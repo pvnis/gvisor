@@ -16,6 +16,7 @@ package nvproxy
 
 import (
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
@@ -30,6 +31,58 @@ func (fd *uvmFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error
 	// application mmaps of /dev/nvidia-uvm are immediately visible to the
 	// driver.
 	return vfs.GenericProxyDeviceConfigureMMap(&fd.vfsfd, fd, opts)
+}
+
+// AddMapping implements memmap.Mappable.AddMapping.
+//
+// Application mappings of /dev/nvidia-uvm reserve the address space that CUDA
+// unified memory is committed into, so newly mapped ranges are charged to the
+// sandbox's account. Only ranges that were not already mapped are charged;
+// mapping the same range twice, including via fork(), reserves no additional
+// address space and so must not be charged twice.
+func (fd *uvmFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	fd.mappingsMu.Lock()
+	defer fd.mappingsMu.Unlock()
+	mapped := fd.mappings.AddMapping(ms, ar, offset, writable)
+	var mappedBytes uint64
+	for _, r := range mapped {
+		mappedBytes += r.Length()
+	}
+	if !fd.dev.nvp.memAcct.reserveUVMVA(ctx, mappedBytes) {
+		// Undo the mapping, so that the mapping set continues to reflect only
+		// the reservations actually charged.
+		fd.mappings.RemoveMapping(ms, ar, offset, writable)
+		return linuxerr.ENOMEM
+	}
+	return nil
+}
+
+// RemoveMapping implements memmap.Mappable.RemoveMapping.
+func (fd *uvmFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	fd.mappingsMu.Lock()
+	defer fd.mappingsMu.Unlock()
+	var unmapped uint64
+	for _, r := range fd.mappings.RemoveMapping(ms, ar, offset, writable) {
+		unmapped += r.Length()
+	}
+	// Release only ranges that no longer have any mapping; a range that is
+	// still mapped elsewhere still reserves its address space. Without this,
+	// a process that repeatedly allocates and frees unified memory would
+	// accumulate charges it never releases.
+	fd.dev.nvp.memAcct.releaseUVMVA(ctx, unmapped)
+}
+
+// CopyMapping implements memmap.Mappable.CopyMapping.
+func (fd *uvmFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return fd.AddMapping(ctx, ms, dstAR, offset, writable)
+}
+
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+//
+// This file's memmap.File and offsets remain consistent across save/restore,
+// so its mappings never require invalidation.
+func (fd *uvmFD) InvalidateUnsavable(ctx context.Context) error {
+	return nil
 }
 
 // Translate implements memmap.Mappable.Translate.

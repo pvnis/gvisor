@@ -270,6 +270,28 @@ type frontendIoctlState struct {
 	nr              uint32
 	ioctlParamsAddr hostarch.Addr
 	ioctlParamsSize uint32
+
+	// pendingCharge is memory reserved from the sandbox's account for an
+	// allocation that has not yet been recorded. It is set before the
+	// allocation is forwarded to the driver and consumed by objAddMem() if the
+	// driver succeeds; if it is still set once the allocation completes, the
+	// allocation did not happen and the reservation must be returned.
+	pendingCharge *memCharge
+}
+
+// takePendingCharge returns fi's pending charge, if any, and clears it.
+func (fi *frontendIoctlState) takePendingCharge() *memCharge {
+	c := fi.pendingCharge
+	fi.pendingCharge = nil
+	return c
+}
+
+// releasePendingCharge returns any reservation that was not consumed by an
+// allocation, which happens when the driver rejected it.
+func (fi *frontendIoctlState) releasePendingCharge() {
+	if c := fi.takePendingCharge(); c != nil {
+		fi.fd.dev.nvp.memAcct.release(fi.ctx, c)
+	}
 }
 
 // frontendIoctlSimple implements a frontend ioctl whose parameters don't
@@ -619,15 +641,24 @@ func rmAllocMemorySystem(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 	if client == nil {
 		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_CLIENT)
 	}
+	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClass(fi.ctx, ioctlParams.Params.HClass, nvos02AllocSize(&ioctlParams.Params))
+	if !ok {
+		unlock()
+		ioctlParams.FD = origFD
+		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_NO_MEMORY)
+	}
 	n, err := frontendIoctlInvoke(fi, ioctlParams)
 	if err == nil && ioctlParams.Params.Status == nvgpu.NV_OK {
-		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.Params.HObjectNew, ioctlParams.Params.HClass, &miscObject{}, ioctlParams.Params.HObjectParent)
+		fi.fd.dev.nvp.objAddMem(fi.ctx, client, ioctlParams.Params.HObjectNew, ioctlParams.Params.HClass, &miscObject{}, charge, ioctlParams.Params.HObjectParent)
+		charge = nil
 		if createMmapCtx {
 			mapFile.memmapFile.mmapLength = ioctlParams.Params.Limit + 1
 			mapFile.memmapFile.memType = getMemoryType(fi.ctx, mapFile.dev, nvgpu.NVOS33_FLAGS_CACHING_TYPE_DEFAULT)
 		}
 	}
 	unlock()
+	// A charge still held here belongs to an allocation the driver rejected.
+	fi.fd.dev.nvp.memAcct.release(fi.ctx, charge)
 	ioctlParams.FD = origFD
 	if err != nil {
 		return n, err
@@ -646,11 +677,20 @@ func rmAllocMemorySimple(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 	if client == nil {
 		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_CLIENT)
 	}
+	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClass(fi.ctx, ioctlParams.Params.HClass, nvos02AllocSize(&ioctlParams.Params))
+	if !ok {
+		unlock()
+		ioctlParams.FD = origFD
+		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_NO_MEMORY)
+	}
 	n, err := frontendIoctlInvoke(fi, ioctlParams)
 	if err == nil && ioctlParams.Params.Status == nvgpu.NV_OK {
-		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.Params.HObjectNew, ioctlParams.Params.HClass, &miscObject{}, ioctlParams.Params.HObjectParent)
+		fi.fd.dev.nvp.objAddMem(fi.ctx, client, ioctlParams.Params.HObjectNew, ioctlParams.Params.HClass, &miscObject{}, charge, ioctlParams.Params.HObjectParent)
+		charge = nil
 	}
 	unlock()
+	// A charge still held here belongs to an allocation the driver rejected.
+	fi.fd.dev.nvp.memAcct.release(fi.ctx, charge)
 	ioctlParams.FD = origFD
 	if err != nil {
 		return n, err
@@ -777,6 +817,15 @@ func rmAllocOSDescriptor(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 	if client == nil {
 		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_CLIENT)
 	}
+	// Charge the page-rounded length actually pinned, rather than the
+	// requested length, since that is what is committed.
+	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClass(fi.ctx, ioctlParams.Params.HClass, arLen)
+	if !ok {
+		unlock()
+		ioctlParams.Params.PMemory = origPMemory
+		ioctlParams.FD = origFD
+		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_NO_MEMORY)
+	}
 	n, err := frontendIoctlInvoke(fi, ioctlParams)
 	if err == nil && ioctlParams.Params.Status == nvgpu.NV_OK {
 		// Transfer ownership of pinned pages to an osDescMem object, to be
@@ -792,13 +841,16 @@ func rmAllocOSDescriptor(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 			obj.m = m
 			obj.len = uintptr(arLen)
 		}
-		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.Params.HObjectNew, ioctlParams.Params.HClass, obj, ioctlParams.Params.HObjectParent)
+		fi.fd.dev.nvp.objAddMem(fi.ctx, client, ioctlParams.Params.HObjectNew, ioctlParams.Params.HClass, obj, charge, ioctlParams.Params.HObjectParent)
+		charge = nil
 		unpinCleanup.Release()
 		if fi.ctx.IsLogging(log.Debug) {
 			fi.ctx.Debugf("nvproxy: pinned %d bytes for OS descriptor with handle %v", arLen, ioctlParams.Params.HObjectNew)
 		}
 	}
 	unlock()
+	// A charge still held here belongs to an allocation the driver rejected.
+	fi.fd.dev.nvp.memAcct.release(fi.ctx, charge)
 	ioctlParams.Params.PMemory = origPMemory
 	ioctlParams.FD = origFD
 	if err != nil {
@@ -1286,7 +1338,49 @@ func rmAllocSimple[Params any, PtrParams marshalPtr[Params]](fi *frontendIoctlSt
 // addSimpleObjDepParentLocked implements rmAllocInvoke.addObjLocked for
 // classes that require no special handling and depend only on their parents.
 func addSimpleObjDepParentLocked[Params any](fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params) {
-	fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent)
+	fi.fd.dev.nvp.objAddMem(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), fi.takePendingCharge(), ioctlParams.HObjectParent)
+}
+
+// rmAllocFailWithStatus reports status to the application for an
+// NV_ESC_RM_ALLOC that is not forwarded to the driver, writing the parameters
+// back in whichever of the two formats the application used.
+//
+// Compare rmAlloc(), which does the same for an unrecognized class.
+func rmAllocFailWithStatus(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool, status uint32) (uintptr, error) {
+	ioctlParams.Status = status
+	outIoctlParams := nvgpu.GetRmAllocParamObj(isNVOS64)
+	outIoctlParams.FromOS64(*ioctlParams)
+	// Any copy-out error is discarded, as in rmAlloc().
+	outIoctlParams.CopyOut(fi.t, fi.ioctlParamsAddr)
+	return 0, nil
+}
+
+// nvos02AllocSize returns the amount of memory requested by an
+// NV_ESC_RM_ALLOC_MEMORY parameter struct, which expresses it as the
+// inclusive upper bound of the allocated range rather than as a length.
+// It returns 0 if the resulting length is not representable.
+func nvos02AllocSize(params *nvgpu.NVOS02_PARAMETERS) uint64 {
+	size := params.Limit + 1
+	if size == 0 {
+		// Integer overflow; the driver rejects this. Compare
+		// rmAllocOSDescriptor(), which fails with NV_ERR_INVALID_LIMIT.
+		return 0
+	}
+	return size
+}
+
+// allocParamsSize returns the amount of memory requested by allocParams, or 0
+// if its type does not specify one. Whether such a request is accounted, and
+// against which counter, is determined by the allocation class; see
+// memKindOfClass().
+func allocParamsSize[Params any](allocParams *Params) uint64 {
+	if allocParams == nil {
+		return 0
+	}
+	if hasSize, ok := any(allocParams).(nvgpu.HasAllocSize); ok {
+		return hasSize.GetAllocSize()
+	}
+	return 0
 }
 
 func rmAllocSimpleParams[Params any, PtrParams marshalPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool, objAddLocked func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *Params)) (uintptr, error) {
@@ -1304,7 +1398,18 @@ func rmAllocSimpleParams[Params any, PtrParams marshalPtr[Params]](fi *frontendI
 	if _, err := allocParams.CopyIn(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
 		return 0, err
 	}
+	// Reserve the memory before forwarding the allocation, so that the limit
+	// is applied to the request rather than discovered after the driver has
+	// already satisfied it.
+	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClass(fi.ctx, ioctlParams.HClass, allocParamsSize(allocParams))
+	if !ok {
+		return rmAllocFailWithStatus(fi, ioctlParams, isNVOS64, nvgpu.NV_ERR_NO_MEMORY)
+	}
+	fi.pendingCharge = charge
 	n, err := rmAllocInvoke(fi, ioctlParams, allocParams, isNVOS64, objAddLocked)
+	// If the allocation was recorded, objAddMem() took the charge; anything
+	// left here belongs to an allocation that did not happen.
+	fi.releasePendingCharge()
 	if err != nil {
 		return n, err
 	}

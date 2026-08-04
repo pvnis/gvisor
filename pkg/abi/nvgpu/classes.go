@@ -277,6 +277,14 @@ type NV_MEMORY_ALLOCATION_PARAMS struct {
 	Tag           uint32
 }
 
+// GetAllocSize implements HasAllocSize.GetAllocSize.
+//
+// This method is promoted to NV_MEMORY_ALLOCATION_PARAMS_V545, which embeds
+// this type.
+func (n *NV_MEMORY_ALLOCATION_PARAMS) GetAllocSize() uint64 {
+	return n.Size
+}
+
 // NV_MEMORY_ALLOCATION_PARAMS_V545 is the updated version of
 // NV_MEMORY_ALLOCATION_PARAMS since 545.23.06.
 //

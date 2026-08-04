@@ -437,23 +437,38 @@ func rmVidHeapControlAllocSize(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS32
 	if client == nil {
 		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_CLIENT)
 	}
-	n, err := frontendIoctlInvoke(fi, ioctlParams)
-	if err == nil && ioctlParams.Status == nvgpu.NV_OK {
-		// src/nvidia/interface/deprecated/rmapi_deprecated_vidheapctrl.c:_rmVidHeapControlAllocCommon()
-		if allocSizeParams.Flags&nvgpu.NVOS32_ALLOC_FLAGS_VIRTUAL != 0 {
-			// src/nvidia/src/kernel/mem_mgr/virtual_mem.c:virtmemConstruct_IMPL() => refAddDependant()
-			fi.fd.dev.nvp.objAdd(fi.ctx, client, allocSizeParams.HMemory, nvgpu.NV50_MEMORY_VIRTUAL, &miscObject{}, ioctlParams.HObjectParent, ioctlParams.HVASpace)
-		} else {
-			classID := nvgpu.ClassID(nvgpu.NV01_MEMORY_SYSTEM)
-			if (allocSizeParams.Attr2>>nvgpu.NVOS32_ATTR2_USE_EGM_SHIFT)&nvgpu.NVOS32_ATTR2_USE_EGM_MASK == nvgpu.NVOS32_ATTR2_USE_EGM_TRUE {
-				classID = nvgpu.NV_MEMORY_EXTENDED_USER
-			} else if (allocSizeParams.Attr>>nvgpu.NVOS32_ATTR_LOCATION_SHIFT)&nvgpu.NVOS32_ATTR_LOCATION_MASK == nvgpu.NVOS32_ATTR_LOCATION_VIDMEM {
-				classID = nvgpu.NV01_MEMORY_LOCAL_USER
-			}
-			fi.fd.dev.nvp.objAdd(fi.ctx, client, allocSizeParams.HMemory, classID, &miscObject{}, ioctlParams.HObjectParent)
+	// Determine the class the driver will use, so that the allocation can be
+	// charged before it is forwarded. This mirrors the classification made
+	// after the fact below; see
+	// src/nvidia/interface/deprecated/rmapi_deprecated_vidheapctrl.c:_rmVidHeapControlAllocCommon().
+	classID := nvgpu.ClassID(nvgpu.NV50_MEMORY_VIRTUAL)
+	if allocSizeParams.Flags&nvgpu.NVOS32_ALLOC_FLAGS_VIRTUAL == 0 {
+		classID = nvgpu.NV01_MEMORY_SYSTEM
+		if (allocSizeParams.Attr2>>nvgpu.NVOS32_ATTR2_USE_EGM_SHIFT)&nvgpu.NVOS32_ATTR2_USE_EGM_MASK == nvgpu.NVOS32_ATTR2_USE_EGM_TRUE {
+			classID = nvgpu.NV_MEMORY_EXTENDED_USER
+		} else if (allocSizeParams.Attr>>nvgpu.NVOS32_ATTR_LOCATION_SHIFT)&nvgpu.NVOS32_ATTR_LOCATION_MASK == nvgpu.NVOS32_ATTR_LOCATION_VIDMEM {
+			classID = nvgpu.NV01_MEMORY_LOCAL_USER
 		}
 	}
+	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClass(fi.ctx, classID, allocSizeParams.Size)
+	if !ok {
+		unlock()
+		allocSizeParams.Address = origAddress
+		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_NO_MEMORY)
+	}
+	n, err := frontendIoctlInvoke(fi, ioctlParams)
+	if err == nil && ioctlParams.Status == nvgpu.NV_OK {
+		if classID == nvgpu.NV50_MEMORY_VIRTUAL {
+			// src/nvidia/src/kernel/mem_mgr/virtual_mem.c:virtmemConstruct_IMPL() => refAddDependant()
+			fi.fd.dev.nvp.objAddMem(fi.ctx, client, allocSizeParams.HMemory, classID, &miscObject{}, charge, ioctlParams.HObjectParent, ioctlParams.HVASpace)
+		} else {
+			fi.fd.dev.nvp.objAddMem(fi.ctx, client, allocSizeParams.HMemory, classID, &miscObject{}, charge, ioctlParams.HObjectParent)
+		}
+		charge = nil
+	}
 	unlock()
+	// A charge still held here belongs to an allocation the driver rejected.
+	fi.fd.dev.nvp.memAcct.release(fi.ctx, charge)
 	allocSizeParams.Address = origAddress
 	if err != nil {
 		return n, err

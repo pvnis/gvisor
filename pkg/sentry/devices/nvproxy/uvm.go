@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -74,12 +75,20 @@ type uvmFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
-	memmap.MappableNoTrackMappings
 
 	dev           *uvmDevice
 	containerName string
 	hostFD        int32
 	memmapFile    uvmFDMemmapFile
+
+	// mappings tracks application mappings of this file, which reserve the
+	// address space that CUDA unified memory is committed into. It is used to
+	// account that reservation; see memKindUVMVA. Mappings are not tracked for
+	// invalidation, which this file does not require.
+	//
+	// mappings is protected by mappingsMu.
+	mappingsMu sync.Mutex `state:"nosave"`
+	mappings   memmap.MappingSet
 
 	queue waiter.Queue
 }

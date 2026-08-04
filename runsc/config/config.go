@@ -373,6 +373,10 @@ type Config struct {
 	// unsupported driver version.
 	NVProxyAllowUnsupportedDriver bool `flag:"nvproxy-allow-unsupported-driver"`
 
+	// NVProxyGPUMemoryLimit is the maximum number of bytes of GPU memory that
+	// the sandbox may allocate. Zero means no limit.
+	NVProxyGPUMemoryLimit uint64 `flag:"nvproxy-gpu-memory-limit"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

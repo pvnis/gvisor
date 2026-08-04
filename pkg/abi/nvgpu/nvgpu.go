@@ -101,3 +101,10 @@ type HasStatus interface {
 	GetStatus() uint32
 	SetStatus(status uint32)
 }
+
+// HasAllocSize is an interface for allocation parameter structs that specify
+// an amount of memory to allocate.
+type HasAllocSize interface {
+	// GetAllocSize returns the number of bytes requested by this allocation.
+	GetAllocSize() uint64
+}

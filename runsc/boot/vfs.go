@@ -1703,6 +1703,7 @@ func nvproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem, 
 		DriverVersion:          nvidiaDriverVersion,
 		DriverCaps:             driverCaps,
 		AllowUnsupportedDriver: info.conf.NVProxyAllowUnsupportedDriver,
+		GPUMemoryLimit:         info.conf.NVProxyGPUMemoryLimit,
 		HostSettings:           info.nvidiaHostSettings,
 		UseDevGofer:            true,
 	})

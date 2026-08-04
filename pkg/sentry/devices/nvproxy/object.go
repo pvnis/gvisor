@@ -41,6 +41,13 @@ type object struct {
 	// protected by client.objsMu.
 	deps  map[*object]struct{} // objects that this object depends on
 	rdeps map[*object]struct{} // objects that depend on this object
+
+	// charge is the memory charged to the sandbox's account for this object,
+	// or nil if this object holds no accounted memory. Objects aliasing a
+	// single underlying allocation share one charge; see memCharge. charge is
+	// set by objAddMem() and cleared when the charge is released.
+	charge *memCharge
+
 	objectFreeEntry
 }
 
@@ -68,6 +75,20 @@ func (o *object) Object() *object {
 //
 // Precondition: client.objsMu must be locked.
 func (nvp *nvproxy) objAdd(ctx context.Context, client *rootClient, h nvgpu.Handle, c nvgpu.ClassID, oi objectImpl, parentH nvgpu.Handle, deps ...nvgpu.Handle) {
+	nvp.objAddMem(ctx, client, h, c, oi, nil /* charge */, parentH, deps...)
+}
+
+// objAddMem is objAdd for objects holding memory that has already been
+// reserved from the sandbox's account with memAccount.reserve(). The charge is
+// held for the lifetime of the object and released when it is freed. A nil
+// charge accounts nothing.
+//
+// The charge is taken before the allocation is forwarded to the driver rather
+// than here, so that the limit cannot be exceeded by allocations racing
+// between the check and the charge.
+//
+// Precondition: client.objsMu must be locked.
+func (nvp *nvproxy) objAddMem(ctx context.Context, client *rootClient, h nvgpu.Handle, c nvgpu.ClassID, oi objectImpl, charge *memCharge, parentH nvgpu.Handle, deps ...nvgpu.Handle) {
 	if h.Val == nvgpu.NV01_NULL_OBJECT {
 		log.Traceback("nvproxy: new object (class %v) has invalid handle %v", c, h)
 		return
@@ -80,10 +101,18 @@ func (nvp *nvproxy) objAdd(ctx context.Context, client *rootClient, h nvgpu.Hand
 	o.handle = h
 	o.parent = parentH
 	o.impl = oi
-	if _, ok := client.resources[h]; ok {
+	if prev, ok := client.resources[h]; ok {
 		ctx.Warningf("nvproxy: handle %v:%v already in use", client.handle, h)
+		// The object being displaced is no longer reachable by handle, so it
+		// will never reach objFree(). Release its charge here; otherwise the
+		// bytes would remain charged to the account forever, and an
+		// application able to provoke handle collisions could drive its own
+		// accounted usage arbitrarily high.
+		nvp.memAcct.release(ctx, prev.charge)
+		prev.charge = nil
 	}
 	client.resources[h] = o
+	o.charge = charge
 
 	if parentH.Val != nvgpu.NV01_NULL_OBJECT {
 		parent, ok := client.resources[parentH]
@@ -161,6 +190,16 @@ func (nvp *nvproxy) objDup(ctx context.Context, clientDst, clientSrc *rootClient
 	}
 	oDst := &miscObject{}
 	nvp.objAdd(ctx, clientDst, dstH, oSrc.class, oDst, parentDstH)
+	// The duplicate refers to the same underlying memory as the original, so
+	// it shares the original's charge rather than being charged again;
+	// otherwise duplicating a handle would inflate accounted usage without
+	// committing any additional memory. Only take the reference if objAdd()
+	// actually recorded the object; otherwise nothing will ever free it, and
+	// the reference would keep the charge outstanding forever.
+	if clientDst.resources[dstH] == oDst.Object() {
+		oSrc.charge.incRef()
+		oDst.Object().charge = oSrc.charge
+	}
 	parentSrc := clientSrc.getObject(ctx, oSrc.parent)
 	// Copy all non-parent dependencies.
 	for dep := range oSrc.deps {
@@ -274,6 +313,11 @@ func (nvp *nvproxy) objFree(ctx context.Context, client *rootClient, h nvgpu.Han
 		for o3 := range o2.deps {
 			delete(o3.rdeps, o2)
 		}
+		// Release here rather than in the NV_ESC_RM_FREE handler: freeing an
+		// object cascades to its dependents, so a single free ioctl may
+		// release many objects, and only this loop observes all of them.
+		nvp.memAcct.release(ctx, o2.charge)
+		o2.charge = nil
 		delete(o2.client.resources, o2.handle)
 		client.objsFreeList.Remove(o2)
 		delete(client.objsFreeSet, o2)

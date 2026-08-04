@@ -54,6 +54,10 @@ type Options struct {
 	// DriverCaps is the set of driver capabilities exposed to applications.
 	DriverCaps nvconf.DriverCaps
 
+	// GPUMemoryLimit is the maximum number of bytes of GPU memory that the
+	// sandbox may allocate. Zero means no limit.
+	GPUMemoryLimit uint64
+
 	HostSettings *nvconf.HostSettings
 
 	// If UseDevGofer is true, open device files via gofer.
@@ -88,6 +92,10 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		procDriverNvidiaParams: opts.HostSettings.ProcDriverNvidiaParams,
 		frontendFDs:            make(map[*frontendFD]struct{}),
 		clients:                make(map[nvgpu.Handle]*rootClient),
+	}
+	nvp.memAcct.gpuLimit = opts.GPUMemoryLimit
+	if opts.GPUMemoryLimit != 0 {
+		log.Infof("nvproxy: GPU memory limited to %d bytes", opts.GPUMemoryLimit)
 	}
 	// Force ModifyDeviceFiles in /proc/driver/nvidia/params to 0. This is
 	// consistent with libnvidia-container's src/nvc_mount.c:mount_procfs().
@@ -213,6 +221,11 @@ type nvproxy struct {
 	procDriverNvidiaParams string
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice
+
+	// memAcct tracks GPU memory charged to this sandbox. It is shared by every
+	// frontendDevice and frontendFD in the sandbox, so it accounts the
+	// sandbox's aggregate usage across all of its processes.
+	memAcct memAccount
 
 	fdsMu       fdsMutex `state:"nosave"`
 	frontendFDs map[*frontendFD]struct{}
