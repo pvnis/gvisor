@@ -282,6 +282,35 @@ type memAccount struct {
 	// vram and uvmVA, that may be charged to this sandbox. Zero means no
 	// limit. gpuLimit is immutable after Register().
 	gpuLimit uint64
+
+	// warnedDenied records that reaching the limit has already been reported.
+	warnedDenied bool
+}
+
+// noteDenialLocked records that an allocation was denied, and returns true if
+// this is the first denial and should be reported.
+//
+// Preconditions: a.mu must be locked.
+func (a *memAccount) noteDenialLocked() bool {
+	if a.warnedDenied {
+		return false
+	}
+	a.warnedDenied = true
+	return true
+}
+
+// warnDenied reports that the GPU memory limit has been reached.
+//
+// Only the first denial is reported, at a level that is enabled by default:
+// an application that retries in a loop would otherwise flood the log, but
+// without any report the condition is hard to identify from outside the
+// sandbox. Denying a unified memory allocation is particularly opaque, since
+// the CUDA driver has no error for it and reports CUDA_ERROR_UNKNOWN; see the
+// memory limit section of g3doc/user_guide/gpu.md.
+func warnDenied(ctx context.Context, kind memKind, size, used, limit uint64) {
+	ctx.Warningf("nvproxy: GPU memory limit reached: denied %d bytes of %s memory with %d of %d bytes in use. "+
+		"Further allocations will fail until memory is released; subsequent denials are logged at debug level only.",
+		size, kind, used, limit)
 }
 
 // Preconditions: a.mu must be locked.
@@ -331,8 +360,11 @@ func (a *memAccount) reserve(ctx context.Context, kind memKind, size uint64) (*m
 	a.mu.Lock()
 	if !a.admitLocked(kind, size) {
 		used, limit := a.vram+a.uvmVA, a.gpuLimit
+		first := a.noteDenialLocked()
 		a.mu.Unlock()
-		if ctx.IsLogging(log.Debug) {
+		if first {
+			warnDenied(ctx, kind, size, used, limit)
+		} else if ctx.IsLogging(log.Debug) {
 			ctx.Debugf("nvproxy: denied %d bytes of %s memory: %d of %d bytes of GPU memory already in use", size, kind, used, limit)
 		}
 		return nil, false
@@ -391,8 +423,11 @@ func (a *memAccount) reserveUVMVA(ctx context.Context, size uint64) bool {
 	a.mu.Lock()
 	if !a.admitLocked(memKindUVMVA, size) {
 		used, limit := a.vram+a.uvmVA, a.gpuLimit
+		first := a.noteDenialLocked()
 		a.mu.Unlock()
-		if ctx.IsLogging(log.Debug) {
+		if first {
+			warnDenied(ctx, memKindUVMVA, size, used, limit)
+		} else if ctx.IsLogging(log.Debug) {
 			ctx.Debugf("nvproxy: denied %d bytes of %s: %d of %d bytes of GPU memory already in use", size, memKindUVMVA, used, limit)
 		}
 		return false

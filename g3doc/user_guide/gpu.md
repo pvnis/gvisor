@@ -389,6 +389,35 @@ device's other tenants are using.
     `k8s-device-plugin`'s time-slicing, which provides no memory isolation of
     its own; the two mechanisms are complementary.
 
+-   **Denying unified memory is reported poorly by CUDA.** An allocation
+    refused by the limit fails the underlying `mmap` with `ENOMEM`, which is
+    what Linux returns when a mapping exceeds a memory limit, but the CUDA
+    driver reports it as `CUDA_ERROR_UNKNOWN` rather than
+    `CUDA_ERROR_OUT_OF_MEMORY`. This is not a divergence from how a real
+    exhaustion behaves: `cuMemAllocManaged()` performs no capacity check and
+    does not fail for lack of memory, so there is no genuine out-of-memory
+    result for this call to imitate. `CUDA_ERROR_OUT_OF_MEMORY` is not
+    reachable from this path at all; of the errnos that reach the CUDA driver
+    here, only `EINVAL` and `EPERM` map to anything more specific than
+    "unknown", and neither describes a memory limit. Device memory allocations,
+    which do have a real out-of-memory result, report
+    `CUDA_ERROR_OUT_OF_MEMORY` as expected.
+
+    Because the application-visible error is uninformative, the Sentry logs a
+    warning the first time an allocation is denied, naming the limit and how
+    much was in use. Only the first denial is reported, so that an application
+    retrying in a loop does not flood the log. This appears wherever the
+    sandbox's logs are directed: setting `--debug-log` alone is enough, since
+    the message is logged at warning level and does not require `--debug`. With
+    no log destination configured, runsc discards Sentry logs, and the denial is
+    visible only as the application's error.
+
+-   **Applications may not expect unified memory to fail.** Since
+    `cuMemAllocManaged()` does not fail for capacity natively, workloads that
+    rely on oversubscribing it -- reserving far more than the device holds and
+    letting the driver migrate pages -- will fail under a limit that a
+    device-memory workload of the same working set would not.
+
 -   **Unified memory is charged at reservation, not commitment.** UVM commits
     device memory lazily, in response to GPU page faults serviced inside the
     host `nvidia-uvm` module, which reaches the resource manager through

@@ -803,3 +803,33 @@ func TestMemClassKindsCoversAccountedClasses(t *testing.T) {
 		}
 	}
 }
+
+// TestLimitDenialWarnsOnce tests that reaching the limit is reported once
+// rather than for every denial. An application that retries in a loop would
+// otherwise flood the log.
+func TestLimitDenialWarnsOnce(t *testing.T) {
+	ctx := context.Background()
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuLimit = 4096
+
+	for i := 0; i < 5; i++ {
+		if _, ok := nvp.memAcct.reserveForClass(ctx, nvgpu.NV01_MEMORY_LOCAL_USER, 8192); ok {
+			t.Fatalf("reserve beyond limit succeeded")
+		}
+	}
+	// Only the first denial reports; the flag records that it has happened.
+	if !nvp.memAcct.warnedDenied {
+		t.Errorf("warnedDenied = false after denials, want true")
+	}
+
+	// A denial on the UVM path shares the same flag, so that a workload using
+	// both kinds is not reported twice.
+	nvp2 := &nvproxy{}
+	nvp2.memAcct.gpuLimit = 4096
+	if nvp2.memAcct.reserveUVMVA(ctx, 8192) {
+		t.Fatalf("UVM reserve beyond limit succeeded")
+	}
+	if !nvp2.memAcct.warnedDenied {
+		t.Errorf("warnedDenied = false after UVM denial, want true")
+	}
+}
