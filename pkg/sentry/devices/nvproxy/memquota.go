@@ -115,8 +115,17 @@ var memClassKinds = map[nvgpu.ClassID]memKind{
 	// backed by local device memory or by memory imported from another node,
 	// which determines whether this sandbox should be charged at all. A wrong
 	// answer here silently over- or under-counts, so these are left alone rather
-	// than guessed at, and must be resolved before the accounting can be called
-	// complete.
+	// than guessed at.
+	//
+	// Resolving this needs hardware that the accounting has not been validated
+	// against: an NVLink/NVSwitch fabric spanning more than one node for the
+	// fabric classes, and a platform with extended GPU memory, such as
+	// Grace-Hopper, for EGM. What has to be established for each class is
+	// whether an allocation consumes this GPU's memory, memory belonging to
+	// another node, or only a mapping of memory already charged elsewhere, and
+	// which field of its allocation parameters carries the size. Until then a
+	// sandbox on such a system can allocate these without being charged; see
+	// the memory limit section of g3doc/user_guide/gpu.md.
 	nvgpu.NV_MEMORY_EXTENDED_USER:       memKindNone,
 	nvgpu.NV_MEMORY_FABRIC:              memKindNone,
 	nvgpu.NV_MEMORY_MULTICAST_FABRIC:    memKindNone,

@@ -327,6 +327,99 @@ echo 1000000 | sudo tee /proc/sys/vm/max_map_count
 
 Alternatively, you can also just pass the runsc flag `--host-settings=enforce`.
 
+## GPU Memory Limits {#memory-limits}
+
+`nvproxy` can limit how much GPU memory a sandbox is able to allocate. Because
+the limit is applied in the Sentry, where the application's `ioctl`s are
+interpreted, sandboxed code cannot observe or bypass it: there is no in-container
+library to unset, preload around, or call past.
+
+Set the limit in bytes with the runsc flag `--nvproxy-gpu-memory-limit`. The
+default of `0` means no limit, and sandboxes without a limit behave exactly as
+before.
+
+A container may request a smaller limit for itself with an annotation:
+
+```
+"dev.gvisor.flag.nvproxy-gpu-memory-limit": "536870912"
+```
+
+The value configured on the runtime is a ceiling. An annotation may lower the
+limit but not raise it, and a container asking for more than the ceiling fails
+to start rather than being silently clamped. This matters because container
+specs are frequently authored by the workload being limited; an annotation that
+could raise the limit would be no limit at all.
+
+When using Kubernetes, note that containerd drops pod annotations before they
+reach the OCI spec unless the runtime declares them. Without the following in
+the `runsc` runtime's containerd configuration, the annotation is ignored and no
+error is reported:
+
+```toml
+pod_annotations = ["dev.gvisor.*"]
+```
+
+### What counts against the limit
+
+The limit covers GPU device memory, and address space reserved on
+`/dev/nvidia-uvm` for CUDA unified ("managed") memory. The two are counted
+together because unified memory is committed into device memory; counting them
+separately would let a sandbox obtain twice its limit.
+
+Host memory pinned for GPU DMA is tracked but does not count against this limit.
+It is host memory, and is bounded by the sandbox's memory limit instead.
+
+Allocations are charged before being forwarded to the driver, so that concurrent
+allocations cannot both be admitted against the same headroom. An allocation
+that would exceed the limit is failed with `NV_ERR_NO_MEMORY`, which the CUDA
+driver reports as `CUDA_ERROR_OUT_OF_MEMORY`, the same result an application
+sees when the GPU is genuinely full.
+
+`cuMemGetInfo()` reports the limit and its remaining headroom rather than the
+whole device, so that applications which size their allocations as a fraction of
+free memory, as PyTorch and TensorFlow do, size themselves to what they can
+actually obtain. This also keeps a sandbox from observing how much memory the
+device's other tenants are using.
+
+### Limitations and future work
+
+-   **Compute is not limited.** This bounds memory only. A sandbox within its
+    memory limit can still monopolize the GPU's compute resources. Sharing a GPU
+    between containers additionally requires something like the
+    `k8s-device-plugin`'s time-slicing, which provides no memory isolation of
+    its own; the two mechanisms are complementary.
+
+-   **Unified memory is charged at reservation, not commitment.** UVM commits
+    device memory lazily, in response to GPU page faults serviced inside the
+    host `nvidia-uvm` module, which reaches the resource manager through
+    in-kernel calls rather than `ioctl`s. The Sentry cannot observe the
+    commitment, so the address space reserved for it is charged instead. This is
+    sound as a bound, since commitment cannot exceed the reservation, but it is
+    not tight: a workload that deliberately oversubscribes, reserving far more
+    than it backs, is charged for what it reserved.
+
+-   **Fabric and EGM memory are not accounted.** `NV_MEMORY_FABRIC`,
+    `NV_MEMORY_MULTICAST_FABRIC`, `NV_MEMORY_FABRIC_IMPORTED_REF`,
+    `NV_MEMORY_EXPORT` and `NV_MEMORY_EXTENDED_USER` (EGM) are recorded as
+    reviewed but deliberately uncharged in `memClassKinds`, because whether a
+    given allocation is backed by local device memory or by memory imported from
+    another node determines whether the sandbox should be charged for it at all,
+    and charging the wrong ones would silently over- or under-count.
+
+    Resolving this requires hardware that the accounting has not yet been
+    validated against: an NVLink/NVSwitch fabric spanning more than one node for
+    the fabric classes, and a platform with extended GPU memory (such as
+    Grace-Hopper) for EGM. Until then, a sandbox on such a system can allocate
+    fabric or EGM memory without it counting against its limit. Deployments that
+    rely on this limit for isolation should not enable the
+    `fabric-imex-mgmt` driver capability.
+
+-   **A small fixed overhead is not charged.** Driver structures allocated
+    alongside a CUDA context are not attributed to the sandbox. Measured against
+    the GPU's own per-process accounting, this is a constant, independent of how
+    much the workload allocates, so a sandbox can hold slightly more than its
+    limit by a bounded amount rather than by a share of what it requests.
+
 ## Security
 
 While GPU support enables important use cases for gVisor, it is important for
