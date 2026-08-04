@@ -48,6 +48,7 @@ const (
 	flagQDiscTBFRate            = "qdisc-tbf-rate"
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
 	flagMountCgroupV2           = "mount-cgroup-v2"
+	flagNVProxyGPUMemLimit      = "nvproxy-gpu-memory-limit"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
 	defaultQDiscTBFRate  = uint64(0)
@@ -182,7 +183,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("nvproxy-docker", false, "LEGACY: Injects nvidia-container-runtime-hook as a prestart hook. Try to use nvidia-container-runtime or `docker run --gpus` instead. Or manually add nvidia-container-runtime-hook as a prestart hook and set up NVIDIA_VISIBLE_DEVICES container environment variable.")
 	flagSet.String("nvproxy-driver-version", "", "NVIDIA driver ABI version to use. If empty, autodetect installed driver version. The special value 'latest' may also be used to use the latest ABI.")
 	flagSet.Bool("nvproxy-allow-unsupported-driver", false, "allow nvproxy to be initialized with an unsupported driver version.")
-	flagSet.Uint64("nvproxy-gpu-memory-limit", 0, "maximum number of bytes of GPU memory that the sandbox may allocate, counting device memory and address space reserved for CUDA unified memory. 0 means no limit.")
+	flagSet.Uint64(flagNVProxyGPUMemLimit, 0, "maximum number of bytes of GPU memory that the sandbox may allocate, counting device memory and address space reserved for CUDA unified memory. 0 means no limit.")
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("rdmaproxy", false, "WIP: enable RDMA support for containers with /dev/infiniband/uverbs* devices.")
 	flagSet.Bool("tpuproxy", false, "LEGACY: enable support for TPU devices. TPU support gets automatically enabled if TPU devices are present in the OCI spec.")
@@ -221,6 +222,26 @@ var overrideAllowlist = map[string]struct {
 	flagQDiscTBFRate:            {check: checkQDiscTBFRate},
 	flagQDiscTBFBurst:           {check: checkQDiscTBFBurst},
 	flagMountCgroupV2:           {},
+	flagNVProxyGPUMemLimit:      {check: checkNVProxyGPUMemoryLimit},
+}
+
+// checkNVProxyGPUMemoryLimit ensures that the GPU memory limit can be lowered
+// but not raised. The limit configured on the runtime is a ceiling: a
+// container may request a smaller share of the GPU, but must not be able to
+// grant itself a larger one by annotating its own spec.
+func checkNVProxyGPUMemoryLimit(c *Config, name string, value string) error {
+	limit, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid %s annotation %q: %w", name, value, err)
+	}
+	if c.NVProxyGPUMemoryLimit == 0 {
+		// The runtime imposes no limit, so any limit is a restriction.
+		return nil
+	}
+	if limit == 0 || limit > c.NVProxyGPUMemoryLimit {
+		return fmt.Errorf("%s=%q exceeds the limit of %d bytes configured on the runtime; annotations may only lower it", name, value, c.NVProxyGPUMemoryLimit)
+	}
+	return nil
 }
 
 // checkOverlay2 ensures that overlay2 can only be enabled using "memory" or

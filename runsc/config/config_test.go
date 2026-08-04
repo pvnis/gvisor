@@ -951,3 +951,32 @@ func TestParseSerializeOverlay2(t *testing.T) {
 		}
 	})
 }
+
+// TestNVProxyGPUMemoryLimitOverride tests that the GPU memory limit annotation
+// may lower the runtime's limit but not raise it. A container that could raise
+// its own limit would not be limited at all.
+func TestNVProxyGPUMemoryLimitOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		runtime     uint64
+		annotation  string
+		wantAllowed bool
+	}{
+		{name: "lower than runtime limit", runtime: 1024, annotation: "512", wantAllowed: true},
+		{name: "equal to runtime limit", runtime: 1024, annotation: "1024", wantAllowed: true},
+		{name: "higher than runtime limit", runtime: 1024, annotation: "2048", wantAllowed: false},
+		{name: "unlimited when runtime limits", runtime: 1024, annotation: "0", wantAllowed: false},
+		{name: "any limit when runtime unlimited", runtime: 0, annotation: "2048", wantAllowed: true},
+		{name: "not a number", runtime: 1024, annotation: "lots", wantAllowed: false},
+		{name: "negative", runtime: 1024, annotation: "-1", wantAllowed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{NVProxyGPUMemoryLimit: tc.runtime}
+			err := checkNVProxyGPUMemoryLimit(c, flagNVProxyGPUMemLimit, tc.annotation)
+			if gotAllowed := err == nil; gotAllowed != tc.wantAllowed {
+				t.Errorf("checkNVProxyGPUMemoryLimit(runtime=%d, annotation=%q) error = %v, want allowed = %v",
+					tc.runtime, tc.annotation, err, tc.wantAllowed)
+			}
+		})
+	}
+}
