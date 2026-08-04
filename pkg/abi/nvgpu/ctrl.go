@@ -426,6 +426,46 @@ type NV208F_CTRL_GPU_VERIFY_INFOROM_PARAMS struct {
 	Checksum uint32
 }
 
+// Values for NV2080_CTRL_FB_INFO.Index, from
+// src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h. Sizes reported by
+// these indices are in kilobytes.
+//
+// These two are what the CUDA driver reads to implement cuMemGetInfo(); that
+// correspondence was confirmed by observing the values returned for a device
+// whose free memory was known.
+const (
+	NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE = 0x00000009
+	NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE = 0x00000016
+)
+
+// NV2080_CTRL_FB_INFO_MAX_LIST_SIZE is the number of entries in
+// NV2080_CTRL_FB_GET_INFO_V2_PARAMS.FBInfoList.
+const NV2080_CTRL_FB_INFO_MAX_LIST_SIZE = 128
+
+// NV2080_CTRL_FB_INFO is an entry of
+// NV2080_CTRL_FB_GET_INFO_V2_PARAMS.FBInfoList, from
+// src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h.
+//
+// +marshal
+type NV2080_CTRL_FB_INFO struct {
+	_     structs.HostLayout
+	Index uint32
+	Data  uint32
+}
+
+// NV2080_CTRL_FB_GET_INFO_V2_PARAMS is the parameter type for
+// NV2080_CTRL_CMD_FB_GET_INFO_V2, from
+// src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h. Unlike
+// NV2080_CTRL_FB_GET_INFO_PARAMS, the info list is inline rather than behind a
+// pointer.
+//
+// +marshal
+type NV2080_CTRL_FB_GET_INFO_V2_PARAMS struct {
+	_              structs.HostLayout
+	FBInfoListSize uint32
+	FBInfoList     [NV2080_CTRL_FB_INFO_MAX_LIST_SIZE]NV2080_CTRL_FB_INFO
+}
+
 // NvxxxCtrlXxxGetInfoParams is used to represent the following:
 // - NV0080_CTRL_GR_GET_INFO_PARAMS
 // - NV2080_CTRL_FB_GET_INFO_PARAMS

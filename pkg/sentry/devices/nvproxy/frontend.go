@@ -1015,6 +1015,70 @@ func rmControlSimple(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETER
 	return n, nil
 }
 
+// ctrlFBGetInfoV2 handles NV2080_CTRL_CMD_FB_GET_INFO_V2, adjusting the
+// framebuffer sizes it reports to reflect the sandbox's GPU memory quota. The
+// CUDA driver reads these to implement cuMemGetInfo(), which applications use
+// to decide how much memory to allocate.
+func ctrlFBGetInfoV2(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
+	var ctrlParams nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
+	if err != nil {
+		return n, err
+	}
+	if ioctlParams.Status == nvgpu.NV_OK {
+		fbInfoApplyQuota(&fi.fd.dev.nvp.memAcct, &ctrlParams)
+	}
+	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// fbInfoApplyQuota rewrites the framebuffer sizes in ctrlParams to reflect
+// acct's quota. It is a no-op if no quota is configured.
+func fbInfoApplyQuota(acct *memAccount, ctrlParams *nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS) {
+	size := ctrlParams.FBInfoListSize
+	if size > nvgpu.NV2080_CTRL_FB_INFO_MAX_LIST_SIZE {
+		// The driver ignores entries beyond the array; do the same rather than
+		// indexing out of bounds on a size the application chose.
+		size = nvgpu.NV2080_CTRL_FB_INFO_MAX_LIST_SIZE
+	}
+	// The driver reports each size independently, and an application may ask
+	// for either without the other, so find them before rewriting either.
+	var total, free *nvgpu.NV2080_CTRL_FB_INFO
+	for i := uint32(0); i < size; i++ {
+		switch e := &ctrlParams.FBInfoList[i]; e.Index {
+		case nvgpu.NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE:
+			total = e
+		case nvgpu.NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE:
+			free = e
+		}
+	}
+	if total == nil && free == nil {
+		return
+	}
+	var realTotal, realFree uint64
+	if total != nil {
+		realTotal = uint64(total.Data) * fbInfoUnitBytes
+	}
+	if free != nil {
+		realFree = uint64(free.Data) * fbInfoUnitBytes
+	}
+	virtTotal, virtFree := acct.virtualFB(realTotal, realFree)
+	if total != nil {
+		total.Data = uint32(virtTotal / fbInfoUnitBytes)
+	}
+	if free != nil {
+		free.Data = uint32(virtFree / fbInfoUnitBytes)
+	}
+}
+
 func ctrlHasFrontendFD[Params any, PtrParams hasFrontendFDPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	var ctrlParamsValue Params
 	ctrlParams := PtrParams(&ctrlParamsValue)

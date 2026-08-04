@@ -321,3 +321,36 @@ func (a *memAccount) usage() (vram, pinnedHost, uvmVA uint64) {
 	defer a.mu.Unlock()
 	return a.vram, a.pinnedHost, a.uvmVA
 }
+
+// fbInfoUnitBytes is the unit, in bytes, of the memory sizes reported by
+// NV2080_CTRL_CMD_FB_GET_INFO_V2.
+const fbInfoUnitBytes = 1024
+
+// virtualFB returns the framebuffer total and free sizes to report to the
+// application, given the values reported by the driver. All values are in
+// bytes.
+//
+// Without this, an application sees the whole device: it sizes its allocations
+// against memory it cannot have and fails in ways that look nothing like
+// exceeding a quota, and it observes how much memory the device's other
+// tenants are using. Frameworks that pre-allocate a fraction of "free" memory,
+// as PyTorch and TensorFlow do, are the common case for the former.
+//
+// Free memory is reported as the smaller of the quota's remaining headroom and
+// the device's actual free memory, since memory consumed by other sandboxes is
+// genuinely unavailable to this one.
+func (a *memAccount) virtualFB(realTotal, realFree uint64) (total, free uint64) {
+	a.mu.Lock()
+	limit := a.gpuLimit
+	used := a.vram + a.uvmVA
+	a.mu.Unlock()
+	if limit == 0 {
+		return realTotal, realFree
+	}
+	total = min(realTotal, limit)
+	var headroom uint64
+	if used < limit {
+		headroom = limit - used
+	}
+	return total, min(realFree, headroom)
+}

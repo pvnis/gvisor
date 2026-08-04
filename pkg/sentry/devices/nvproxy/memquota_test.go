@@ -623,3 +623,131 @@ func TestNoLimitAdmitsEverything(t *testing.T) {
 	addMem(t, nvp, client, handle(10), nvgpu.NV01_MEMORY_LOCAL_USER, 1<<40, handle(nvgpu.NV01_NULL_OBJECT))
 	checkUsage(t, nvp, 1<<40, 0)
 }
+
+// fbParams builds NV2080_CTRL_CMD_FB_GET_INFO_V2 parameters reporting the
+// given total and free sizes, in bytes.
+func fbParams(total, free uint64) *nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS {
+	p := &nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS{FBInfoListSize: 2}
+	p.FBInfoList[0].Index = nvgpu.NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE
+	p.FBInfoList[0].Data = uint32(total / fbInfoUnitBytes)
+	p.FBInfoList[1].Index = nvgpu.NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE
+	p.FBInfoList[1].Data = uint32(free / fbInfoUnitBytes)
+	return p
+}
+
+func fbResult(p *nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS) (total, free uint64) {
+	return uint64(p.FBInfoList[0].Data) * fbInfoUnitBytes, uint64(p.FBInfoList[1].Data) * fbInfoUnitBytes
+}
+
+// TestVirtualFBReportsQuota tests that the framebuffer sizes reported to the
+// application reflect its quota rather than the whole device.
+func TestVirtualFBReportsQuota(t *testing.T) {
+	const gib = 1 << 30
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuLimit = 2 * gib
+
+	p := fbParams(12*gib, 11*gib)
+	fbInfoApplyQuota(&nvp.memAcct, p)
+	total, free := fbResult(p)
+	if total != 2*gib {
+		t.Errorf("total = %d, want %d", total, 2*gib)
+	}
+	if free != 2*gib {
+		t.Errorf("free = %d, want %d", free, 2*gib)
+	}
+}
+
+// TestVirtualFBFreeShrinksWithUse tests that reported free memory decreases as
+// the sandbox allocates, so that an application polling it sees its own usage.
+func TestVirtualFBFreeShrinksWithUse(t *testing.T) {
+	const gib = 1 << 30
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuLimit = 2 * gib
+	client := newTestClient(nvp, 1)
+
+	addMem(t, nvp, client, handle(10), nvgpu.NV01_MEMORY_LOCAL_USER, gib/2, handle(nvgpu.NV01_NULL_OBJECT))
+
+	p := fbParams(12*gib, 11*gib)
+	fbInfoApplyQuota(&nvp.memAcct, p)
+	if _, free := fbResult(p); free != 2*gib-gib/2 {
+		t.Errorf("free = %d, want %d", free, 2*gib-gib/2)
+	}
+}
+
+// TestVirtualFBFreeBoundedByDevice tests that reported free memory never
+// exceeds what the device actually has free, since memory consumed by other
+// sandboxes is not available to this one.
+func TestVirtualFBFreeBoundedByDevice(t *testing.T) {
+	const gib = 1 << 30
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuLimit = 8 * gib
+
+	// The device has only 1 GiB free, well below this sandbox's headroom.
+	p := fbParams(12*gib, gib)
+	fbInfoApplyQuota(&nvp.memAcct, p)
+	if _, free := fbResult(p); free != gib {
+		t.Errorf("free = %d, want %d", free, gib)
+	}
+}
+
+// TestVirtualFBUnlimitedPassesThrough tests that a sandbox with no quota sees
+// the device's real sizes.
+func TestVirtualFBUnlimitedPassesThrough(t *testing.T) {
+	const gib = 1 << 30
+	nvp := &nvproxy{}
+
+	p := fbParams(12*gib, 11*gib)
+	fbInfoApplyQuota(&nvp.memAcct, p)
+	total, free := fbResult(p)
+	if total != 12*gib || free != 11*gib {
+		t.Errorf("total, free = %d, %d; want %d, %d", total, free, 12*gib, 11*gib)
+	}
+}
+
+// TestVirtualFBOverQuotaReportsNoFree tests that a sandbox at or beyond its
+// limit is reported no free memory rather than an underflowed size.
+func TestVirtualFBOverQuotaReportsNoFree(t *testing.T) {
+	const gib = 1 << 30
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuLimit = gib
+	client := newTestClient(nvp, 1)
+
+	addMem(t, nvp, client, handle(10), nvgpu.NV01_MEMORY_LOCAL_USER, gib, handle(nvgpu.NV01_NULL_OBJECT))
+
+	p := fbParams(12*gib, 11*gib)
+	fbInfoApplyQuota(&nvp.memAcct, p)
+	if _, free := fbResult(p); free != 0 {
+		t.Errorf("free = %d, want 0", free)
+	}
+}
+
+// TestVirtualFBIgnoresOversizedList tests that a list size larger than the
+// array is clamped rather than indexed out of bounds.
+func TestVirtualFBIgnoresOversizedList(t *testing.T) {
+	const gib = 1 << 30
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuLimit = 2 * gib
+
+	p := fbParams(12*gib, 11*gib)
+	p.FBInfoListSize = ^uint32(0)
+	fbInfoApplyQuota(&nvp.memAcct, p)
+	if total, _ := fbResult(p); total != 2*gib {
+		t.Errorf("total = %d, want %d", total, 2*gib)
+	}
+}
+
+// TestVirtualFBPartialList tests that a request for only one of the two sizes
+// is handled, since applications may ask for either alone.
+func TestVirtualFBPartialList(t *testing.T) {
+	const gib = 1 << 30
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuLimit = 2 * gib
+
+	p := &nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS{FBInfoListSize: 1}
+	p.FBInfoList[0].Index = nvgpu.NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE
+	p.FBInfoList[0].Data = uint32(11 * gib / fbInfoUnitBytes)
+	fbInfoApplyQuota(&nvp.memAcct, p)
+	if got := uint64(p.FBInfoList[0].Data) * fbInfoUnitBytes; got != 2*gib {
+		t.Errorf("free = %d, want %d", got, 2*gib)
+	}
+}
