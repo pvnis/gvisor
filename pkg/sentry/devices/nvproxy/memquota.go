@@ -81,48 +81,143 @@ func (k memKind) countsAgainstGPULimit() bool {
 	return k == memKindVRAM || k == memKindUVMVA
 }
 
-// memKindOfClass returns the kind of memory held by driver objects of the
-// given class.
+// memClassKinds records the accounting decision for every allocation class
+// nvproxy supports, including those reached through NV_ESC_RM_ALLOC_MEMORY and
+// NV_ESC_RM_VID_HEAP_CONTROL rather than the allocation class table.
 //
-// Classes not listed here hold no accounted memory, or are not yet accounted;
-// see the "Unaccounted" note below. Implementors adding a new allocation class
-// to version.go must extend this function if the class commits memory.
+// Every class must appear here, including those that hold no memory.
+// TestAllocationClassesReviewed fails for any class registered in version.go
+// that is absent, so that a driver version which introduces a class cannot
+// leave it silently unaccounted: the failure is what forces the decision to be
+// made. Implementors adding an allocation class must add it here, and must
+// determine whether it commits memory rather than assuming it does not.
+var memClassKinds = map[nvgpu.ClassID]memKind{
+	// Device memory. Allocated by NV_ESC_RM_ALLOC, by NV_ESC_RM_ALLOC_MEMORY,
+	// and by NV_ESC_RM_VID_HEAP_CONTROL, which normalizes to these classes in
+	// rmVidHeapControlAllocSize().
+	nvgpu.NV01_MEMORY_LOCAL_USER:       memKindVRAM,
+	nvgpu.NV01_MEMORY_LOCAL_PRIVILEGED: memKindVRAM,
+
+	// Host memory pinned for GPU DMA, not device memory, despite being reached
+	// through the same allocation ioctls.
+	nvgpu.NV01_MEMORY_SYSTEM:               memKindPinnedHost,
+	nvgpu.NV01_MEMORY_SYSTEM_OS_DESCRIPTOR: memKindPinnedHost,
+
+	// Virtual address space only. Physical memory is committed by the
+	// allocations that back these ranges and is accounted there; charging the
+	// reservation as well would double-count.
+	nvgpu.NV01_MEMORY_VIRTUAL: memKindNone,
+	nvgpu.NV50_MEMORY_VIRTUAL: memKindNone,
+
+	// Reviewed but deliberately not accounted, pending validation against
+	// hardware. NV_MEMORY_EXTENDED_USER (EGM) is device-adjacent memory whose
+	// backing pool depends on platform configuration; the fabric classes may be
+	// backed by local device memory or by memory imported from another node,
+	// which determines whether this sandbox should be charged at all. A wrong
+	// answer here silently over- or under-counts, so these are left alone rather
+	// than guessed at, and must be resolved before the accounting can be called
+	// complete.
+	nvgpu.NV_MEMORY_EXTENDED_USER:       memKindNone,
+	nvgpu.NV_MEMORY_FABRIC:              memKindNone,
+	nvgpu.NV_MEMORY_MULTICAST_FABRIC:    memKindNone,
+	nvgpu.NV_MEMORY_FABRIC_IMPORTED_REF: memKindNone,
+	nvgpu.NV_MEMORY_EXPORT:              memKindNone,
+
+	// Reviewed; these hold no memory charged to the sandbox. They are clients,
+	// devices, channels, contexts, engine objects, events and similar. Note
+	// that NV_MEMORY_MAPPER and the *_INLINE_TO_MEMORY_* classes name memory but
+	// describe engines and mappings of memory allocated elsewhere.
+	nvgpu.NV01_ROOT:                    memKindNone,
+	nvgpu.NV01_ROOT_NON_PRIV:           memKindNone,
+	nvgpu.NV01_CONTEXT_DMA:             memKindNone,
+	nvgpu.NV01_ROOT_CLIENT:             memKindNone,
+	nvgpu.NV04_DISPLAY_COMMON:          memKindNone,
+	nvgpu.NV01_EVENT_OS_EVENT:          memKindNone,
+	nvgpu.NV01_DEVICE_0:                memKindNone,
+	nvgpu.NV_SEMAPHORE_SURFACE:         memKindNone,
+	nvgpu.RM_USER_SHARED_DATA:          memKindNone,
+	nvgpu.NV_IMEX_SESSION:              memKindNone,
+	nvgpu.NV_MEMORY_MAPPER:             memKindNone,
+	nvgpu.NV20_SUBDEVICE_0:             memKindNone,
+	nvgpu.NV2081_BINAPI:                memKindNone,
+	nvgpu.NV20_SUBDEVICE_DIAG:          memKindNone,
+	nvgpu.NV50_P2P:                     memKindNone,
+	nvgpu.NV50_THIRD_PARTY_P2P:         memKindNone,
+	nvgpu.GT200_DEBUGGER:               memKindNone,
+	nvgpu.MPS_COMPUTE:                  memKindNone,
+	nvgpu.FERMI_TWOD_A:                 memKindNone,
+	nvgpu.FERMI_CONTEXT_SHARE_A:        memKindNone,
+	nvgpu.GF100_DISP_SW:                memKindNone,
+	nvgpu.GF100_ZBC_CLEAR:              memKindNone,
+	nvgpu.GF100_PROFILER:               memKindNone,
+	nvgpu.GF100_SUBDEVICE_MASTER:       memKindNone,
+	nvgpu.GF100_SUBDEVICE_INFOROM:      memKindNone,
+	nvgpu.FERMI_VASPACE_A:              memKindNone,
+	nvgpu.KEPLER_CHANNEL_GROUP_A:       memKindNone,
+	nvgpu.NVENC_SW_SESSION:             memKindNone,
+	nvgpu.KEPLER_INLINE_TO_MEMORY_B:    memKindNone,
+	nvgpu.MAXWELL_PROFILER_DEVICE:      memKindNone,
+	nvgpu.NVB8B0_VIDEO_DECODER:         memKindNone,
+	nvgpu.NVB8D1_VIDEO_NVJPG:           memKindNone,
+	nvgpu.NVB8FA_VIDEO_OFA:             memKindNone,
+	nvgpu.VOLTA_USERMODE_A:             memKindNone,
+	nvgpu.TURING_USERMODE_A:            memKindNone,
+	nvgpu.TURING_CHANNEL_GPFIFO_A:      memKindNone,
+	nvgpu.NVC4B0_VIDEO_DECODER:         memKindNone,
+	nvgpu.NVC4B7_VIDEO_ENCODER:         memKindNone,
+	nvgpu.NVC4D1_VIDEO_NVJPG:           memKindNone,
+	nvgpu.AMPERE_CHANNEL_GPFIFO_A:      memKindNone,
+	nvgpu.TURING_A:                     memKindNone,
+	nvgpu.TURING_DMA_COPY_A:            memKindNone,
+	nvgpu.TURING_COMPUTE_A:             memKindNone,
+	nvgpu.HOPPER_USERMODE_A:            memKindNone,
+	nvgpu.AMPERE_A:                     memKindNone,
+	nvgpu.NVC6B0_VIDEO_DECODER:         memKindNone,
+	nvgpu.AMPERE_DMA_COPY_A:            memKindNone,
+	nvgpu.AMPERE_COMPUTE_A:             memKindNone,
+	nvgpu.NVC6FA_VIDEO_OFA:             memKindNone,
+	nvgpu.BLACKWELL_USERMODE_A:         memKindNone,
+	nvgpu.NVC7B0_VIDEO_DECODER:         memKindNone,
+	nvgpu.AMPERE_DMA_COPY_B:            memKindNone,
+	nvgpu.NVC7B7_VIDEO_ENCODER:         memKindNone,
+	nvgpu.AMPERE_COMPUTE_B:             memKindNone,
+	nvgpu.NVC7FA_VIDEO_OFA:             memKindNone,
+	nvgpu.HOPPER_CHANNEL_GPFIFO_A:      memKindNone,
+	nvgpu.HOPPER_DMA_COPY_A:            memKindNone,
+	nvgpu.BLACKWELL_CHANNEL_GPFIFO_A:   memKindNone,
+	nvgpu.ADA_A:                        memKindNone,
+	nvgpu.NVC9B0_VIDEO_DECODER:         memKindNone,
+	nvgpu.BLACKWELL_DMA_COPY_A:         memKindNone,
+	nvgpu.NVC9B7_VIDEO_ENCODER:         memKindNone,
+	nvgpu.ADA_COMPUTE_A:                memKindNone,
+	nvgpu.NVC9D1_VIDEO_NVJPG:           memKindNone,
+	nvgpu.NVC9FA_VIDEO_OFA:             memKindNone,
+	nvgpu.BLACKWELL_CHANNEL_GPFIFO_B:   memKindNone,
+	nvgpu.BLACKWELL_DMA_COPY_B:         memKindNone,
+	nvgpu.NV_CONFIDENTIAL_COMPUTE:      memKindNone,
+	nvgpu.HOPPER_A:                     memKindNone,
+	nvgpu.HOPPER_SEC2_WORK_LAUNCH_A:    memKindNone,
+	nvgpu.HOPPER_COMPUTE_A:             memKindNone,
+	nvgpu.NV_COUNTER_COLLECTION_UNIT:   memKindNone,
+	nvgpu.BLACKWELL_INLINE_TO_MEMORY_A: memKindNone,
+	nvgpu.BLACKWELL_A:                  memKindNone,
+	nvgpu.NVCDB0_VIDEO_DECODER:         memKindNone,
+	nvgpu.BLACKWELL_COMPUTE_A:          memKindNone,
+	nvgpu.NVCDD1_VIDEO_NVJPG:           memKindNone,
+	nvgpu.NVCDFA_VIDEO_OFA:             memKindNone,
+	nvgpu.BLACKWELL_B:                  memKindNone,
+	nvgpu.NVCEB7_VIDEO_ENCODER:         memKindNone,
+	nvgpu.BLACKWELL_COMPUTE_B:          memKindNone,
+	nvgpu.NVCFB7_VIDEO_ENCODER:         memKindNone,
+	nvgpu.NVD1B7_VIDEO_ENCODER:         memKindNone,
+}
+
+// memKindOfClass returns the kind of memory held by driver objects of the
+// given class. A class with no recorded decision holds nothing, which keeps a
+// driver upgrade from failing allocations outright; TestAllocationClassesReviewed
+// is what ensures such a class does not reach a release unreviewed.
 func memKindOfClass(class nvgpu.ClassID) memKind {
-	switch class {
-	case nvgpu.NV01_MEMORY_LOCAL_USER, nvgpu.NV01_MEMORY_LOCAL_PRIVILEGED:
-		// Device memory. Allocated by NV_ESC_RM_ALLOC, by
-		// NV_ESC_RM_ALLOC_MEMORY, and by NV_ESC_RM_VID_HEAP_CONTROL (which
-		// normalizes to this class in rmVidHeapControlAllocSize()).
-		return memKindVRAM
-
-	case nvgpu.NV01_MEMORY_SYSTEM, nvgpu.NV01_MEMORY_SYSTEM_OS_DESCRIPTOR:
-		// Host memory pinned for GPU DMA, not device memory, despite being
-		// reached through the same allocation ioctls.
-		return memKindPinnedHost
-
-	case nvgpu.NV01_MEMORY_VIRTUAL, nvgpu.NV50_MEMORY_VIRTUAL:
-		// Virtual address space only. Physical memory is committed by the
-		// allocations that back these ranges, and is accounted there; charging
-		// the reservation as well would double-count.
-		return memKindNone
-
-	default:
-		// Unaccounted:
-		//
-		// - NV_MEMORY_EXTENDED_USER (EGM) is device-adjacent memory whose
-		// backing pool depends on platform configuration.
-		//
-		// - NV_MEMORY_FABRIC, NV_MEMORY_MULTICAST_FABRIC and
-		// NV_MEMORY_FABRIC_IMPORTED_REF may be backed by local device memory
-		// or by memory imported from another node, which determines whether
-		// this sandbox should be charged at all.
-		//
-		// Both require validation against hardware before being charged; a
-		// wrong answer here silently over- or under-counts. They are left
-		// unaccounted deliberately rather than guessed at, and must be
-		// resolved before quota enforcement can claim completeness.
-		return memKindNone
-	}
+	return memClassKinds[class]
 }
 
 // memCharge records memory charged to a sandbox's account.

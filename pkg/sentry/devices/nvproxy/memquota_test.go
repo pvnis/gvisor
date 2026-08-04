@@ -15,6 +15,7 @@
 package nvproxy
 
 import (
+	"sort"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
@@ -749,5 +750,56 @@ func TestVirtualFBPartialList(t *testing.T) {
 	fbInfoApplyQuota(&nvp.memAcct, p)
 	if got := uint64(p.FBInfoList[0].Data) * fbInfoUnitBytes; got != 2*gib {
 		t.Errorf("free = %d, want %d", got, 2*gib)
+	}
+}
+
+// TestAllocationClassesReviewed tests that every allocation class nvproxy
+// supports has a recorded accounting decision.
+//
+// This is a drift guard rather than a test of behavior. Support for a new
+// driver version is added by extending the tables in version.go, and a version
+// that introduces an allocation class committing GPU memory would otherwise
+// leave it unaccounted, silently weakening every quota, with nothing failing to
+// say so. Requiring the class to be listed in memClassKinds forces whoever adds
+// it to decide whether it commits memory.
+func TestAllocationClassesReviewed(t *testing.T) {
+	Init()
+	// Report each unreviewed class once rather than once per driver version
+	// that registers it.
+	missing := make(map[nvgpu.ClassID][]string)
+	for version, abiEntry := range abis {
+		abi := abiEntry.cons()
+		for class := range abi.allocationClass {
+			if _, ok := memClassKinds[class]; !ok {
+				missing[class] = append(missing[class], version.String())
+			}
+		}
+	}
+	for class, versions := range missing {
+		sort.Strings(versions)
+		t.Errorf("allocation class %v has no accounting decision; add it to memClassKinds in memquota.go, "+
+			"charging it if it commits GPU memory (registered by driver version(s) %v)", class, versions)
+	}
+}
+
+// TestMemClassKindsCoversAccountedClasses tests that the classes the
+// allocation paths charge are all recorded as accounted. These are reached
+// through NV_ESC_RM_ALLOC_MEMORY and NV_ESC_RM_VID_HEAP_CONTROL rather than
+// the allocation class table, so TestAllocationClassesReviewed does not see
+// them.
+func TestMemClassKindsCoversAccountedClasses(t *testing.T) {
+	for _, test := range []struct {
+		class nvgpu.ClassID
+		want  memKind
+	}{
+		{nvgpu.NV01_MEMORY_LOCAL_USER, memKindVRAM},
+		{nvgpu.NV01_MEMORY_LOCAL_PRIVILEGED, memKindVRAM},
+		{nvgpu.NV01_MEMORY_SYSTEM, memKindPinnedHost},
+		{nvgpu.NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, memKindPinnedHost},
+		{nvgpu.NV_MEMORY_EXTENDED_USER, memKindNone},
+	} {
+		if got := memKindOfClass(test.class); got != test.want {
+			t.Errorf("memKindOfClass(%v) = %v, want %v", test.class, got, test.want)
+		}
 	}
 }
