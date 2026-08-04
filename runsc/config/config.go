@@ -377,6 +377,11 @@ type Config struct {
 	// the sandbox may allocate. Zero means no limit.
 	NVProxyGPUMemoryLimit uint64 `flag:"nvproxy-gpu-memory-limit"`
 
+	// NVProxyMaxTimesliceUs is the longest GPU scheduler timeslice, in
+	// microseconds, that the sandbox may request for its channel groups. Zero
+	// means no limit.
+	NVProxyMaxTimesliceUs uint64 `flag:"nvproxy-max-timeslice-us"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

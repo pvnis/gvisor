@@ -1079,6 +1079,34 @@ func fbInfoApplyQuota(acct *memAccount, ctrlParams *nvgpu.NV2080_CTRL_FB_GET_INF
 	}
 }
 
+// ctrlSetTimeslice handles NVA06C_CTRL_CMD_SET_TIMESLICE.
+//
+// The timeslice is how long the GPU's scheduler runs a channel group before
+// switching to another, so a sandbox that enlarges its own timeslice takes a
+// greater share of a GPU it shares with others. Work submission does not pass
+// through the Sentry -- it is a write to a mapped pushbuffer and a doorbell
+// ring -- so this is the only point at which nvproxy sees anything about
+// scheduling at all, and the only one at which it can refuse.
+func ctrlSetTimeslice(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
+	limit := fi.fd.dev.nvp.maxTimesliceUs
+	if limit == 0 {
+		return rmControlSimple(fi, ioctlParams)
+	}
+	var ctrlParams nvgpu.NVA06C_CTRL_SET_TIMESLICE_PARAMS
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+	if ctrlParams.TimesliceUs > limit {
+		fi.ctx.Warningf("nvproxy: denied request for a %d us GPU scheduler timeslice, which exceeds the limit of %d us",
+			ctrlParams.TimesliceUs, limit)
+		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INSUFFICIENT_PERMISSIONS)
+	}
+	return rmControlSimple(fi, ioctlParams)
+}
+
 func ctrlHasFrontendFD[Params any, PtrParams hasFrontendFDPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	var ctrlParamsValue Params
 	ctrlParams := PtrParams(&ctrlParamsValue)

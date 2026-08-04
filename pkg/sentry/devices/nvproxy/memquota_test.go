@@ -833,3 +833,13 @@ func TestLimitDenialWarnsOnce(t *testing.T) {
 		t.Errorf("warnedDenied = false after UVM denial, want true")
 	}
 }
+
+// TestMaxTimesliceUnsetIsUnrestricted tests that a sandbox with no timeslice
+// limit configured is not subject to one, so that enabling the limit is opt-in
+// and existing sandboxes are unaffected.
+func TestMaxTimesliceUnsetIsUnrestricted(t *testing.T) {
+	nvp := &nvproxy{}
+	if nvp.maxTimesliceUs != 0 {
+		t.Errorf("maxTimesliceUs = %d by default, want 0 (unrestricted)", nvp.maxTimesliceUs)
+	}
+}

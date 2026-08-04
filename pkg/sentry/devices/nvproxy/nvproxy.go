@@ -58,6 +58,10 @@ type Options struct {
 	// sandbox may allocate. Zero means no limit.
 	GPUMemoryLimit uint64
 
+	// MaxTimesliceUs is the longest GPU scheduler timeslice, in microseconds,
+	// that the sandbox may request. Zero means no limit.
+	MaxTimesliceUs uint64
+
 	HostSettings *nvconf.HostSettings
 
 	// If UseDevGofer is true, open device files via gofer.
@@ -94,6 +98,10 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		clients:                make(map[nvgpu.Handle]*rootClient),
 	}
 	nvp.memAcct.gpuLimit = opts.GPUMemoryLimit
+	nvp.maxTimesliceUs = opts.MaxTimesliceUs
+	if opts.MaxTimesliceUs != 0 {
+		log.Infof("nvproxy: GPU scheduler timeslice limited to %d us", opts.MaxTimesliceUs)
+	}
 	if opts.GPUMemoryLimit != 0 {
 		log.Infof("nvproxy: GPU memory limited to %d bytes", opts.GPUMemoryLimit)
 	}
@@ -217,6 +225,7 @@ type nvproxy struct {
 	abi                    *driverABI `state:"nosave"`
 	version                nvconf.DriverVersion
 	capsEnabled            nvconf.DriverCaps
+	maxTimesliceUs         uint64
 	useDevGofer            bool
 	procDriverNvidiaParams string
 	devInfo                DeviceInfo

@@ -980,3 +980,17 @@ func TestNVProxyGPUMemoryLimitOverride(t *testing.T) {
 		})
 	}
 }
+
+// TestNVProxyMaxTimesliceDefault tests that the GPU timeslice limit is not
+// applied unless configured.
+func TestNVProxyMaxTimesliceDefault(t *testing.T) {
+	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+	RegisterFlags(testFlags)
+	c, err := NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.NVProxyMaxTimesliceUs != 0 {
+		t.Errorf("NVProxyMaxTimesliceUs = %d, want 0", c.NVProxyMaxTimesliceUs)
+	}
+}

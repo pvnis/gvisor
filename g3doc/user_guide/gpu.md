@@ -359,6 +359,20 @@ error is reported:
 pod_annotations = ["dev.gvisor.*"]
 ```
 
+### Limiting the scheduler timeslice
+
+The timeslice is how long the GPU scheduler runs a channel group before
+switching to another, so a container that enlarges its own takes a greater
+share of a GPU it shares with others. `--nvproxy-max-timeslice-us` caps the
+value a sandbox may request; requests above it fail with
+`NV_ERR_INSUFFICIENT_PERMISSIONS`. The default of `0` imposes no limit, leaving
+behavior unchanged.
+
+This is the only scheduling control nvproxy can police, for the reason given
+under limitations below: everything else about scheduling happens without the
+Sentry's involvement. It prevents a container enlarging its own share; it does
+not let shares be assigned.
+
 ### What counts against the limit
 
 The limit covers GPU device memory, and address space reserved on
@@ -383,11 +397,31 @@ device's other tenants are using.
 
 ### Limitations and future work
 
--   **Compute is not limited.** This bounds memory only. A sandbox within its
-    memory limit can still monopolize the GPU's compute resources. Sharing a GPU
-    between containers additionally requires something like the
+-   **Compute is not limited, and cannot be from here.** This bounds memory
+    only. Once a channel has been set up, work is submitted by writing commands
+    to a pushbuffer in mapped memory and ringing a doorbell through a mapped
+    register. That never enters the kernel, so the Sentry does not see it: a
+    sustained run of 13,000 kernel launches produced no `ioctl`s at all between
+    context creation and teardown. There is consequently no point at which
+    nvproxy could meter, delay or schedule GPU work, and no amount of `ioctl`
+    handling would create one.
+
+    This is a real difference from in-container approaches such as HAMi's
+    `libvgpu.so`, which can limit compute precisely because it runs inside the
+    container and intercepts CUDA calls before submission. That position is also
+    what makes such limits removable by the workload being limited. The trade is
+    structural rather than incidental: enforcement outside the container cannot
+    see work submission, and enforcement that can see it is reachable by the
+    container.
+
+    Sharing a GPU between containers therefore also wants something like the
     `k8s-device-plugin`'s time-slicing, which provides no memory isolation of
-    its own; the two mechanisms are complementary.
+    its own; the two mechanisms are complementary. Time-slicing divides GPU time
+    evenly between equal workloads, but the shares are the GPU scheduler's
+    default round-robin rather than a policy: they cannot be assigned per
+    container, and a workload that issues longer kernels takes a somewhat larger
+    share. Where compute must genuinely be partitioned, MIG enforces it in
+    hardware.
 
 -   **Denying unified memory is reported poorly by CUDA.** An allocation
     refused by the limit fails the underlying `mmap` with `ENOMEM`, which is

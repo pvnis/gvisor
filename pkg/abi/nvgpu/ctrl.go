@@ -878,6 +878,16 @@ const (
 	NVA06C_CTRL_CMD_PREEMPT         = 0xa06c0105
 )
 
+// NVA06C_CTRL_SET_TIMESLICE_PARAMS is the parameter type for
+// NVA06C_CTRL_CMD_SET_TIMESLICE, from
+// src/common/sdk/nvidia/inc/ctrl/ctrla06c.h.
+//
+// +marshal
+type NVA06C_CTRL_SET_TIMESLICE_PARAMS struct {
+	_           structs.HostLayout
+	TimesliceUs uint64
+}
+
 // From src/common/sdk/nvidia/inc/ctrl/ctrla06f/ctrla06fgpfifo.h:
 const (
 	NVA06F_CTRL_CMD_GPFIFO_SCHEDULE = 0xa06f0103
