@@ -48,6 +48,7 @@ const (
 	flagQDiscTBFRate            = "qdisc-tbf-rate"
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
 	flagMountCgroupV2           = "mount-cgroup-v2"
+	flagNVProxyGPUComputePct    = "nvproxy-gpu-compute-percent"
 	flagNVProxyGPUMemLimit      = "nvproxy-gpu-memory-limit"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
@@ -183,6 +184,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("nvproxy-docker", false, "LEGACY: Injects nvidia-container-runtime-hook as a prestart hook. Try to use nvidia-container-runtime or `docker run --gpus` instead. Or manually add nvidia-container-runtime-hook as a prestart hook and set up NVIDIA_VISIBLE_DEVICES container environment variable.")
 	flagSet.String("nvproxy-driver-version", "", "NVIDIA driver ABI version to use. If empty, autodetect installed driver version. The special value 'latest' may also be used to use the latest ABI.")
 	flagSet.Bool("nvproxy-allow-unsupported-driver", false, "allow nvproxy to be initialized with an unsupported driver version.")
+	flagSet.Uint64(flagNVProxyGPUComputePct, 0, "percentage of wall-clock time during which the sandbox may submit work to the GPU. Submission is held in the Sentry outside that share, so the limit cannot be bypassed from within the sandbox. 0 means no limit.")
 	flagSet.Uint64("nvproxy-max-timeslice-us", 0, "longest GPU scheduler timeslice, in microseconds, that a sandbox may request for its channel groups. A longer timeslice increases the sandbox's share of the GPU relative to others sharing it. 0 means no limit.")
 	flagSet.Uint64(flagNVProxyGPUMemLimit, 0, "maximum number of bytes of GPU memory that the sandbox may allocate, counting device memory and address space reserved for CUDA unified memory. 0 means no limit.")
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
@@ -224,6 +226,30 @@ var overrideAllowlist = map[string]struct {
 	flagQDiscTBFBurst:           {check: checkQDiscTBFBurst},
 	flagMountCgroupV2:           {},
 	flagNVProxyGPUMemLimit:      {check: checkNVProxyGPUMemoryLimit},
+	flagNVProxyGPUComputePct:    {check: checkNVProxyGPUComputePercent},
+}
+
+// checkNVProxyGPUComputePercent ensures that a container may reduce its share
+// of GPU compute but not increase it, for the same reason as
+// checkNVProxyGPUMemoryLimit: the spec is frequently written by the workload
+// being limited.
+func checkNVProxyGPUComputePercent(c *Config, name string, value string) error {
+	pct, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid %s annotation %q: %w", name, value, err)
+	}
+	if pct > 100 {
+		return fmt.Errorf("%s=%q is not a percentage", name, value)
+	}
+	runtime := c.NVProxyGPUComputePercent
+	if runtime == 0 || runtime >= 100 {
+		// The runtime imposes no limit, so any percentage is a restriction.
+		return nil
+	}
+	if pct == 0 || pct > runtime {
+		return fmt.Errorf("%s=%q exceeds the limit of %d%% configured on the runtime; annotations may only lower it", name, value, runtime)
+	}
+	return nil
 }
 
 // checkNVProxyGPUMemoryLimit ensures that the GPU memory limit can be lowered

@@ -42,6 +42,7 @@ go_template_instance(
 go_library(
     name = "nvproxy",
     srcs = [
+        "computegate.go",
         "fds_mutex.go",
         "frontend.go",
         "frontend_mmap.go",
@@ -104,6 +105,7 @@ go_library(
 go_test(
     name = "nvproxy_test",
     srcs = [
+        "computegate_test.go",
         "memquota_test.go",
         "nvproxy_test.go",
     ],

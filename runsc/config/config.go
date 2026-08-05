@@ -382,6 +382,10 @@ type Config struct {
 	// means no limit.
 	NVProxyMaxTimesliceUs uint64 `flag:"nvproxy-max-timeslice-us"`
 
+	// NVProxyGPUComputePercent is the percentage of wall-clock time during
+	// which the sandbox may submit work to the GPU. Zero means no limit.
+	NVProxyGPUComputePercent uint64 `flag:"nvproxy-gpu-compute-percent"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

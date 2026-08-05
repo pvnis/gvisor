@@ -994,3 +994,32 @@ func TestNVProxyMaxTimesliceDefault(t *testing.T) {
 		t.Errorf("NVProxyMaxTimesliceUs = %d, want 0", c.NVProxyMaxTimesliceUs)
 	}
 }
+
+// TestNVProxyGPUComputePercentOverride tests that the GPU compute annotation
+// may lower the runtime's share but not raise it.
+func TestNVProxyGPUComputePercentOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		runtime     uint64
+		annotation  string
+		wantAllowed bool
+	}{
+		{name: "lower than runtime", runtime: 50, annotation: "25", wantAllowed: true},
+		{name: "equal to runtime", runtime: 50, annotation: "50", wantAllowed: true},
+		{name: "higher than runtime", runtime: 50, annotation: "75", wantAllowed: false},
+		{name: "unlimited when runtime limits", runtime: 50, annotation: "0", wantAllowed: false},
+		{name: "hundred when runtime limits", runtime: 50, annotation: "100", wantAllowed: false},
+		{name: "any share when runtime unlimited", runtime: 0, annotation: "75", wantAllowed: true},
+		{name: "over one hundred", runtime: 0, annotation: "150", wantAllowed: false},
+		{name: "not a number", runtime: 50, annotation: "half", wantAllowed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{NVProxyGPUComputePercent: tc.runtime}
+			err := checkNVProxyGPUComputePercent(c, flagNVProxyGPUComputePct, tc.annotation)
+			if gotAllowed := err == nil; gotAllowed != tc.wantAllowed {
+				t.Errorf("checkNVProxyGPUComputePercent(runtime=%d, annotation=%q) error = %v, want allowed = %v",
+					tc.runtime, tc.annotation, err, tc.wantAllowed)
+			}
+		})
+	}
+}

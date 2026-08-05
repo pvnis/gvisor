@@ -62,6 +62,10 @@ type Options struct {
 	// that the sandbox may request. Zero means no limit.
 	MaxTimesliceUs uint64
 
+	// ComputePercent is the percentage of wall-clock time during which the
+	// sandbox may submit work to the GPU. Zero means no limit.
+	ComputePercent uint64
+
 	HostSettings *nvconf.HostSettings
 
 	// If UseDevGofer is true, open device files via gofer.
@@ -99,6 +103,11 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	}
 	nvp.memAcct.gpuLimit = opts.GPUMemoryLimit
 	nvp.maxTimesliceUs = opts.MaxTimesliceUs
+	nvp.computeGate.init(opts.ComputePercent)
+	if nvp.computeGate.enabled() {
+		log.Infof("nvproxy: GPU compute limited to %d%% of wall-clock time", opts.ComputePercent)
+		go nvp.computeGate.run()
+	}
 	if opts.MaxTimesliceUs != 0 {
 		log.Infof("nvproxy: GPU scheduler timeslice limited to %d us", opts.MaxTimesliceUs)
 	}
@@ -226,6 +235,7 @@ type nvproxy struct {
 	version                nvconf.DriverVersion
 	capsEnabled            nvconf.DriverCaps
 	maxTimesliceUs         uint64
+	computeGate            computeGate
 	useDevGofer            bool
 	procDriverNvidiaParams string
 	devInfo                DeviceInfo

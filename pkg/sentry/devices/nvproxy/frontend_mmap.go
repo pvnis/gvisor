@@ -36,8 +36,63 @@ func (fd *frontendFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) 
 	return vfs.GenericProxyDeviceConfigureMMap(&fd.vfsfd, fd, opts)
 }
 
+// AddMapping implements memmap.Mappable.AddMapping.
+func (fd *frontendFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	fd.mappingsMu.Lock()
+	defer fd.mappingsMu.Unlock()
+	fd.mappings.AddMapping(ms, ar, offset, writable)
+	return nil
+}
+
+// RemoveMapping implements memmap.Mappable.RemoveMapping.
+func (fd *frontendFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	fd.mappingsMu.Lock()
+	defer fd.mappingsMu.Unlock()
+	fd.mappings.RemoveMapping(ms, ar, offset, writable)
+}
+
+// CopyMapping implements memmap.Mappable.CopyMapping.
+func (fd *frontendFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return fd.AddMapping(ctx, ms, dstAR, offset, writable)
+}
+
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+//
+// This file's memmap.File and offsets remain consistent across save/restore,
+// so its mappings never require invalidation for that purpose.
+func (fd *frontendFD) InvalidateUnsavable(ctx context.Context) error {
+	return nil
+}
+
+// revokeMappings invalidates every mapping of this file, so that the next
+// access faults into the Sentry.
+func (fd *frontendFD) revokeMappings() {
+	type mapping struct {
+		ms memmap.MappingSpace
+		ar hostarch.AddrRange
+	}
+	fd.mappingsMu.Lock()
+	var ms []mapping
+	for seg := fd.mappings.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		for m := range seg.Value() {
+			ms = append(ms, mapping{m.MappingSpace, m.AddrRange})
+		}
+	}
+	fd.mappingsMu.Unlock()
+	// Invalidate outside the lock: it acquires the address space's own lock,
+	// which a task faulting on this file may hold while waiting in Translate.
+	for _, m := range ms {
+		m.ms.Invalidate(m.ar, memmap.InvalidateOpts{})
+	}
+}
+
 // Translate implements memmap.Mappable.Translate.
 func (fd *frontendFD) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	// Writes to a channel's command buffer submit work to the GPU, so this is
+	// where a sandbox over its compute limit is held.
+	if at.Write && fd.gated.Load() {
+		fd.dev.nvp.computeGate.wait(ctx)
+	}
 	return []memmap.Translation{
 		{
 			Source: optional,

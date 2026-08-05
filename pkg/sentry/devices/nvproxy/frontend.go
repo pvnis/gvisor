@@ -34,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -96,7 +97,17 @@ type frontendFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
 	vfs.NoLockFD
-	memmap.MappableNoTrackMappings
+	// mappings tracks application mappings of this file so that they can be
+	// revoked by the compute gate. mappings is protected by mappingsMu.
+	mappingsMu sync.Mutex `state:"nosave"`
+	mappings   memmap.MappingSet
+
+	// mappedMem is the memory object mapped through this file, if any, and is
+	// protected by mappedMemMu. gated records whether that object was
+	// subsequently identified as a channel command buffer.
+	mappedMemMu sync.Mutex `state:"nosave"`
+	mappedMem   nvgpu.Handle
+	gated       atomicbitops.Bool
 
 	dev           *frontendDevice
 	containerName string
@@ -134,6 +145,7 @@ type frontendFD struct {
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *frontendFD) Release(ctx context.Context) {
+	fd.dev.nvp.computeGate.forget(fd)
 	fdnotifier.RemoveFD(fd.hostFD)
 	fd.appQueue.Notify(waiter.EventHUp)
 
@@ -1626,6 +1638,7 @@ func rmAllocChannelGroup(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAM
 
 func rmAllocChannel(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
 	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CHANNEL_ALLOC_PARAMS) {
+		fi.fd.dev.nvp.computeGate.addCommandBuffer(allocParams.HObjectBuffer)
 		// See
 		// src/nvidia/src/kernel/gpu/fifo/kernel_channel.c:kchannelConstruct_IMPL()
 		// => refAddDependant(). The channel's parent may be a device or
@@ -1641,6 +1654,7 @@ func rmAllocChannel(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS
 // rmAllocChannelV570 is the same as rmAllocChannel, but for 570.86.15.
 func rmAllocChannelV570(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
 	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570) {
+		fi.fd.dev.nvp.computeGate.addCommandBuffer(allocParams.HObjectBuffer)
 		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace, allocParams.HContextShare)
 	})
 }
@@ -1648,6 +1662,7 @@ func rmAllocChannelV570(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAME
 // rmAllocChannelV610 is the same as rmAllocChannel, but for 610.43.02.
 func rmAllocChannelV610(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
 	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CHANNEL_ALLOC_PARAMS_V610) {
+		fi.fd.dev.nvp.computeGate.addCommandBuffer(allocParams.HObjectBuffer)
 		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace, allocParams.HContextShare)
 	})
 }
@@ -1843,6 +1858,11 @@ func rmMapMemory(fi *frontendIoctlState) (uintptr, error) {
 		fi.ctx.Warningf("nvproxy: attempted to reuse FD %d for NV_ESC_RM_MAP_MEMORY", ioctlParams.FD)
 		return 0, linuxerr.EINVAL
 	}
+
+	mapFile.mappedMemMu.Lock()
+	mapFile.mappedMem = ioctlParams.Params.HMemory
+	mapFile.mappedMemMu.Unlock()
+	fi.fd.dev.nvp.computeGate.noteMapping(ioctlParams.Params.HMemory, mapFile)
 
 	origFD := ioctlParams.FD
 	ioctlParams.FD = mapFile.hostFD

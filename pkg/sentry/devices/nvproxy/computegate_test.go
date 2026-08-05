@@ -1,0 +1,193 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package nvproxy
+
+import (
+	"testing"
+	"time"
+
+	"gvisor.dev/gvisor/pkg/abi/nvgpu"
+)
+
+func newGate(percent uint64) *computeGate {
+	g := &computeGate{}
+	g.init(percent)
+	return g
+}
+
+// atPhase returns a time at the given offset into a period.
+func atPhase(d time.Duration) time.Time {
+	base := time.Unix(0, 0).Add(1000 * computeGatePeriod)
+	return base.Add(d)
+}
+
+func TestComputeGateEnabled(t *testing.T) {
+	for _, test := range []struct {
+		percent uint64
+		want    bool
+	}{
+		{0, false},   // unset
+		{100, false}, // the whole period is permitted
+		{1, true},
+		{50, true},
+		{99, true},
+	} {
+		if got := newGate(test.percent).enabled(); got != test.want {
+			t.Errorf("percent %d: enabled() = %v, want %v", test.percent, got, test.want)
+		}
+	}
+}
+
+// TestComputeGateWaitUntil tests how long a submission is held, which is what
+// determines the share of time a sandbox receives.
+func TestComputeGateWaitUntil(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		percent uint64
+		phase   time.Duration
+		want    time.Duration
+	}{
+		{
+			// Inside the allowance, submission proceeds immediately.
+			name: "within allowance", percent: 50,
+			phase: 10 * time.Millisecond, want: 0,
+		},
+		{
+			// At the very end of the allowance it is still permitted.
+			name: "last instant of allowance", percent: 50,
+			phase: 50*time.Millisecond - time.Nanosecond, want: 0,
+		},
+		{
+			// Just past it, the wait runs to the end of the period.
+			name: "just past allowance", percent: 50,
+			phase: 50 * time.Millisecond, want: 50 * time.Millisecond,
+		},
+		{
+			name: "late in period", percent: 50,
+			phase: 90 * time.Millisecond, want: 10 * time.Millisecond,
+		},
+		{
+			// A small share waits for most of the period.
+			name: "small share", percent: 10,
+			phase: 20 * time.Millisecond, want: 80 * time.Millisecond,
+		},
+		{
+			// No limit configured: never held.
+			name: "disabled", percent: 0,
+			phase: 90 * time.Millisecond, want: 0,
+		},
+		{
+			name: "full share", percent: 100,
+			phase: 90 * time.Millisecond, want: 0,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := newGate(test.percent).waitUntil(atPhase(test.phase)); got != test.want {
+				t.Errorf("waitUntil(phase=%v) = %v, want %v", test.phase, got, test.want)
+			}
+		})
+	}
+}
+
+// TestComputeGateWaitNeverExceedsPeriod tests that a submission is never held
+// for longer than one period, so that a gated sandbox always makes progress.
+func TestComputeGateWaitNeverExceedsPeriod(t *testing.T) {
+	for _, percent := range []uint64{1, 25, 50, 99} {
+		g := newGate(percent)
+		for phase := time.Duration(0); phase < computeGatePeriod; phase += time.Millisecond {
+			if d := g.waitUntil(atPhase(phase)); d < 0 || d >= computeGatePeriod {
+				t.Errorf("percent %d, phase %v: wait = %v, want within [0, %v)", percent, phase, d, computeGatePeriod)
+			}
+		}
+	}
+}
+
+// TestComputeGateAllowanceFraction tests that the permitted portion of each
+// period matches the configured percentage, since the share a sandbox receives
+// is proportional to it.
+func TestComputeGateAllowanceFraction(t *testing.T) {
+	for _, percent := range []uint64{10, 25, 50, 75} {
+		g := newGate(percent)
+		var permitted int
+		const samples = 1000
+		for i := 0; i < samples; i++ {
+			phase := time.Duration(i) * computeGatePeriod / samples
+			if g.waitUntil(atPhase(phase)) == 0 {
+				permitted++
+			}
+		}
+		got := uint64(permitted * 100 / samples)
+		if got != percent {
+			t.Errorf("percent %d: %d%% of the period was permitted", percent, got)
+		}
+	}
+}
+
+// TestComputeGateResolvesEitherOrder tests that a command buffer is gated
+// whether the channel is created before or after its memory is mapped. An
+// application maps first, but nothing guarantees it.
+func TestComputeGateResolvesEitherOrder(t *testing.T) {
+	h := nvgpu.Handle{Val: 0x5c000015}
+
+	t.Run("mapped first", func(t *testing.T) {
+		g, fd := newGate(50), &frontendFD{}
+		g.noteMapping(h, fd)
+		if fd.gated.Load() {
+			t.Errorf("gated before the channel identified the buffer")
+		}
+		g.addCommandBuffer(h)
+		if !fd.gated.Load() {
+			t.Errorf("not gated after the channel identified the buffer")
+		}
+	})
+
+	t.Run("channel first", func(t *testing.T) {
+		g, fd := newGate(50), &frontendFD{}
+		g.addCommandBuffer(h)
+		g.noteMapping(h, fd)
+		if !fd.gated.Load() {
+			t.Errorf("not gated after the mapping appeared")
+		}
+	})
+}
+
+// TestComputeGateDisabledTracksNothing tests that an unlimited sandbox does no
+// bookkeeping.
+func TestComputeGateDisabledTracksNothing(t *testing.T) {
+	h := nvgpu.Handle{Val: 0x5c000015}
+	g, fd := newGate(0), &frontendFD{}
+	g.noteMapping(h, fd)
+	g.addCommandBuffer(h)
+	if fd.gated.Load() || len(g.gated) != 0 || len(g.byMem) != 0 {
+		t.Errorf("gating disabled but state was recorded")
+	}
+}
+
+// TestComputeGateForget tests that a released file description is dropped, so
+// that the gate does not retain it.
+func TestComputeGateForget(t *testing.T) {
+	h := nvgpu.Handle{Val: 0x5c000015}
+	g, fd := newGate(50), &frontendFD{}
+	fd.mappedMem = h
+	g.noteMapping(h, fd)
+	g.addCommandBuffer(h)
+	if len(g.gated) != 1 || len(g.byMem) != 1 {
+		t.Fatalf("gated=%d byMem=%d, want 1 and 1", len(g.gated), len(g.byMem))
+	}
+	g.forget(fd)
+	if len(g.gated) != 0 || len(g.byMem) != 0 {
+		t.Errorf("gated=%d byMem=%d after release, want 0 and 0", len(g.gated), len(g.byMem))
+	}
+}
