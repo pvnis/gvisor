@@ -49,6 +49,7 @@ const (
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
 	flagMountCgroupV2           = "mount-cgroup-v2"
 	flagNVProxyGPUComputePct    = "nvproxy-gpu-compute-percent"
+	flagNVProxyGPUWeight        = "nvproxy-gpu-weight"
 	flagNVProxyGPUMemLimit      = "nvproxy-gpu-memory-limit"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
@@ -185,7 +186,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("nvproxy-driver-version", "", "NVIDIA driver ABI version to use. If empty, autodetect installed driver version. The special value 'latest' may also be used to use the latest ABI.")
 	flagSet.Bool("nvproxy-allow-unsupported-driver", false, "allow nvproxy to be initialized with an unsupported driver version.")
 	flagSet.String("nvproxy-gpu-scheduler-socket", "", "path of a `runsc gpu-scheduler` socket that divides the GPU between the sandboxes sharing it. When set, the sandbox's share is decided by the scheduler rather than fixed.")
-	flagSet.Uint64("nvproxy-gpu-weight", 0, "this sandbox's share of a GPU relative to others scheduled alongside it. Only meaningful with --nvproxy-gpu-scheduler-socket. 0 is treated as 1.")
+	flagSet.Uint64(flagNVProxyGPUWeight, 0, "this sandbox's share of a GPU relative to others scheduled alongside it. Only meaningful with --nvproxy-gpu-scheduler-socket. 0 is treated as 1.")
 	flagSet.Uint64(flagNVProxyGPUComputePct, 0, "percentage of wall-clock time during which the sandbox may submit work to the GPU. Submission is held in the Sentry outside that share, so the limit cannot be bypassed from within the sandbox. 0 means no limit.")
 	flagSet.Uint64("nvproxy-max-timeslice-us", 0, "longest GPU scheduler timeslice, in microseconds, that a sandbox may request for its channel groups. A longer timeslice increases the sandbox's share of the GPU relative to others sharing it. 0 means no limit.")
 	flagSet.Uint64(flagNVProxyGPUMemLimit, 0, "maximum number of bytes of GPU memory that the sandbox may allocate, counting device memory and address space reserved for CUDA unified memory. 0 means no limit.")
@@ -229,6 +230,33 @@ var overrideAllowlist = map[string]struct {
 	flagMountCgroupV2:           {},
 	flagNVProxyGPUMemLimit:      {check: checkNVProxyGPUMemoryLimit},
 	flagNVProxyGPUComputePct:    {check: checkNVProxyGPUComputePercent},
+	flagNVProxyGPUWeight:        {check: checkNVProxyGPUWeight},
+}
+
+// checkNVProxyGPUWeight ensures that a container may reduce its share of a GPU
+// but not increase it.
+//
+// A weight is relative, so raising one takes GPU time from every other
+// container sharing the device. As with the other limits, the value configured
+// on the runtime is the most a container may have, and a spec written by the
+// workload itself may only ask for less.
+func checkNVProxyGPUWeight(c *Config, name string, value string) error {
+	weight, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid %s annotation %q: %w", name, value, err)
+	}
+	if weight == 0 {
+		return fmt.Errorf("%s=%q: a weight of zero would exclude the container from scheduling", name, value)
+	}
+	runtime := c.NVProxyGPUWeight
+	if runtime == 0 {
+		// The runtime states no weight, so there is nothing to exceed.
+		return nil
+	}
+	if weight > runtime {
+		return fmt.Errorf("%s=%q exceeds the weight of %d configured on the runtime; annotations may only lower it", name, value, runtime)
+	}
+	return nil
 }
 
 // checkNVProxyGPUComputePercent ensures that a container may reduce its share

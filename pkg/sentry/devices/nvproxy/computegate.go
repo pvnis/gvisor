@@ -118,8 +118,12 @@ func (g *computeGate) setGrant(grant gpusched.Grant) {
 		grant.Allowance = grant.Period
 	}
 	g.grantMu.Lock()
+	changed := g.grant != grant
 	g.grant = grant
 	g.grantMu.Unlock()
+	if changed {
+		log.Infof("nvproxy: GPU window is now %v of every %v at phase %v", grant.Allowance, grant.Period, grant.Phase)
+	}
 }
 
 // currentGrant returns the window in effect.

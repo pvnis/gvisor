@@ -1023,3 +1023,31 @@ func TestNVProxyGPUComputePercentOverride(t *testing.T) {
 		})
 	}
 }
+
+// TestNVProxyGPUWeightOverride tests that the GPU weight annotation may lower a
+// container's share but not raise it, since a weight is relative and raising
+// one takes time from every other container on the GPU.
+func TestNVProxyGPUWeightOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		runtime     uint64
+		annotation  string
+		wantAllowed bool
+	}{
+		{name: "lower than runtime", runtime: 300, annotation: "100", wantAllowed: true},
+		{name: "equal to runtime", runtime: 300, annotation: "300", wantAllowed: true},
+		{name: "higher than runtime", runtime: 300, annotation: "600", wantAllowed: false},
+		{name: "zero", runtime: 300, annotation: "0", wantAllowed: false},
+		{name: "any weight when runtime states none", runtime: 0, annotation: "600", wantAllowed: true},
+		{name: "not a number", runtime: 300, annotation: "heavy", wantAllowed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{NVProxyGPUWeight: tc.runtime}
+			err := checkNVProxyGPUWeight(c, flagNVProxyGPUWeight, tc.annotation)
+			if gotAllowed := err == nil; gotAllowed != tc.wantAllowed {
+				t.Errorf("checkNVProxyGPUWeight(runtime=%d, annotation=%q) error = %v, want allowed = %v",
+					tc.runtime, tc.annotation, err, tc.wantAllowed)
+			}
+		})
+	}
+}
