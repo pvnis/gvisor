@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy"
@@ -42,6 +43,7 @@ type Options struct {
 	NVProxy               bool
 	NVProxyCaps           nvconf.DriverCaps
 	TPUProxy              bool
+	AMDProxy              bool
 	ControllerFD          uint32
 	CgoEnabled            bool
 	PluginNetwork         bool
@@ -71,6 +73,7 @@ func (opt Options) ConfigKey() string {
 	fmt.Fprintf(&sb, "NVProxy=%t ", opt.NVProxy)
 	fmt.Fprintf(&sb, "NVProxyCaps=%v ", opt.NVProxyCaps)
 	fmt.Fprintf(&sb, "TPUProxy=%t ", opt.TPUProxy)
+	fmt.Fprintf(&sb, "AMDProxy=%t ", opt.AMDProxy)
 	fmt.Fprintf(&sb, "CgoEnabled=%t ", opt.CgoEnabled)
 	fmt.Fprintf(&sb, "PluginNetwork=%t ", opt.PluginNetwork)
 	return strings.TrimSpace(sb.String())
@@ -101,6 +104,9 @@ func Warnings(opt Options) []string {
 	}
 	if opt.TPUProxy {
 		warnings = append(warnings, "TPU device proxy enabled: syscall filters less restrictive!")
+	}
+	if opt.AMDProxy {
+		warnings = append(warnings, "AMD GPU driver proxy enabled: syscall filters less restrictive!")
 	}
 	if opt.CgoEnabled {
 		warnings = append(warnings, "CGO enabled: syscall filters less restrictive!")
@@ -154,6 +160,9 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 	}
 	if opt.TPUProxy {
 		s.Merge(tpuproxy.Filters())
+	}
+	if opt.AMDProxy {
+		s.Merge(amdproxy.Filters())
 	}
 	if opt.CgoEnabled {
 		s.Merge(cgoFilters())

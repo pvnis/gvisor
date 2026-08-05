@@ -386,6 +386,9 @@ type Config struct {
 	// which the sandbox may submit work to the GPU. Zero means no limit.
 	NVProxyGPUComputePercent uint64 `flag:"nvproxy-gpu-compute-percent"`
 
+	// AMDProxy enables support for AMD GPUs.
+	AMDProxy bool `flag:"amdproxy"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

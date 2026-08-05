@@ -41,6 +41,7 @@ import (
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
@@ -155,6 +156,9 @@ type containerInfo struct {
 
 	// nvproxyDevInfo holds information on nvproxy devices.
 	nvproxyDevInfo *nvproxy.DeviceInfo
+
+	// amdproxyDevInfo holds information on amdproxy devices.
+	amdproxyDevInfo *amdproxy.DeviceInfo
 
 	// applicationCores is the number of CPU cores gVisor reports to user
 	// applications.
@@ -1094,6 +1098,7 @@ func (l *Loader) installSeccompFilters() error {
 			NVProxy:               nvproxyEnabled,
 			NVProxyCaps:           nvproxyCaps,
 			TPUProxy:              specutils.TPUProxyEnabled(l.root.spec, l.root.conf),
+			AMDProxy:              specutils.AMDProxyEnabled(l.root.spec, l.root.conf),
 			ControllerFD:          uint32(l.ctrl.srv.FD()),
 			CgoEnabled:            config.CgoEnabled,
 			PluginNetwork:         l.root.conf.Network == config.NetworkPlugin,
@@ -1308,6 +1313,7 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 		goferMountConfs:    goferMountConfs,
 		nvidiaHostSettings: l.root.nvidiaHostSettings,
 		nvproxyDevInfo:     l.root.nvproxyDevInfo,
+		amdproxyDevInfo:    l.root.amdproxyDevInfo,
 		rootfsUpperTarFD:   rootfsUpperTarFD,
 	}
 	var err error

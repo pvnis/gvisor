@@ -38,6 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
@@ -190,6 +191,10 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo) error {
 	}
 
 	if err := nvproxyRegisterDevices(info, vfsObj, k.NvidiaDriverVersion); err != nil {
+		return err
+	}
+
+	if err := amdproxyRegisterDevices(info, vfsObj); err != nil {
 		return err
 	}
 
@@ -1682,6 +1687,14 @@ func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *contai
 			major = info.nvproxyDevInfo.CapsDevMajor
 			log.Infof("Switching %s device major number from %d to %d", devSpec.Path, devSpec.Major, major)
 		}
+	} else if devSpec.Path == specutils.KFDDevicePath {
+		// KFD's device major number is allocated dynamically, so the Sentry's
+		// does not match the host's. DRM render nodes need no such treatment:
+		// their major number is statically assigned and identical in both.
+		if info.amdproxyDevInfo != nil && major != info.amdproxyDevInfo.KFDDevMajor {
+			major = info.amdproxyDevInfo.KFDDevMajor
+			log.Infof("Switching /dev/kfd device major number from %d to %d", devSpec.Major, major)
+		}
 	} else if strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps-imex-channels/") {
 		if info.nvproxyDevInfo.CapsIMEXChannelsDevMajor != 0 && major != info.nvproxyDevInfo.CapsIMEXChannelsDevMajor {
 			major = info.nvproxyDevInfo.CapsIMEXChannelsDevMajor
@@ -1713,5 +1726,19 @@ func nvproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem, 
 		return fmt.Errorf("registering nvproxy driver: %w", err)
 	}
 	info.nvproxyDevInfo = devInfo
+	return nil
+}
+
+func amdproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem) error {
+	if !specutils.AMDProxyEnabled(info.spec, info.conf) {
+		return nil
+	}
+	devInfo, err := amdproxy.Register(vfsObj, &amdproxy.Options{
+		UseDevGofer: true,
+	})
+	if err != nil {
+		return fmt.Errorf("registering amdproxy driver: %w", err)
+	}
+	info.amdproxyDevInfo = devInfo
 	return nil
 }

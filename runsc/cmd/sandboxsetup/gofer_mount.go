@@ -476,6 +476,14 @@ func SetupMounts(conf *config.Config, mounts []specs.Mount, root, procPath strin
 	return nil
 }
 
+// ShouldExposeAMDDevice returns true if path refers to an AMD GPU device
+// which should be exposed to the container.
+//
+// Precondition: amdproxy is enabled.
+func ShouldExposeAMDDevice(path string) bool {
+	return path == specutils.KFDDevicePath || specutils.RenderDeviceRegex.MatchString(path)
+}
+
 // ShouldExposeNvidiaDevice returns true if path refers to an Nvidia device
 // which should be exposed to the container.
 //
@@ -517,9 +525,11 @@ func SetupDev(spec *specs.Spec, conf *config.Config, root, procPath string) erro
 	}
 	nvproxyEnabled := specutils.NVProxyEnabled(spec, conf)
 	tpuproxyEnabled := specutils.TPUProxyEnabled(spec, conf)
+	amdproxyEnabled := specutils.AMDProxyEnabled(spec, conf)
 	for _, dev := range spec.Linux.Devices {
 		shouldMount := (nvproxyEnabled && ShouldExposeNvidiaDevice(dev.Path)) ||
-			(tpuproxyEnabled && ShouldExposeTpuDevice(dev.Path))
+			(tpuproxyEnabled && ShouldExposeTpuDevice(dev.Path)) ||
+			(amdproxyEnabled && ShouldExposeAMDDevice(dev.Path))
 		if !shouldMount {
 			continue
 		}

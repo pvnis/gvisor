@@ -188,6 +188,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Uint64("nvproxy-max-timeslice-us", 0, "longest GPU scheduler timeslice, in microseconds, that a sandbox may request for its channel groups. A longer timeslice increases the sandbox's share of the GPU relative to others sharing it. 0 means no limit.")
 	flagSet.Uint64(flagNVProxyGPUMemLimit, 0, "maximum number of bytes of GPU memory that the sandbox may allocate, counting device memory and address space reserved for CUDA unified memory. 0 means no limit.")
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
+	flagSet.Bool("amdproxy", false, "WIP: enable support for AMD GPUs. AMD GPU support gets automatically enabled if /dev/kfd is present in the OCI spec.")
 	flagSet.Bool("rdmaproxy", false, "WIP: enable RDMA support for containers with /dev/infiniband/uverbs* devices.")
 	flagSet.Bool("tpuproxy", false, "LEGACY: enable support for TPU devices. TPU support gets automatically enabled if TPU devices are present in the OCI spec.")
 
