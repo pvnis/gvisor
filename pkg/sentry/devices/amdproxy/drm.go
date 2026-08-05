@@ -94,7 +94,7 @@ type renderFD struct {
 
 	dev        *renderDevice
 	queue      waiter.Queue
-	memmapFile fsutil.MmapNoInternalFile
+	memmapFile fsutil.MmapPreciseFile
 }
 
 func (fd *renderFD) isRestored() bool {
@@ -109,7 +109,6 @@ func (fd *renderFD) Release(context.Context) {
 	}
 	fdnotifier.RemoveFD(fd.hostFD)
 	fd.queue.Notify(waiter.EventHUp)
-	fd.memmapFile.Closer = &fd.memmapFile
 	fd.memmapFile.MappableRelease() // eventually closes fd.hostFD
 }
 

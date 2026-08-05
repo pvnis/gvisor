@@ -63,6 +63,10 @@ func (dev *kfdDevice) Open(ctx context.Context, mnt *vfs.Mount, d *vfs.Dentry, o
 		return nil, err
 	}
 	fd.memmapFile.SetFD(int(hostFD))
+	// Everything reachable by mmap()ing /dev/kfd is device registers: the
+	// doorbells a queue is rung through, the MMIO remap page, and the event
+	// page. Mapping those write-back would be wrong.
+	fd.memmapFile.SetMemType(hostarch.MemoryTypeUncached)
 	dev.amdp.trackFD(fd)
 	return &fd.vfsfd, nil
 }
@@ -82,7 +86,7 @@ type kfdFD struct {
 
 	dev        *kfdDevice
 	queue      waiter.Queue
-	memmapFile fsutil.MmapNoInternalFile
+	memmapFile fsutil.MmapPreciseFile
 }
 
 func (fd *kfdFD) isRestored() bool {
@@ -97,7 +101,6 @@ func (fd *kfdFD) Release(context.Context) {
 	}
 	fdnotifier.RemoveFD(fd.hostFD)
 	fd.queue.Notify(waiter.EventHUp)
-	fd.memmapFile.Closer = &fd.memmapFile
 	fd.memmapFile.MappableRelease() // eventually closes fd.hostFD
 }
 
