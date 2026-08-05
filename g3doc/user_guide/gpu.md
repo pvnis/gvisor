@@ -435,14 +435,9 @@ device's other tenants are using.
     see work submission, and enforcement that can see it is reachable by the
     container.
 
-    Sharing a GPU between containers therefore also wants something like the
-    `k8s-device-plugin`'s time-slicing, which provides no memory isolation of
-    its own; the two mechanisms are complementary. Time-slicing divides GPU time
-    evenly between equal workloads, but the shares are the GPU scheduler's
-    default round-robin rather than a policy: they cannot be assigned per
-    container, and a workload that issues longer kernels takes a somewhat larger
-    share. Where compute must genuinely be partitioned, MIG enforces it in
-    hardware.
+    A sandbox's share of GPU compute can be capped separately; see
+    [Limiting GPU Compute](#compute-limits) below. Where compute must genuinely be
+    partitioned rather than capped, MIG enforces it in hardware.
 
 -   **Denying unified memory is reported poorly by CUDA.** An allocation
     refused by the limit fails the underlying `mmap` with `ENOMEM`, which is
@@ -503,6 +498,65 @@ device's other tenants are using.
     the GPU's own per-process accounting, this is a constant, independent of how
     much the workload allocates, so a sandbox can hold slightly more than its
     limit by a bounded amount rather than by a share of what it requests.
+
+## Limiting GPU Compute {#compute-limits}
+
+`--nvproxy-gpu-compute-percent` bounds the share of wall-clock time during
+which a sandbox may submit work to the GPU, and a container may lower its own
+share, but not raise it, with:
+
+```
+"dev.gvisor.flag.nvproxy-gpu-compute-percent": "25"
+```
+
+The default of `0` imposes no limit.
+
+Submission cannot be intercepted directly. Once a channel exists, an application
+writes commands to a ring buffer in memory it has mapped and rings a doorbell
+through a mapped register, neither of which enters the kernel. What the Sentry
+can do instead is revoke its own mapping of the ring buffer at the end of the
+sandbox's share of each period, so that the next write to it faults, and hold
+that fault until the share comes round again. The technique is taken from
+[Krypton](https://www.usenix.org/conference/atc25/presentation/zhang-shulai),
+which does the same from a kernel module.
+
+Measured against an unlimited baseline of 654 kernel launches per second:
+
+    configured   achieved   share of unlimited
+        75%       498/s          76.2%
+        50%       333/s          51.0%
+        25%       169/s          25.8%
+
+The small consistent overshoot is work already in flight when the mapping is
+revoked, which runs to completion.
+
+### What a limited sandbox may notice
+
+While a sandbox is held, the task waiting to submit holds its address space's
+lock, so other threads in the same sandbox stall on operations that need it:
+mapping and unmapping memory, and faulting in pages that are not yet resident.
+Threads computing over memory they have already touched are unaffected. Measured
+with a limit of 25%, a thread doing continuous `mmap`/fault/`munmap` fell to
+about 20% of its unlimited rate, while a thread doing arithmetic over a resident
+buffer was unaffected.
+
+This is a difference from Krypton, which delivers the fault to a handler inside
+the container and so stalls only the submitting thread. gVisor handles the fault
+in the Sentry, which is what removes the need for anything inside the container,
+at the cost of holding that lock. Workloads that allocate heavily on other
+threads while the GPU is throttled will feel it.
+
+### It is a cap, not a share
+
+Each sandbox limits only itself. Time that one sandbox does not use is not
+redistributed to another, because a Sentry sees only its own sandbox; enforcing
+shares between sandboxes would require a coordinator outside all of them. The
+limit is therefore useful for holding a tenant to an agreed fraction of a GPU,
+not for dividing a GPU efficiently between tenants.
+
+Time-slicing in the `k8s-device-plugin` divides GPU time between containers
+evenly by default and is work-conserving, but the shares cannot be assigned and
+are not enforced; the two mechanisms address different halves of the problem.
 
 ## Security
 
