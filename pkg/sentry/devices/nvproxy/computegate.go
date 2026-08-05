@@ -76,6 +76,33 @@ func (g *computeGate) init(percent uint64) {
 	g.gated = make(map[*frontendFD]struct{})
 }
 
+// restore resumes gating after the sandbox has been restored.
+//
+// The gate's state is saved with the sandbox, so the command buffers it had
+// learned and the file descriptions it was gating come back with it, but the
+// goroutine that revokes their mappings does not. Without restarting it a
+// restored sandbox would keep its configured limit and stop being held to it.
+//
+// The percentage is the one the sandbox was created with rather than whatever
+// the restoring command line specifies, as with the other limits nvproxy
+// enforces.
+func (g *computeGate) restore() {
+	// Empty maps may come back nil.
+	if g.cmdBufs == nil {
+		g.cmdBufs = make(map[nvgpu.Handle]struct{})
+	}
+	if g.byMem == nil {
+		g.byMem = make(map[nvgpu.Handle]*frontendFD)
+	}
+	if g.gated == nil {
+		g.gated = make(map[*frontendFD]struct{})
+	}
+	if g.enabled() {
+		log.Infof("nvproxy: resuming GPU compute limit of %d%% after restore", g.percent)
+		go g.run()
+	}
+}
+
 // enabled returns true if g limits submission.
 func (g *computeGate) enabled() bool {
 	return g.percent != 0 && g.percent < 100

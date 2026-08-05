@@ -191,3 +191,58 @@ func TestComputeGateForget(t *testing.T) {
 		t.Errorf("gated=%d byMem=%d after release, want 0 and 0", len(g.gated), len(g.byMem))
 	}
 }
+
+// TestComputeGateRestoreKeepsState tests that restoring preserves what the
+// gate had learned, so that a restored sandbox keeps being held to its limit
+// rather than having to rediscover its command buffers.
+func TestComputeGateRestoreKeepsState(t *testing.T) {
+	h := nvgpu.Handle{Val: 0x5c000015}
+	g, fd := newGate(50), &frontendFD{}
+	fd.mappedMem = h
+	g.noteMapping(h, fd)
+	g.addCommandBuffer(h)
+
+	g.restore()
+
+	if _, ok := g.cmdBufs[h]; !ok {
+		t.Errorf("command buffer %v forgotten across restore", h)
+	}
+	if _, ok := g.gated[fd]; !ok {
+		t.Errorf("gated file description forgotten across restore")
+	}
+	if !fd.gated.Load() {
+		t.Errorf("file description no longer gated after restore")
+	}
+}
+
+// TestComputeGateRestoreRebuildsNilMaps tests that a gate whose maps came back
+// nil is still usable, since empty maps need not survive serialization.
+func TestComputeGateRestoreRebuildsNilMaps(t *testing.T) {
+	g := &computeGate{percent: 50}
+	g.restore()
+	// Must not panic on a nil map.
+	h := nvgpu.Handle{Val: 0x5c000015}
+	fd := &frontendFD{}
+	g.noteMapping(h, fd)
+	g.addCommandBuffer(h)
+	if !fd.gated.Load() {
+		t.Errorf("gating did not work after restoring nil maps")
+	}
+}
+
+// TestComputeGateRestoreDisabledStartsNothing tests that a sandbox with no
+// limit does not acquire one across restore.
+func TestComputeGateRestoreDisabledStartsNothing(t *testing.T) {
+	g := &computeGate{percent: 0}
+	g.restore()
+	if g.enabled() {
+		t.Errorf("gate became enabled across restore")
+	}
+	h := nvgpu.Handle{Val: 0x5c000015}
+	fd := &frontendFD{}
+	g.noteMapping(h, fd)
+	g.addCommandBuffer(h)
+	if fd.gated.Load() {
+		t.Errorf("file description gated despite no limit")
+	}
+}

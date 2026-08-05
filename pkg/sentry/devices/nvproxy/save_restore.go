@@ -299,6 +299,11 @@ func (nvp *nvproxy) afterLoad(ctx goContext.Context) {
 		// Reuse slice across iterations.
 		depHs = depHs[:0]
 	}
+
+	// Resume compute gating last: it starts a goroutine that walks the file
+	// descriptions it was gating, which must not run while they are still
+	// being remapped and reopened above.
+	nvp.computeGate.restore()
 }
 
 func (fd *frontendFD) load(ctx goContext.Context) {
