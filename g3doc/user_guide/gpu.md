@@ -546,6 +546,18 @@ in the Sentry, which is what removes the need for anything inside the container,
 at the cost of holding that lock. Workloads that allocate heavily on other
 threads while the GPU is throttled will feel it.
 
+### Checkpointing is not yet supported
+
+Checkpointing a sandbox that is using a GPU fails. The objects the driver
+tracks on the application's behalf are recreated on restore by replaying their
+creation, and only some of them can be: the OS events that every CUDA context
+creates, memory allocated through the older allocation ioctls, duplicated
+handles and pinned host descriptors have no such support, so the save is
+refused rather than producing an image that could not be restored.
+
+This is not specific to the limits described above; it applies to any sandbox
+with a GPU.
+
 ### It is a cap, not a share
 
 Each sandbox limits only itself. Time that one sandbox does not use is not

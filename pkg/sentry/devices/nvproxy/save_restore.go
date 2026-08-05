@@ -173,6 +173,17 @@ func MakeDeviceRemapping(oldIDs, newIDs []DeviceRemapID) (*DeviceRemapping, erro
 }
 
 // beforeSave is invoked by stateify.
+//
+// Checkpointing a sandbox that is using a GPU currently fails here. Only
+// rmAllocObject and rootClient implement Restore; objects recorded as
+// miscObject or osDescMem do not, and those cover the OS events every CUDA
+// context creates, memory allocated through NV_ESC_RM_ALLOC_MEMORY and
+// NV_ESC_RM_VID_HEAP_CONTROL, duplicated handles, and pinned host descriptors.
+//
+// Supporting them means replaying each object's creation with the right host
+// file descriptor and parameters, and re-pinning pages for osDescMem. Until
+// then a GPU sandbox can be saved only if the application has created none of
+// them, which a CUDA application does not manage.
 func (nvp *nvproxy) beforeSave() {
 	// No need to hold any locks since the sandbox is paused.
 	// This avoids lock inversion between nvp.clientsMu and rootClient.objsMu.
