@@ -389,6 +389,11 @@ type Config struct {
 	// AMDProxy enables support for AMD GPUs.
 	AMDProxy bool `flag:"amdproxy"`
 
+	// AMDProxyCUMask is the set of GPU compute units the sandbox may run
+	// on, as a hexadecimal bitmask with one bit per unit. Empty means every
+	// compute unit.
+	AMDProxyCUMask string `flag:"amdproxy-cu-mask"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

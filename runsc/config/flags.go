@@ -25,6 +25,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy/amdconf"
 	"gvisor.dev/gvisor/runsc/flag"
 )
 
@@ -49,6 +50,7 @@ const (
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
 	flagMountCgroupV2           = "mount-cgroup-v2"
 	flagNVProxyGPUComputePct    = "nvproxy-gpu-compute-percent"
+	flagAMDProxyCUMask          = "amdproxy-cu-mask"
 	flagNVProxyGPUMemLimit      = "nvproxy-gpu-memory-limit"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
@@ -189,6 +191,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Uint64(flagNVProxyGPUMemLimit, 0, "maximum number of bytes of GPU memory that the sandbox may allocate, counting device memory and address space reserved for CUDA unified memory. 0 means no limit.")
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("amdproxy", false, "WIP: enable support for AMD GPUs. AMD GPU support gets automatically enabled if /dev/kfd is present in the OCI spec.")
+	flagSet.String(flagAMDProxyCUMask, "", "hexadecimal bitmask of the GPU compute units the sandbox may run on, one bit per unit. The mask is applied to every queue the sandbox creates, and is enforced by the GPU rather than by anything the sandbox can reach. Empty means every compute unit. Masks are only a partition if they do not overlap, which whatever assigns GPUs to sandboxes is responsible for.")
 	flagSet.Bool("rdmaproxy", false, "WIP: enable RDMA support for containers with /dev/infiniband/uverbs* devices.")
 	flagSet.Bool("tpuproxy", false, "LEGACY: enable support for TPU devices. TPU support gets automatically enabled if TPU devices are present in the OCI spec.")
 
@@ -228,6 +231,34 @@ var overrideAllowlist = map[string]struct {
 	flagMountCgroupV2:           {},
 	flagNVProxyGPUMemLimit:      {check: checkNVProxyGPUMemoryLimit},
 	flagNVProxyGPUComputePct:    {check: checkNVProxyGPUComputePercent},
+	flagAMDProxyCUMask:          {check: checkAMDProxyCUMask},
+}
+
+// checkAMDProxyCUMask ensures that a container may give up compute units but
+// not claim ones it was not assigned, for the same reason as
+// checkNVProxyGPUComputePercent: the spec is frequently written by the
+// workload being limited, so an annotation that could widen the mask would be
+// no limit at all.
+func checkAMDProxyCUMask(c *Config, name string, value string) error {
+	mask, err := amdconf.ParseCUMask(value)
+	if err != nil {
+		return fmt.Errorf("invalid %s annotation %q: %w", name, value, err)
+	}
+	if mask.Empty() {
+		return fmt.Errorf("%s=%q selects no compute units", name, value)
+	}
+	runtime, err := amdconf.ParseCUMask(c.AMDProxyCUMask)
+	if err != nil {
+		return fmt.Errorf("runtime %s=%q is invalid: %w", name, c.AMDProxyCUMask, err)
+	}
+	if len(runtime) == 0 {
+		// The runtime imposes no limit, so any mask is a restriction.
+		return nil
+	}
+	if !mask.IsSubsetOf(runtime) {
+		return fmt.Errorf("%s=%q is not contained in the mask %v configured on the runtime; annotations may only narrow it", name, value, runtime)
+	}
+	return nil
 }
 
 // checkNVProxyGPUComputePercent ensures that a container may reduce its share

@@ -40,6 +40,7 @@ import (
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy/amdconf"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
@@ -1735,8 +1736,13 @@ func amdproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem)
 	if !specutils.AMDProxyEnabled(info.spec, info.conf) {
 		return nil
 	}
+	cuMask, err := amdconf.ParseCUMask(info.conf.AMDProxyCUMask)
+	if err != nil {
+		return fmt.Errorf("invalid --amdproxy-cu-mask: %w", err)
+	}
 	devInfo, err := amdproxy.Register(vfsObj, &amdproxy.Options{
 		UseDevGofer: true,
+		CUMask:      cuMask,
 	})
 	if err != nil {
 		return fmt.Errorf("registering amdproxy driver: %w", err)

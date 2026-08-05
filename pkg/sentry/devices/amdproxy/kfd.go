@@ -164,9 +164,7 @@ type kfdIoctlState struct {
 // GET_QUEUE_WAVE_STATE, GET_DMABUF_INFO); ioctls carrying file descriptors
 // (IMPORT_DMABUF, EXPORT_DMABUF, SMI_EVENTS); and ioctls with
 // variable-length or otherwise unvalidated parameters (SVM, CRIU_OP,
-// DBG_TRAP). CREATE_QUEUE is denied because it names GPU virtual addresses
-// whose meaning under gVisor's split address spaces has not yet been
-// established.
+// DBG_TRAP).
 func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	if fd.isRestored() {
 		return 0, linuxerr.EBADF
@@ -225,6 +223,8 @@ func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 		return kfdMapMemoryToGPU(ki)
 	case amdgpu.AMDKFD_IOC_SET_CU_MASK:
 		return kfdSetCUMask(ki)
+	case amdgpu.AMDKFD_IOC_CREATE_QUEUE:
+		return kfdCreateQueue(ki)
 	}
 	ctx.Warningf("amdproxy: unsupported KFD ioctl %s (%#x)", amdgpu.KFDIoctl(ki.cmd), ki.cmd)
 	return 0, linuxerr.EINVAL

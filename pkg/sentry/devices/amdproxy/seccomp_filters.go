@@ -53,6 +53,7 @@ func Filters() seccomp.SyscallRules {
 		amdgpu.AMDKFD_IOC_MAP_MEMORY_TO_GPU,
 		amdgpu.AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU,
 		amdgpu.AMDKFD_IOC_SET_CU_MASK,
+		amdgpu.AMDKFD_IOC_CREATE_QUEUE,
 	} {
 		ioctlRules = append(ioctlRules, seccomp.PerArg{
 			seccomp.NonNegativeFD{},

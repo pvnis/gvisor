@@ -65,6 +65,7 @@ go_library(
         "//pkg/sentry/control",
         "//pkg/sentry/devices/memdev",
         "//pkg/sentry/devices/amdproxy",
+        "//pkg/sentry/devices/amdproxy/amdconf",
         "//pkg/sentry/devices/nvproxy",
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/sentry/devices/tpuproxy",

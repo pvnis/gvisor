@@ -37,7 +37,9 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy/amdconf"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -50,6 +52,14 @@ const kfdMinor = 0
 type Options struct {
 	// If UseDevGofer is true, open device files via gofer.
 	UseDevGofer bool
+
+	// CUMask is the set of GPU compute units the sandbox may run on. A nil
+	// mask means every compute unit.
+	//
+	// Which units a sandbox is given has to be decided outside it, by
+	// whatever assigns GPUs to sandboxes: masks are only a partition if they
+	// do not overlap, and a Sentry sees nothing but its own sandbox.
+	CUMask amdconf.CUMask
 }
 
 // DeviceInfo contains information on registered amdproxy devices. Device
@@ -68,8 +78,15 @@ type DeviceInfo struct {
 func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error) {
 	amdp := &amdproxy{
 		useDevGofer: opts.UseDevGofer,
+		cuMask:      opts.CUMask,
 		kfdFDs:      make(map[*kfdFD]struct{}),
 		renderFDs:   make(map[*renderFD]struct{}),
+	}
+	if len(opts.CUMask) > 0 {
+		if opts.CUMask.Empty() {
+			return nil, fmt.Errorf("amdproxy: CU mask selects no compute units")
+		}
+		log.Infof("amdproxy: GPU compute units limited to %v (%d units)", opts.CUMask, opts.CUMask.Count())
 	}
 
 	kfdDevMajor, err := vfsObj.GetDynamicCharDevMajor()
@@ -110,6 +127,10 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 type amdproxy struct {
 	useDevGofer bool
 	devInfo     DeviceInfo
+
+	// cuMask is the sandbox's compute unit ceiling, applied to every queue
+	// it creates. Immutable after Register.
+	cuMask amdconf.CUMask
 
 	fdsMu     sync.Mutex `state:"nosave"`
 	kfdFDs    map[*kfdFD]struct{}
