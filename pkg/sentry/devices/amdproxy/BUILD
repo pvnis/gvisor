@@ -10,6 +10,7 @@ go_library(
         "amdproxy.go",
         "drm.go",
         "drm_mmap.go",
+        "drm_unsafe.go",
         "kfd.go",
         "kfd_handlers.go",
         "kfd_mmap.go",

@@ -18,11 +18,14 @@ import (
 	"fmt"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/amdgpu"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -147,18 +150,47 @@ func (fd *renderFD) Epollable() bool {
 	return true
 }
 
+// renderIoctlState holds the state of a single render node ioctl in progress.
+type renderIoctlState struct {
+	fd      *renderFD
+	ctx     context.Context
+	t       *kernel.Task
+	cmd     uint32
+	argAddr hostarch.Addr
+}
+
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
 //
-// No amdgpu or DRM ioctl is forwarded yet. The render node is currently
-// useful only as the object AMDKFD_IOC_ACQUIRE_VM refers to, which needs the
-// host file description but issues no ioctl on it. Forwarding the GEM
-// allocation ioctls requires charging them against the same budget as KFD's,
-// so they are denied until that accounting exists rather than being opened up
-// first and accounted later.
+// Only the ioctls needed to identify the device are forwarded. The GEM
+// allocation, address-binding and command-submission ioctls
+// (AMDGPU_GEM_CREATE, AMDGPU_GEM_VA, AMDGPU_CS and friends) are denied:
+// allocation here is a second path to device memory that must be charged
+// against the same budget as KFD's, and command submission is the point at
+// which work reaches the GPU. Neither should be opened up before the
+// accounting that governs them exists.
 func (fd *renderFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	if fd.isRestored() {
 		return 0, linuxerr.EBADF
 	}
-	ctx.Warningf("amdproxy: unsupported DRM render node ioctl %#x", args[1].Uint())
+	t := kernel.TaskFromContext(ctx)
+	if t == nil {
+		panic("Ioctl should be called from a task context")
+	}
+	ri := &renderIoctlState{
+		fd:      fd,
+		ctx:     ctx,
+		t:       t,
+		cmd:     args[1].Uint(),
+		argAddr: args[2].Pointer(),
+	}
+	switch amdgpu.DRMIoctl(ri.cmd) {
+	case amdgpu.DRM_IOCTL_GET_CLIENT:
+		return renderIoctlSimple[amdgpu.DRMClient](ri)
+	case amdgpu.DRM_IOCTL_VERSION:
+		return drmVersion(ri)
+	case amdgpu.DRM_IOCTL_AMDGPU_INFO:
+		return drmAMDGPUInfo(ri)
+	}
+	ctx.Warningf("amdproxy: unsupported DRM render node ioctl %s (%#x)", amdgpu.DRMIoctl(ri.cmd), ri.cmd)
 	return 0, linuxerr.EINVAL
 }

@@ -59,6 +59,16 @@ func Filters() seccomp.SyscallRules {
 			seccomp.EqualTo(cmd),
 		})
 	}
+	for _, cmd := range []amdgpu.DRMIoctl{
+		amdgpu.DRM_IOCTL_VERSION,
+		amdgpu.DRM_IOCTL_GET_CLIENT,
+		amdgpu.DRM_IOCTL_AMDGPU_INFO,
+	} {
+		ioctlRules = append(ioctlRules, seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(cmd),
+		})
+	}
 	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		unix.SYS_IOCTL: seccomp.Or(ioctlRules),
 		unix.SYS_MMAP: seccomp.PerArg{
