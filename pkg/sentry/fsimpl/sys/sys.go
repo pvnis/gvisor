@@ -137,6 +137,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	devicesSub := map[string]kernfs.Inode{} // /sys/devices
 	virtualSub := map[string]kernfs.Inode{} // /sys/devices/virtual
 	moduleSub := map[string]kernfs.Inode{}  // /sys/module
+	devCharSub := map[string]kernfs.Inode{} // /sys/dev/char
 	systemSub := map[string]kernfs.Inode{   // /sys/devices/system
 		"cpu": cpuDir(ctx, fs, creds),
 	}
@@ -195,6 +196,22 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			if amdDirs.module != nil {
 				moduleSub["amdgpu"] = amdDirs.module
 			}
+			for name, sub := range amdDirs.devices {
+				// The TPU proxy, RDMA and AMD GPU stacks each populate
+				// /sys/devices from their own view of the PCI hierarchy, and
+				// deep-merging two sealed kernfs subtrees is not supported,
+				// so reject an overlap rather than silently dropping one.
+				if _, ok := devicesSub[name]; ok {
+					return nil, nil, fmt.Errorf("AMD GPU sysfs and another accelerator both populate /sys/devices/%s", name)
+				}
+				devicesSub[name] = sub
+			}
+			if amdDirs.classDRM != nil {
+				classSub["drm"] = amdDirs.classDRM
+			}
+			for name, sub := range amdDirs.devChar {
+				devCharSub[name] = sub
+			}
 		}
 		if idata.RDMASysfs != nil {
 			rdmaDirs, err := fs.newRDMASysfs(ctx, creds, idata.RDMASysfs)
@@ -250,7 +267,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		"class": fs.newDir(ctx, creds, defaultSysDirMode, classSub),
 		"dev": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 			"block": fs.newDir(ctx, creds, defaultSysDirMode, nil),
-			"char":  fs.newDir(ctx, creds, defaultSysDirMode, nil),
+			"char":  fs.newDir(ctx, creds, defaultSysDirMode, devCharSub),
 		}),
 		"devices":  fs.newDir(ctx, creds, defaultSysDirMode, devicesSub),
 		"firmware": fs.newDir(ctx, creds, defaultSysDirMode, nil),
