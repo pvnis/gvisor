@@ -15,9 +15,12 @@
 package nvproxy
 
 import (
+	"fmt"
+	"os"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/gpusched"
 	"gvisor.dev/gvisor/pkg/log"
@@ -80,6 +83,11 @@ type computeGate struct {
 	// gated is the set of file descriptions whose mappings must be revoked at
 	// the end of each period. It is protected by mu.
 	gated map[*frontendFD]struct{}
+
+	// submissions counts attempts to submit work since the last report to the
+	// scheduler, which uses it to tell a sandbox that is using the GPU from one
+	// that is merely connected.
+	submissions atomicbitops.Uint64
 }
 
 // init prepares g to gate submission, permitting it for the given share of each
@@ -254,6 +262,7 @@ func (g *computeGate) waitUntil(t time.Time) time.Duration {
 // The sleep is uninterruptible so that the sandbox cannot escape its limit by
 // arranging to be signalled, and is bounded by one period.
 func (g *computeGate) wait(ctx context.Context) {
+	g.noteSubmission()
 	d := g.waitUntil(time.Now())
 	if d <= 0 {
 		return
@@ -305,4 +314,58 @@ func (g *computeGate) revoke() {
 	for _, fd := range fds {
 		fd.revokeMappings()
 	}
+}
+
+// noteSubmission records that the sandbox tried to submit work, which is what
+// the scheduler is told in order to distinguish a sandbox using the GPU from
+// one merely holding a share of it.
+func (g *computeGate) noteSubmission() {
+	g.submissions.Add(1)
+}
+
+// follow takes the sandbox's window from a scheduler reached over fd.
+//
+// The exchange runs on its own goroutine and is driven by the scheduler: each
+// window it sends is applied, and a report of what the sandbox did with the
+// last one is sent back. Nothing on the submission path waits for any of it, so
+// a scheduler that stops responding leaves the sandbox with the window it last
+// had rather than stalling it.
+func (g *computeGate) follow(schedFD int, id string, weight uint64, percent uint64) {
+	// The Sentry may read and write an open connection, but not create one, so
+	// this wraps the donated descriptor rather than dialling.
+	f := os.NewFile(uintptr(schedFD), "gpu-scheduler")
+	conn := gpusched.NewConn(f)
+
+	var maxFraction float64
+	if percent > 0 && percent < 100 {
+		// A configured limit remains a ceiling that the scheduler may not
+		// raise, so that being scheduled cannot grant more than was allowed.
+		maxFraction = float64(percent) / 100
+	}
+	if id == "" {
+		// The scheduler only needs to tell sandboxes apart, and the container
+		// ID is not yet known this early in a sandbox's life. The process ID
+		// is unique among the sandboxes on a host, which is all that is
+		// required.
+		id = fmt.Sprintf("sandbox-%d", os.Getpid())
+	}
+	go func() {
+		defer conn.Close()
+		if err := conn.SendHello(gpusched.Hello{ID: id, Weight: weight, MaxFraction: maxFraction}); err != nil {
+			log.Warningf("nvproxy: announcing to the GPU scheduler: %v", err)
+			return
+		}
+		for {
+			a, err := conn.RecvAssignment()
+			if err != nil {
+				log.Warningf("nvproxy: GPU scheduler connection lost, keeping the last window: %v", err)
+				return
+			}
+			g.setGrant(a.Grant())
+			if err := conn.SendReport(gpusched.Report{Submissions: g.submissions.Swap(0)}); err != nil {
+				log.Warningf("nvproxy: reporting to the GPU scheduler: %v", err)
+				return
+			}
+		}
+	}()
 }

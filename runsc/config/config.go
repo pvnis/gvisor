@@ -386,6 +386,15 @@ type Config struct {
 	// which the sandbox may submit work to the GPU. Zero means no limit.
 	NVProxyGPUComputePercent uint64 `flag:"nvproxy-gpu-compute-percent"`
 
+	// NVProxyGPUSchedulerSocket is the path of a GPU scheduler dividing the
+	// GPU between the sandboxes sharing it. Empty means the sandbox is not
+	// scheduled and keeps whatever fixed share it was configured with.
+	NVProxyGPUSchedulerSocket string `flag:"nvproxy-gpu-scheduler-socket"`
+
+	// NVProxyGPUWeight is this sandbox's share of a GPU relative to the others
+	// scheduled alongside it. Zero is treated as one.
+	NVProxyGPUWeight uint64 `flag:"nvproxy-gpu-weight"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

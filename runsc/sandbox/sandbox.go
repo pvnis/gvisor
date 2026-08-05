@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"net"
 	"os"
 	"os/exec"
 	"path"
@@ -1006,6 +1007,22 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	s.ControlSocketPath = controlSocketPath
 	log.Infof("Control socket path: %q", s.ControlSocketPath)
 	donations.DonateAndClose("controller-fd", os.NewFile(uintptr(sockFD), "control_server_socket"))
+
+	// Connect to the GPU scheduler out here and hand the sandbox the open
+	// connection: the Sentry's syscall filter does not permit it to connect to
+	// anything itself.
+	if conf.NVProxyGPUSchedulerSocket != "" {
+		schedConn, err := net.Dial("unix", conf.NVProxyGPUSchedulerSocket)
+		if err != nil {
+			return fmt.Errorf("connecting to the GPU scheduler at %q: %w", conf.NVProxyGPUSchedulerSocket, err)
+		}
+		schedFile, err := schedConn.(*net.UnixConn).File()
+		schedConn.Close()
+		if err != nil {
+			return fmt.Errorf("taking the GPU scheduler connection: %w", err)
+		}
+		donations.DonateAndClose("gpu-scheduler-fd", schedFile)
+	}
 
 	specFile, err := specutils.OpenSpec(args.BundleDir)
 	if err != nil {

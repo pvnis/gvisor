@@ -66,6 +66,18 @@ type Options struct {
 	// sandbox may submit work to the GPU. Zero means no limit.
 	ComputePercent uint64
 
+	// SchedulerFD is an open connection to a GPU scheduler that decides this
+	// sandbox's share, or -1 if it has none. The Sentry cannot connect to
+	// anything itself, so the connection is made outside and donated.
+	SchedulerFD int
+
+	// SchedulerWeight is this sandbox's share relative to the others the
+	// scheduler is dividing the GPU between.
+	SchedulerWeight uint64
+
+	// ContainerID identifies this sandbox to the scheduler.
+	ContainerID string
+
 	HostSettings *nvconf.HostSettings
 
 	// If UseDevGofer is true, open device files via gofer.
@@ -103,7 +115,12 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	}
 	nvp.memAcct.gpuLimit = opts.GPUMemoryLimit
 	nvp.maxTimesliceUs = opts.MaxTimesliceUs
-	nvp.computeGate.init(opts.ComputePercent, false /* scheduled */)
+	scheduled := opts.SchedulerFD >= 0
+	nvp.computeGate.init(opts.ComputePercent, scheduled)
+	if scheduled {
+		log.Infof("nvproxy: GPU share for %q decided by the scheduler, weight %d", opts.ContainerID, opts.SchedulerWeight)
+		nvp.computeGate.follow(opts.SchedulerFD, opts.ContainerID, opts.SchedulerWeight, opts.ComputePercent)
+	}
 	if nvp.computeGate.enabled() {
 		log.Infof("nvproxy: GPU compute limited to %d%% of wall-clock time", opts.ComputePercent)
 		go nvp.computeGate.run()

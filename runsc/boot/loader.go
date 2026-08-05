@@ -135,6 +135,9 @@ type containerInfo struct {
 	// execFD is the host file descriptor used for program execution.
 	execFD *fd.FD
 
+	// gpuSchedulerFD is an open connection to a GPU scheduler, or -1.
+	gpuSchedulerFD int
+
 	// goferFDs are the FDs that attach the sandbox to the gofers.
 	goferFDs []*fd.FD
 
@@ -393,6 +396,10 @@ type Args struct {
 	// GoferFDs is an array of FDs used to connect with the Gofer. The Loader
 	// takes ownership of these FDs and may close them at any time.
 	GoferFDs []int
+	// GPUSchedulerFD is an open connection to a GPU scheduler, or -1 if the
+	// sandbox is not scheduled.
+	GPUSchedulerFD int
+
 	// DevGoferFD is the FD for the dev gofer connection. The Loader takes
 	// ownership of this FD and may close it at any time.
 	DevGoferFD int
@@ -618,6 +625,11 @@ func New(args Args) (*Loader, error) {
 	}
 	for _, filestoreFD := range args.GoferFilestoreFDs {
 		l.root.goferFilestoreFDs = append(l.root.goferFilestoreFDs, fd.New(filestoreFD))
+	}
+	if args.GPUSchedulerFD >= 0 {
+		l.root.gpuSchedulerFD = args.GPUSchedulerFD
+	} else {
+		l.root.gpuSchedulerFD = -1
 	}
 	if args.DevGoferFD >= 0 {
 		l.root.devGoferFD = fd.New(args.DevGoferFD)

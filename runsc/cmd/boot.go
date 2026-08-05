@@ -102,6 +102,9 @@ type Boot struct {
 	// devIoFD is the FD to connect to dev gofer.
 	devIoFD int
 
+	// gpuSchedulerFD is an open connection to a GPU scheduler, or -1.
+	gpuSchedulerFD int
+
 	// goferFilestoreFDs are FDs to the regular files that will back the tmpfs or
 	// overlayfs mount for certain gofer mounts.
 	goferFilestoreFDs sandboxsetup.IntFlags
@@ -267,6 +270,7 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&b.deviceFD, "device-fd", -1, "FD for the platform device file")
 	f.Var(&b.ioFDs, "io-fds", "list of image FDs and/or socket FDs to connect gofer clients. They must follow this order: root first, then mounts as defined in the spec")
 	f.IntVar(&b.devIoFD, "dev-io-fd", -1, "FD to connect dev gofer client")
+	f.IntVar(&b.gpuSchedulerFD, "gpu-scheduler-fd", -1, "FD of an open connection to a GPU scheduler. If negative, the sandbox is not scheduled.")
 	f.Var(&b.stdioFDs, "stdio-fds", "list of FDs containing sandbox stdin, stdout, and stderr in that order")
 	f.Var(&b.passFDs, "pass-fd", "mapping of host to guest FDs. They must be in M:N format. M is the host and N the guest descriptor.")
 	f.IntVar(&b.execFD, "exec-fd", -1, "host file descriptor used for program execution.")
@@ -600,6 +604,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		Device:              fd.New(b.deviceFD),
 		GoferFDs:            b.ioFDs.GetArray(),
 		DevGoferFD:          b.devIoFD,
+		GPUSchedulerFD:      b.gpuSchedulerFD,
 		StdioFDs:            b.stdioFDs.GetArray(),
 		PassFDs:             b.passFDs.GetArray(),
 		ExecFD:              b.execFD,
