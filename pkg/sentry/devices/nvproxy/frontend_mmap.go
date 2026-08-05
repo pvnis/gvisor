@@ -58,9 +58,12 @@ func (fd *frontendFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, s
 
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
 //
-// This file's memmap.File and offsets remain consistent across save/restore,
-// so its mappings never require invalidation for that purpose.
+// Mappings of this file are backed by the host's device memory rather than by a
+// memory file, and cannot be saved. Dropping them here lets the sandbox be
+// checkpointed while the application holds them; the application faults on its
+// next access after restore and the mapping is re-established then.
 func (fd *frontendFD) InvalidateUnsavable(ctx context.Context) error {
+	fd.revokeMappings()
 	return nil
 }
 

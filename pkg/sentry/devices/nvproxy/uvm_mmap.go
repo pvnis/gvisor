@@ -79,10 +79,31 @@ func (fd *uvmFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR,
 
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
 //
-// This file's memmap.File and offsets remain consistent across save/restore,
-// so its mappings never require invalidation.
+// As for frontendFD, mappings of this file are backed by host device memory
+// and cannot be saved, so they are dropped and re-established by faulting after
+// restore.
 func (fd *uvmFD) InvalidateUnsavable(ctx context.Context) error {
+	fd.revokeMappings()
 	return nil
+}
+
+// revokeMappings invalidates every mapping of this file.
+func (fd *uvmFD) revokeMappings() {
+	type mapping struct {
+		ms memmap.MappingSpace
+		ar hostarch.AddrRange
+	}
+	fd.mappingsMu.Lock()
+	var ms []mapping
+	for seg := fd.mappings.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		for m := range seg.Value() {
+			ms = append(ms, mapping{m.MappingSpace, m.AddrRange})
+		}
+	}
+	fd.mappingsMu.Unlock()
+	for _, m := range ms {
+		m.ms.Invalidate(m.ar, memmap.InvalidateOpts{})
+	}
 }
 
 // Translate implements memmap.Mappable.Translate.
