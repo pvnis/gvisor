@@ -373,6 +373,27 @@ under limitations below: everything else about scheduling happens without the
 Sentry's involvement. It prevents a container enlarging its own share; it does
 not let shares be assigned.
 
+### Deriving the limit from a scheduler's resource
+
+Schedulers that understand GPU memory, such as
+[HAMi](https://project-hami.io)'s, have containers request it as an extended
+resource (`nvidia.com/gpumem`, in mebibytes) and use it to decide which node and
+GPU a pod is placed on. Placement alone does not stop a container from
+allocating more than it asked for, so `webhook/pkg/gpumem` restates the request
+as the annotation above, which has it enforced in the Sentry where the container
+cannot reach it. The scheduler is unaffected and needs no changes, since the
+resource it reads is left as it was.
+
+The limit applies to the sandbox rather than to individual containers, so it is
+the pod's peak demand: containers run together and their requests add up, while
+init containers run before them and only the largest matters. A limit already
+stated on the pod is left alone, since it may deliberately be lower than what
+was requested.
+
+Note that requesting an extended resource requires something on the node to
+advertise it; the annotation is only derived, not invented, so a pod that
+requests no GPU memory does not acquire a limit.
+
 ### What counts against the limit
 
 The limit covers GPU device memory, and address space reserved on
