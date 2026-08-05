@@ -24,6 +24,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/tpu"
+	"gvisor.dev/gvisor/pkg/amdsysfs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
@@ -168,6 +169,10 @@ func setUpChroot(spec *specs.Spec, conf *config.Config) error {
 		return fmt.Errorf("error configuring chroot for RDMA sysfs: %w", err)
 	}
 
+	if err := amdGPUSysfsUpdateChroot(chroot, spec, conf); err != nil {
+		return fmt.Errorf("error configuring chroot for AMD GPU sysfs: %w", err)
+	}
+
 	if err := specutils.SafeMount("", chroot, "", unix.MS_REMOUNT|unix.MS_RDONLY|unix.MS_BIND, "", "/proc"); err != nil {
 		return fmt.Errorf("error remounting chroot in read-only: %v", err)
 	}
@@ -300,6 +305,27 @@ func rdmaSysfsUpdateChroot(chroot string, spec *specs.Spec, conf *config.Config)
 		if err := bindMountSysfsInChrootReadonly(chroot, portsPath, portsPath); err != nil {
 			return fmt.Errorf("bind-mounting %q read-only in chroot: %w", portsPath, err)
 		}
+	}
+	return nil
+}
+
+// amdGPUSysfsUpdateChroot collects the host's KFD topology into a JSON
+// snapshot inside the chroot, for the sandbox process to rebuild in its own
+// sysfs. ROCm reads the topology before it opens /dev/kfd, so a sandbox
+// without it sees no GPU regardless of its device files.
+func amdGPUSysfsUpdateChroot(chroot string, spec *specs.Spec, conf *config.Config) error {
+	if !specutils.AMDProxyEnabled(spec, conf) {
+		return nil
+	}
+	snap, err := amdsysfs.Collect("/sys")
+	if err != nil {
+		return fmt.Errorf("collecting AMD GPU sysfs snapshot: %w", err)
+	}
+	if snap == nil {
+		return nil
+	}
+	if err := snap.Save(filepath.Join(chroot, amdsysfs.Path)); err != nil {
+		return fmt.Errorf("saving AMD GPU sysfs snapshot: %w", err)
 	}
 	return nil
 }

@@ -25,6 +25,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/amdsysfs"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -60,6 +61,10 @@ type InternalData struct {
 	// EnableTPUProxyPaths is whether to populate sysfs paths used by hardware
 	// accelerators.
 	EnableTPUProxyPaths bool
+	// AMDGPUSysfs, when non-nil, is the host sysfs snapshot from which the
+	// AMD GPU topology (/sys/devices/virtual/kfd, /sys/class/kfd) is
+	// constructed.
+	AMDGPUSysfs *amdsysfs.Snapshot
 	// RDMASysfs, when non-nil, is the host sysfs snapshot from which the
 	// RDMA device topology (/sys/devices/pci..., /sys/class/infiniband*,
 	// /sys/class/net, /sys/class/pci_bus, /sys/bus/pci/devices,
@@ -130,6 +135,8 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		"power_supply": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 	}
 	devicesSub := map[string]kernfs.Inode{} // /sys/devices
+	virtualSub := map[string]kernfs.Inode{} // /sys/devices/virtual
+	moduleSub := map[string]kernfs.Inode{}  // /sys/module
 	systemSub := map[string]kernfs.Inode{   // /sys/devices/system
 		"cpu": cpuDir(ctx, fs, creds),
 	}
@@ -182,6 +189,13 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			}
 			kernelSub["iommu_groups"] = fs.newDir(ctx, creds, defaultSysDirMode, iommuGroups)
 		}
+		if amdDirs := fs.newAMDGPUSysfs(ctx, creds, idata.AMDGPUSysfs); amdDirs != nil {
+			virtualSub["kfd"] = amdDirs.kfd
+			classSub["kfd"] = amdDirs.class
+			if amdDirs.module != nil {
+				moduleSub["amdgpu"] = amdDirs.module
+			}
+		}
 		if idata.RDMASysfs != nil {
 			rdmaDirs, err := fs.newRDMASysfs(ctx, creds, idata.RDMASysfs)
 			if err != nil {
@@ -221,13 +235,14 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		classSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 			"id": kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "../../devices/virtual/dmi/id"),
 		})
-		devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"dmi": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-					"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, productName+"\n"),
-				}),
+		virtualSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+				"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, productName+"\n"),
 			}),
 		})
+	}
+	if len(virtualSub) > 0 {
+		devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, virtualSub)
 	}
 	root := fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"block": fs.newDir(ctx, creds, defaultSysDirMode, nil),
@@ -241,7 +256,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		"firmware": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 		"fs":       fs.newDir(ctx, creds, defaultSysDirMode, fsDirChildren),
 		"kernel":   fs.newDir(ctx, creds, defaultSysDirMode, kernelSub),
-		"module":   fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"module":   fs.newDir(ctx, creds, defaultSysDirMode, moduleSub),
 		"power":    fs.newDir(ctx, creds, defaultSysDirMode, nil),
 	})
 	fs.root = root.(*dir)

@@ -28,6 +28,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/amdsysfs"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/coverage"
@@ -252,6 +253,9 @@ type Loader struct {
 	// /sys/devices/virtual/dmi/id/product_name.
 	productName string
 
+	// amdGPUSysfs is the host sysfs snapshot for AMD GPU topology, or nil.
+	amdGPUSysfs *amdsysfs.Snapshot
+
 	// rdmaSysfs is the host sysfs snapshot for RDMA device topology, or
 	// nil when disabled.
 	rdmaSysfs *rdma.Snapshot
@@ -432,6 +436,9 @@ type Args struct {
 	// /sys/devices/virtual/dmi/id/product_name.
 	ProductName string
 
+	// AMDGPUSysfs is the host sysfs snapshot for AMD GPU topology, or nil.
+	AMDGPUSysfs *amdsysfs.Snapshot
+
 	// RDMASysfs is the host sysfs snapshot for RDMA device topology, or
 	// nil when disabled.
 	RDMASysfs *rdma.Snapshot
@@ -552,6 +559,7 @@ func New(args Args) (*Loader, error) {
 		stopProfiling:         stopProfiling,
 		productName:           args.ProductName,
 		rdmaSysfs:             args.RDMASysfs,
+		amdGPUSysfs:           args.AMDGPUSysfs,
 		cpuQuota:              args.CPUQuota,
 		cpuPeriod:             args.CPUPeriod,
 		hostTHP:               args.HostTHP,

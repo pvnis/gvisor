@@ -29,6 +29,7 @@ import (
 	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/amdsysfs"
 	"gvisor.dev/gvisor/pkg/coretag"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -591,6 +592,15 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		}
 	}
 
+	var amdSnap *amdsysfs.Snapshot
+	if specutils.AMDProxyEnabled(spec, conf) {
+		// Load the AMD GPU sysfs snapshot serialized by the chroot stage.
+		var err error
+		if amdSnap, err = amdsysfs.Load(amdsysfs.Path); err != nil {
+			util.Fatalf("loading AMD GPU sysfs snapshot: %v", err)
+		}
+	}
+
 	// Create the loader.
 	bootArgs := boot.Args{
 		ID:                  f.Arg(0),
@@ -612,6 +622,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		TotalHostMem:        b.totalHostMem,
 		UserLogFD:           b.userLogFD,
 		RDMASysfs:           rdmaSnap,
+		AMDGPUSysfs:         amdSnap,
 		ProductName:         b.productName,
 		PodInitConfigFD:     b.podInitConfigFD,
 		SinkFDs:             b.sinkFDs.GetArray(),
