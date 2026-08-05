@@ -7,13 +7,20 @@ package(
 
 go_library(
     name = "gpusched",
-    srcs = ["gpusched.go"],
+    srcs = [
+        "gpusched.go",
+        "server.go",
+        "wire.go",
+    ],
     visibility = ["//:sandbox"],
 )
 
 go_test(
     name = "gpusched_test",
     size = "small",
-    srcs = ["gpusched_test.go"],
+    srcs = [
+        "gpusched_test.go",
+        "server_test.go",
+    ],
     library = ":gpusched",
 )
