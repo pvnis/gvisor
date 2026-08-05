@@ -36,7 +36,7 @@ upstreaming on its own.
 
 ## File as a bug, not fixed here
 
-### The KVM platform cannot map device memory past its first page
+### gVisor's KVM platform cannot map device memory past its first page
 
 Under `--platform=kvm`, only the first page of a proxied device mapping is
 usable. Every later page faults with `SIGBUS`.
@@ -67,13 +67,40 @@ The following were each tested and ruled out, so none of them is the cause:
 - pages not being faulted into the Sentry first (forcing `precommit` does not
   help, including with a touch loop the compiler cannot elide; note that the
   existing loop's `_ = s[i]` is a discarded read)
+- the host being unable to reach the memory at all. Reading every page of the
+  mapping from the Sentry with `safecopy.LoadUint32` succeeds for all of them:
 
-What remains is that KVM cannot back guest memory with a `VM_PFNMAP` device
-VMA through an ordinary `KVM_SET_USER_MEMORY_REGION` slot:
-`hva_to_pfn_remapped` resolves such a mapping only where a host PTE is
-already present. Fixing this means teaching the KVM platform to recognise
-device memory and handle it outside the normal memory-slot path, which is
-platform work, not an amdproxy change.
+  ```
+  sentry-read fr=[100043000,100243000) okPages=512 badPages=0 firstErr=<nil>
+  ```
+
+That last measurement is the important one, and it settles where the bug is.
+The Sentry is an ordinary host process; if it can read all 512 pages, then the
+amdgpu driver, the device VMA and the host page tables are all fine, and the
+host PTEs are present by the time the guest runs. The failure is therefore
+entirely in how gVisor's KVM platform makes that memory visible to the guest,
+not in the host's ability to provide it.
+
+**This is a gVisor bug, in `pkg/sentry/platform/kvm`.** An earlier revision of
+this note attributed it to Linux KVM being unable to back guest memory with a
+`VM_PFNMAP` VMA. That was an inference, and the measurement above contradicts
+it: the pages are readable and mapped on the host, so `hva_to_pfn_remapped`
+has a present PTE to follow.
+
+What is not yet established is which part of the platform is at fault. The two
+candidates, neither confirmed:
+
+- the KVM memory slot covering the device mapping's guest-physical range.
+  `machine.mapPhysical` skips slot creation when `hasSlot(physicalStart)`
+  already holds for the enclosing 8 GiB fault block, and `physicalRegions` is
+  computed once at startup from `/proc/self/maps`, before any device mapping
+  exists.
+- the guest page tables installed by `addressSpace.mapLocked`, even though
+  `MapFile` is called with the correct range and a single block.
+
+Confirming which would need the guest-physical address and slot contents
+dumped for the failing range and compared against the Sentry virtual address
+that `MapInternal` returned.
 
 gVisor already warns that `cudaMallocManaged()` is "flaky on -platform=kvm";
 this reduces that to a deterministic one-line reproducer.
