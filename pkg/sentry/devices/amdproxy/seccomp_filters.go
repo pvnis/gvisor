@@ -48,6 +48,11 @@ func Filters() seccomp.SyscallRules {
 		amdgpu.AMDKFD_IOC_ALLOC_QUEUE_GWS,
 		amdgpu.AMDKFD_IOC_SET_XNACK_MODE,
 		amdgpu.AMDKFD_IOC_RUNTIME_ENABLE,
+		amdgpu.AMDKFD_IOC_ACQUIRE_VM,
+		amdgpu.AMDKFD_IOC_GET_PROCESS_APERTURES_NEW,
+		amdgpu.AMDKFD_IOC_MAP_MEMORY_TO_GPU,
+		amdgpu.AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU,
+		amdgpu.AMDKFD_IOC_SET_CU_MASK,
 	} {
 		ioctlRules = append(ioctlRules, seccomp.PerArg{
 			seccomp.NonNegativeFD{},

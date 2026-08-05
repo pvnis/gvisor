@@ -8,7 +8,10 @@ go_library(
     name = "amdproxy",
     srcs = [
         "amdproxy.go",
+        "drm.go",
+        "drm_mmap.go",
         "kfd.go",
+        "kfd_handlers.go",
         "kfd_mmap.go",
         "kfd_unsafe.go",
         "seccomp_filters.go",
@@ -25,6 +28,7 @@ go_library(
         "//pkg/fdnotifier",
         "//pkg/hostarch",
         "//pkg/marshal",
+        "//pkg/marshal/primitive",
         "//pkg/seccomp",
         "//pkg/sentry/arch",
         "//pkg/sentry/fsutil",

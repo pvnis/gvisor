@@ -7,6 +7,7 @@ licenses(["notice"])
 go_library(
     name = "amdgpu",
     srcs = [
+        "drm.go",
         "kfd.go",
     ],
     hostlayout = True,

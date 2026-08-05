@@ -149,21 +149,21 @@ type kfdIoctlState struct {
 
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
 //
-// Each case below is an ioctl whose parameter struct is fixed-size and
-// contains no pointers into application memory and no file descriptors, so it
-// can be copied in, forwarded, and copied back out unchanged.
+// The kfdIoctlSimple cases are ioctls whose parameter struct is fixed-size
+// and contains no pointers into application memory and no file descriptors,
+// so they can be copied in, forwarded, and copied back out unchanged. The
+// cases below those need a dedicated handler, either to translate a file
+// descriptor or to retarget a pointer at a Sentry buffer.
 //
-// Every other KFD ioctl is denied. Those fall into three groups, each of
-// which needs handling this package does not yet implement: ioctls carrying
-// pointers to application buffers the kernel reads or fills
-// (GET_PROCESS_APERTURES{,_NEW}, MAP/UNMAP_MEMORY_TO_GPU, SET_CU_MASK,
-// WAIT_EVENTS, GET_TILE_CONFIG, GET_QUEUE_WAVE_STATE, GET_DMABUF_INFO);
-// ioctls carrying file descriptors, which name Sentry FDs that must be
-// translated to host FDs (ACQUIRE_VM, IMPORT_DMABUF, EXPORT_DMABUF,
-// SMI_EVENTS); and ioctls with variable-length or otherwise unvalidated
-// parameters (SVM, CRIU_OP, DBG_TRAP). CREATE_QUEUE is denied because it
-// names GPU virtual addresses whose meaning under gVisor's split address
-// spaces has not yet been established.
+// Every other KFD ioctl is denied, and each needs handling this package does
+// not yet implement: ioctls carrying pointers to application buffers
+// (GET_PROCESS_APERTURES, WAIT_EVENTS, GET_TILE_CONFIG,
+// GET_QUEUE_WAVE_STATE, GET_DMABUF_INFO); ioctls carrying file descriptors
+// (IMPORT_DMABUF, EXPORT_DMABUF, SMI_EVENTS); and ioctls with
+// variable-length or otherwise unvalidated parameters (SVM, CRIU_OP,
+// DBG_TRAP). CREATE_QUEUE is denied because it names GPU virtual addresses
+// whose meaning under gVisor's split address spaces has not yet been
+// established.
 func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	if fd.isRestored() {
 		return 0, linuxerr.EBADF
@@ -214,6 +214,14 @@ func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 		return kfdIoctlSimple[amdgpu.KFDIoctlSetXNACKModeArgs](ki)
 	case amdgpu.AMDKFD_IOC_RUNTIME_ENABLE:
 		return kfdIoctlSimple[amdgpu.KFDIoctlRuntimeEnableArgs](ki)
+	case amdgpu.AMDKFD_IOC_ACQUIRE_VM:
+		return kfdAcquireVM(ki)
+	case amdgpu.AMDKFD_IOC_GET_PROCESS_APERTURES_NEW:
+		return kfdGetProcessAperturesNew(ki)
+	case amdgpu.AMDKFD_IOC_MAP_MEMORY_TO_GPU, amdgpu.AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU:
+		return kfdMapMemoryToGPU(ki)
+	case amdgpu.AMDKFD_IOC_SET_CU_MASK:
+		return kfdSetCUMask(ki)
 	}
 	ctx.Warningf("amdproxy: unsupported KFD ioctl %s (%#x)", amdgpu.KFDIoctl(ki.cmd), ki.cmd)
 	return 0, linuxerr.EINVAL

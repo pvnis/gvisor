@@ -328,7 +328,7 @@ type KFDIoctlGetClockCountersArgs struct {
 
 // KFDProcessDeviceApertures is struct kfd_process_device_apertures.
 //
-// +marshal
+// +marshal slice:KFDProcessDeviceAperturesSlice
 type KFDProcessDeviceApertures struct {
 	_            structs.HostLayout
 	LDSBase      uint64

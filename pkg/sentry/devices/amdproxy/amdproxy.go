@@ -29,9 +29,11 @@ package amdproxy
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/amdgpu"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -67,6 +69,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	amdp := &amdproxy{
 		useDevGofer: opts.UseDevGofer,
 		kfdFDs:      make(map[*kfdFD]struct{}),
+		renderFDs:   make(map[*renderFD]struct{}),
 	}
 
 	kfdDevMajor, err := vfsObj.GetDynamicCharDevMajor()
@@ -82,6 +85,24 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		return nil, err
 	}
 
+	// DRM's device major number is statically assigned, so unlike KFD the
+	// Sentry's numbering matches the host's and render nodes keep their minor
+	// numbers. Registering a device only determines which implementation
+	// serves it if it is opened; whether the node exists in the sandbox at all
+	// is decided by the container's device list.
+	for minor := uint32(amdgpu.DRM_RENDER_MINOR_BASE); minor <= amdgpu.DRM_RENDER_MINOR_MAX; minor++ {
+		if err := vfsObj.RegisterDevice(vfs.CharDevice, amdgpu.DRM_MAJOR, minor, &renderDevice{
+			amdp:  amdp,
+			minor: minor,
+		}, &vfs.RegisterDeviceOptions{
+			GroupName: "dri",
+			Pathname:  path.Join("dri", fmt.Sprintf("renderD%d", minor)),
+			FilePerms: 0666,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
 	return &amdp.devInfo, nil
 }
 
@@ -90,8 +111,9 @@ type amdproxy struct {
 	useDevGofer bool
 	devInfo     DeviceInfo
 
-	fdsMu  sync.Mutex `state:"nosave"`
-	kfdFDs map[*kfdFD]struct{}
+	fdsMu     sync.Mutex `state:"nosave"`
+	kfdFDs    map[*kfdFD]struct{}
+	renderFDs map[*renderFD]struct{}
 }
 
 func (amdp *amdproxy) trackFD(fd *kfdFD) {
@@ -104,6 +126,18 @@ func (amdp *amdproxy) untrackFD(fd *kfdFD) {
 	amdp.fdsMu.Lock()
 	defer amdp.fdsMu.Unlock()
 	delete(amdp.kfdFDs, fd)
+}
+
+func (amdp *amdproxy) trackRenderFD(fd *renderFD) {
+	amdp.fdsMu.Lock()
+	defer amdp.fdsMu.Unlock()
+	amdp.renderFDs[fd] = struct{}{}
+}
+
+func (amdp *amdproxy) untrackRenderFD(fd *renderFD) {
+	amdp.fdsMu.Lock()
+	defer amdp.fdsMu.Unlock()
+	delete(amdp.renderFDs, fd)
 }
 
 type marshalPtr[T any] interface {
