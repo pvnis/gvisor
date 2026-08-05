@@ -1,0 +1,104 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cmd
+
+import (
+	"context"
+	"net"
+	"os"
+	"time"
+
+	"github.com/google/subcommands"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/gpusched"
+	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/runsc/cmd/util"
+	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/flag"
+)
+
+// GPUScheduler implements subcommands.Command for the "gpu-scheduler" command.
+type GPUScheduler struct {
+	socket string
+	period time.Duration
+}
+
+// Name implements subcommands.Command.Name.
+func (*GPUScheduler) Name() string {
+	return "gpu-scheduler"
+}
+
+// Synopsis implements subcommands.Command.Synopsis.
+func (*GPUScheduler) Synopsis() string {
+	return "divide a GPU's time between the sandboxes sharing it"
+}
+
+// Usage implements subcommands.Command.Usage.
+func (*GPUScheduler) Usage() string {
+	return `gpu-scheduler [flags] - divide a GPU's time between the sandboxes sharing it.
+
+A sandbox can be stopped from submitting work to a GPU outside a window of time,
+but choosing that window is not something a sandbox can do for itself: it cannot
+see how many others are competing with it, nor whether they are using the GPU at
+all. This command runs outside every sandbox and decides for them.
+
+Sandboxes connect to the socket given by --socket, which they are pointed at
+with the runsc flag --nvproxy-gpu-scheduler-socket. Those using the GPU divide
+each period in proportion to their weights, so one running alone receives all of
+it, and they are given windows that do not overlap so that they take turns.
+
+Run one per GPU.
+`
+}
+
+// SetFlags implements subcommands.Command.SetFlags.
+func (g *GPUScheduler) SetFlags(f *flag.FlagSet) {
+	f.StringVar(&g.socket, "socket", "/run/runsc-gpu-scheduler.sock", "path of the socket sandboxes connect to.")
+	f.DurationVar(&g.period, "period", gpusched.DefaultPeriod, "length of the cycle that windows are placed within.")
+}
+
+// FetchSpec implements util.SubCommand.FetchSpec.
+func (g *GPUScheduler) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
+	// This command does not operate on a container, so there is no spec.
+	return "", nil, nil
+}
+
+// Execute implements subcommands.Command.Execute.
+func (g *GPUScheduler) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
+	if f.NArg() != 0 {
+		f.Usage()
+		return subcommands.ExitUsageError
+	}
+
+	// A socket left behind by a previous run would make listening fail.
+	if err := os.Remove(g.socket); err != nil && !os.IsNotExist(err) {
+		util.Fatalf("removing the existing socket %q: %v", g.socket, err)
+	}
+	l, err := net.Listen("unix", g.socket)
+	if err != nil {
+		util.Fatalf("listening on %q: %v", g.socket, err)
+	}
+	defer l.Close()
+	// Sandboxes run as root, but need not be the same user as this process.
+	if err := os.Chmod(g.socket, 0666); err != nil {
+		util.Fatalf("setting permissions on %q: %v", g.socket, err)
+	}
+
+	log.Infof("GPU scheduler listening on %q with a period of %v", g.socket, g.period)
+	if err := gpusched.NewServer(g.period).Serve(l); err != nil {
+		util.Fatalf("serving: %v", err)
+	}
+	return subcommands.ExitSuccess
+}

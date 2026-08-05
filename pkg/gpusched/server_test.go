@@ -168,14 +168,17 @@ func TestServerIdleSandboxYieldsShare(t *testing.T) {
 	connect(t, Hello{ID: "idle", Weight: 100})
 	waitForClients(t, s, 2)
 
-	for i := 0; i < 2; i++ {
+	// The idle sandbox is not judged so by a single period; tick until the
+	// hysteresis expires.
+	for i := 0; i < idleTicksBeforeYielding+2; i++ {
 		busy.SendReport(Report{Submissions: 1})
 		waitForReports(t, s, 1)
 		s.Tick()
-		if i == 0 {
-			drain(t, busy)
-		}
+		drain(t, busy)
 	}
+	busy.SendReport(Report{Submissions: 1})
+	waitForReports(t, s, 1)
+	s.Tick()
 
 	if got := recvGrant(t, busy).Fraction(); got < 0.9 {
 		t.Errorf("active sandbox received %.0f%% beside an idle one, want nearly all", got*100)
@@ -215,5 +218,37 @@ func drain(t *testing.T, c *Conn) {
 	t.Helper()
 	if _, err := c.RecvAssignment(); err != nil {
 		t.Fatalf("draining assignment: %v", err)
+	}
+}
+
+// TestServerToleratesAMissedReport tests that a sandbox is not judged idle by a
+// single period without a report.
+//
+// A sandbox reports on a clock of its own, so whenever it drifts against the
+// scheduler's a period will pass in which nothing arrived; a sandbox between
+// kernels looks the same. Reacting to one such period would make its share
+// oscillate.
+func TestServerToleratesAMissedReport(t *testing.T) {
+	s, connect := testServer(t)
+	a := connect(t, Hello{ID: "a", Weight: 100})
+	b := connect(t, Hello{ID: "b", Weight: 100})
+	waitForClients(t, s, 2)
+
+	for i := 0; i < 2; i++ {
+		a.SendReport(Report{Submissions: 1})
+		b.SendReport(Report{Submissions: 1})
+		waitForReports(t, s, 2)
+		s.Tick()
+		drain(t, a)
+		drain(t, b)
+	}
+
+	// A period passes in which b reports nothing.
+	a.SendReport(Report{Submissions: 1})
+	waitForReports(t, s, 1)
+	s.Tick()
+	drain(t, a)
+	if got := recvGrant(t, b).Fraction(); got < 0.4 {
+		t.Errorf("after one missed report b was cut to %.0f%%, want about half", got*100)
 	}
 }

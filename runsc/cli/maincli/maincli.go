@@ -85,6 +85,7 @@ func commands() (map[util.SubCommand]string, []subcommands.Command) {
 		new(cmd.Debug):        debugGroup,
 		new(cmd.Statefile):    debugGroup,
 		new(cmd.Symbolize):    debugGroup,
+		new(cmd.GPUScheduler): debugGroup,
 		new(cmd.Usage):        debugGroup,
 		new(cmd.ReadControl):  debugGroup,
 		new(cmd.WriteControl): debugGroup,

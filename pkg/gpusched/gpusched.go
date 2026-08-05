@@ -277,11 +277,15 @@ func (s *Scheduler) Grants() map[ID]Grant {
 	return grants
 }
 
-// Settle applies the accounting for a period whose windows were the given
-// grants: it credits clients for time withheld from them, charges them for time
-// they used beyond their window, and clears the measurements.
+// Settle applies the accounting for the period that has just ended, whose
+// windows were the given grants: it credits clients for time withheld from
+// them, charges them for time they used beyond the window they actually had,
+// and clears the measurements.
 //
-// The cycle for each period is Observe, then Grants, then Settle.
+// The cycle for each period is Observe, then Grants for the period to come,
+// then Settle against the windows of the period that ended. Settling against
+// the windows just computed would invent an overrun whenever a client's share
+// shrank.
 func (s *Scheduler) Settle(grants map[ID]Grant) {
 	for id, c := range s.clients {
 		// Time held back in repayment reduces what is owed.

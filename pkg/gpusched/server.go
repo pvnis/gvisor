@@ -32,6 +32,12 @@ type Server struct {
 	mu    sync.Mutex
 	sched *Scheduler
 	conns map[ID]*serverConn
+
+	// prevGrants are the windows that were in effect over the period just
+	// ended, which is what the usage reported for it must be judged against.
+	// Charging it against the windows being computed for the next period would
+	// invent an overrun whenever a sandbox's share shrank.
+	prevGrants map[ID]Grant
 }
 
 // serverConn is one connected sandbox.
@@ -48,7 +54,19 @@ type serverConn struct {
 	// whole period so that a sandbox's first report counts as activity rather
 	// than as having used nothing.
 	lastAllowance time.Duration
+
+	// idleTicks counts consecutive periods in which the sandbox reported
+	// nothing. It is what keeps a sandbox from being judged idle by a single
+	// period: a sandbox reports once per period on a clock of its own, so
+	// whenever the two drift a period will pass in which nothing arrived, and
+	// treating that as idleness would make its share oscillate. A sandbox
+	// between kernels behaves the same way.
+	idleTicks int
 }
+
+// idleTicksBeforeYielding is how many consecutive periods a sandbox must report
+// nothing in before its share is given to others.
+const idleTicksBeforeYielding = 3
 
 // NewServer returns a Server scheduling in periods of the given length.
 func NewServer(period time.Duration) *Server {
@@ -130,8 +148,13 @@ func (s *Server) Tick() {
 	// submitted nothing is idle, and its share goes to one that will use it.
 	for id, sc := range s.conns {
 		if sc.submissions.Swap(0) > 0 {
-			// It used its window. How much of it cannot be seen from here;
-			// measuring that needs the GPU's own accounting.
+			sc.idleTicks = 0
+		} else {
+			sc.idleTicks++
+		}
+		if sc.idleTicks < idleTicksBeforeYielding {
+			// It is using the GPU. How much of its window it used cannot be
+			// seen from here; measuring that needs the GPU's own accounting.
 			s.sched.Observe(id, sc.lastAllowance)
 		} else {
 			s.sched.Observe(id, 0)
@@ -145,7 +168,8 @@ func (s *Server) Tick() {
 		}
 		conns[id] = sc
 	}
-	s.sched.Settle(grants)
+	s.sched.Settle(s.prevGrants)
+	s.prevGrants = grants
 	s.mu.Unlock()
 
 	// Send outside the lock: a sandbox that has stopped reading must not hold
