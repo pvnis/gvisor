@@ -74,6 +74,7 @@ go_library(
     deps = [
         "//pkg/abi/linux",
         "//pkg/abi/nvgpu",
+        "//pkg/gpusched",
         "//pkg/atomicbitops",
         "//pkg/cleanup",
         "//pkg/context",

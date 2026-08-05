@@ -19,6 +19,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/gpusched"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -48,9 +49,22 @@ const computeGatePeriod = 100 * time.Millisecond
 //
 // +stateify savable
 type computeGate struct {
-	// percent is the percentage of each period during which submission is
-	// permitted. Zero or 100 disables gating. It is immutable after Register().
+	// percent is the share of each period during which submission is permitted
+	// when no scheduler is supplying one. Zero or 100 disables gating. It is
+	// immutable after Register().
 	percent uint64
+
+	// scheduled is true if a scheduler outside the sandbox supplies the window,
+	// in which case gating is in effect regardless of percent. It is immutable
+	// after Register().
+	scheduled bool
+
+	// grantMu protects the window, which a scheduler may replace at any time.
+	// It is separate from mu so that reading the window on the submission path
+	// does not wait on the bookkeeping below, and is held only for the few
+	// reads needed to copy it.
+	grantMu sync.Mutex `state:"nosave"`
+	grant   gpusched.Grant
 
 	mu sync.Mutex `state:"nosave"`
 
@@ -68,12 +82,43 @@ type computeGate struct {
 	gated map[*frontendFD]struct{}
 }
 
-// init prepares g to gate at the given percentage.
-func (g *computeGate) init(percent uint64) {
+// init prepares g to gate submission, permitting it for the given share of each
+// period until a scheduler supplies a window. If scheduled is true, gating is in
+// effect even when percent is unset, because the scheduler decides the share.
+func (g *computeGate) init(percent uint64, scheduled bool) {
 	g.percent = percent
+	g.scheduled = scheduled
 	g.cmdBufs = make(map[nvgpu.Handle]struct{})
 	g.byMem = make(map[nvgpu.Handle]*frontendFD)
 	g.gated = make(map[*frontendFD]struct{})
+	// Until a scheduler says otherwise, hold the sandbox to its configured
+	// share, or to all of the period if it has none. Starting at nothing would
+	// stall a sandbox whose scheduler never appears.
+	allowance := computeGatePeriod
+	if percent > 0 && percent < 100 {
+		allowance = time.Duration(uint64(computeGatePeriod) * percent / 100)
+	}
+	g.grant = gpusched.Grant{Period: computeGatePeriod, Allowance: allowance}
+}
+
+// setGrant replaces the window during which submission is permitted.
+func (g *computeGate) setGrant(grant gpusched.Grant) {
+	if grant.Period <= 0 {
+		return
+	}
+	if grant.Allowance > grant.Period {
+		grant.Allowance = grant.Period
+	}
+	g.grantMu.Lock()
+	g.grant = grant
+	g.grantMu.Unlock()
+}
+
+// currentGrant returns the window in effect.
+func (g *computeGate) currentGrant() gpusched.Grant {
+	g.grantMu.Lock()
+	defer g.grantMu.Unlock()
+	return g.grant
 }
 
 // restore resumes gating after the sandbox has been restored.
@@ -97,21 +142,18 @@ func (g *computeGate) restore() {
 	if g.gated == nil {
 		g.gated = make(map[*frontendFD]struct{})
 	}
+	if g.grant.Period <= 0 {
+		g.grant = gpusched.Grant{Period: computeGatePeriod, Allowance: computeGatePeriod}
+	}
 	if g.enabled() {
-		log.Infof("nvproxy: resuming GPU compute limit of %d%% after restore", g.percent)
+		log.Infof("nvproxy: resuming GPU compute limit after restore")
 		go g.run()
 	}
 }
 
 // enabled returns true if g limits submission.
 func (g *computeGate) enabled() bool {
-	return g.percent != 0 && g.percent < 100
-}
-
-// allowance returns the portion of each period during which submission is
-// permitted.
-func (g *computeGate) allowance() time.Duration {
-	return time.Duration(uint64(computeGatePeriod) * g.percent / 100)
+	return g.scheduled || (g.percent != 0 && g.percent < 100)
 }
 
 // noteMapping records that the memory object h is mapped through fd.
@@ -173,17 +215,31 @@ func (g *computeGate) forget(fd *frontendFD) {
 }
 
 // waitUntil returns how long a submission arriving at time t must wait before
-// it is permitted, which is zero if it falls within the sandbox's share of the
-// period.
+// it is permitted, which is zero if t falls within the sandbox's window.
+//
+// The window begins at the grant's phase rather than at the start of the period,
+// so that sandboxes sharing a GPU take turns instead of all contending during
+// the same part of every period.
 func (g *computeGate) waitUntil(t time.Time) time.Duration {
 	if !g.enabled() {
 		return 0
 	}
-	phase := time.Duration(t.UnixNano()) % computeGatePeriod
-	if allow := g.allowance(); phase < allow {
+	grant := g.currentGrant()
+	if grant.Allowance >= grant.Period {
 		return 0
 	}
-	return computeGatePeriod - phase
+	pos := time.Duration(t.UnixNano()) % grant.Period
+	switch {
+	case pos < grant.Phase:
+		// Before the window opens.
+		return grant.Phase - pos
+	case pos < grant.Phase+grant.Allowance:
+		// Within it.
+		return 0
+	default:
+		// Past it; wait for the window in the next period.
+		return grant.Period - pos + grant.Phase
+	}
 }
 
 // wait blocks the calling task until the sandbox is permitted to submit work.
@@ -213,20 +269,29 @@ func (g *computeGate) wait(ctx context.Context) {
 // It runs until the sandbox exits; there is no shutdown path because a Sentry
 // outlives every sandbox process that could be gated.
 func (g *computeGate) run() {
-	allow := g.allowance()
 	for {
-		// Sleep until the end of this period's allowance, so that mappings are
-		// revoked exactly when the sandbox's share ends. Revoking at any other
-		// point would let an application that faulted early run on through the
-		// remainder of the period.
-		phase := time.Duration(time.Now().UnixNano()) % computeGatePeriod
-		if phase < allow {
-			time.Sleep(allow - phase)
-		} else {
-			time.Sleep(computeGatePeriod - phase + allow)
-		}
+		time.Sleep(g.untilWindowEnd(time.Now()))
 		g.revoke()
 	}
+}
+
+// untilWindowEnd returns how long until the end of the window containing or
+// following t.
+//
+// Mappings are revoked exactly then, so that a sandbox is shut out for the
+// remainder of the period. Revoking at any other point would let an application
+// that faulted early run on past the end of its window.
+func (g *computeGate) untilWindowEnd(t time.Time) time.Duration {
+	grant := g.currentGrant()
+	if grant.Period <= 0 {
+		return computeGatePeriod
+	}
+	end := grant.Phase + grant.Allowance
+	pos := time.Duration(t.UnixNano()) % grant.Period
+	if pos < end {
+		return end - pos
+	}
+	return grant.Period - pos + end
 }
 
 // revoke invalidates every mapping of every gated file description.

@@ -19,11 +19,12 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
+	"gvisor.dev/gvisor/pkg/gpusched"
 )
 
 func newGate(percent uint64) *computeGate {
 	g := &computeGate{}
-	g.init(percent)
+	g.init(percent, false /* scheduled */)
 	return g
 }
 
@@ -220,6 +221,7 @@ func TestComputeGateRestoreKeepsState(t *testing.T) {
 func TestComputeGateRestoreRebuildsNilMaps(t *testing.T) {
 	g := &computeGate{percent: 50}
 	g.restore()
+	g.setGrant(gpusched.Grant{Period: computeGatePeriod, Allowance: computeGatePeriod / 2})
 	// Must not panic on a nil map.
 	h := nvgpu.Handle{Val: 0x5c000015}
 	fd := &frontendFD{}
@@ -244,5 +246,99 @@ func TestComputeGateRestoreDisabledStartsNothing(t *testing.T) {
 	g.addCommandBuffer(h)
 	if fd.gated.Load() {
 		t.Errorf("file description gated despite no limit")
+	}
+}
+
+// TestComputeGateHonoursPhase tests that a window beginning partway through the
+// period is respected at both ends. Sandboxes sharing a GPU are given
+// non-overlapping windows so that they take turns, which only works if each
+// waits for its own.
+func TestComputeGateHonoursPhase(t *testing.T) {
+	g := newGate(50)
+	// A window covering the second half of each period.
+	g.setGrant(gpusched.Grant{
+		Period:    computeGatePeriod,
+		Allowance: computeGatePeriod / 2,
+		Phase:     computeGatePeriod / 2,
+	})
+	for _, test := range []struct {
+		name  string
+		phase time.Duration
+		want  time.Duration
+	}{
+		{"before the window", 10 * time.Millisecond, 40 * time.Millisecond},
+		{"window opens", 50 * time.Millisecond, 0},
+		{"within the window", 70 * time.Millisecond, 0},
+		{"last instant", 100*time.Millisecond - time.Nanosecond, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := g.waitUntil(atPhase(test.phase)); got != test.want {
+				t.Errorf("waitUntil(phase=%v) = %v, want %v", test.phase, got, test.want)
+			}
+		})
+	}
+}
+
+// TestComputeGateDisjointWindowsDoNotOverlap tests that two sandboxes given
+// adjacent windows are never permitted at the same instant, which is what makes
+// them take turns rather than contend.
+func TestComputeGateDisjointWindowsDoNotOverlap(t *testing.T) {
+	a, b := newGate(50), newGate(50)
+	half := computeGatePeriod / 2
+	a.setGrant(gpusched.Grant{Period: computeGatePeriod, Allowance: half})
+	b.setGrant(gpusched.Grant{Period: computeGatePeriod, Allowance: half, Phase: half})
+
+	var bothPermitted, neitherPermitted int
+	for ph := time.Duration(0); ph < computeGatePeriod; ph += time.Millisecond {
+		aOK := a.waitUntil(atPhase(ph)) == 0
+		bOK := b.waitUntil(atPhase(ph)) == 0
+		if aOK && bOK {
+			bothPermitted++
+		}
+		if !aOK && !bOK {
+			neitherPermitted++
+		}
+	}
+	if bothPermitted != 0 {
+		t.Errorf("both sandboxes were permitted at %d instants, want none", bothPermitted)
+	}
+	// The GPU should never be left with nobody able to use it.
+	if neitherPermitted != 0 {
+		t.Errorf("neither sandbox was permitted at %d instants, leaving the GPU idle", neitherPermitted)
+	}
+}
+
+// TestComputeGateWindowEnd tests that revocation is scheduled for the end of
+// the window rather than the end of the period.
+func TestComputeGateWindowEnd(t *testing.T) {
+	g := newGate(50)
+	g.setGrant(gpusched.Grant{
+		Period:    computeGatePeriod,
+		Allowance: 30 * time.Millisecond,
+		Phase:     20 * time.Millisecond,
+	})
+	// The window closes at 50ms.
+	for _, test := range []struct {
+		phase, want time.Duration
+	}{
+		{0, 50 * time.Millisecond},
+		{40 * time.Millisecond, 10 * time.Millisecond},
+		{60 * time.Millisecond, 90 * time.Millisecond},
+	} {
+		if got := g.untilWindowEnd(atPhase(test.phase)); got != test.want {
+			t.Errorf("untilWindowEnd(phase=%v) = %v, want %v", test.phase, got, test.want)
+		}
+	}
+}
+
+// TestComputeGateFullAllowanceNeverWaits tests that a sandbox granted the whole
+// period is never held, which is what a sandbox running alone should receive.
+func TestComputeGateFullAllowanceNeverWaits(t *testing.T) {
+	g := newGate(50)
+	g.setGrant(gpusched.Grant{Period: computeGatePeriod, Allowance: computeGatePeriod})
+	for ph := time.Duration(0); ph < computeGatePeriod; ph += time.Millisecond {
+		if d := g.waitUntil(atPhase(ph)); d != 0 {
+			t.Fatalf("waitUntil(phase=%v) = %v with the whole period granted, want 0", ph, d)
+		}
 	}
 }

@@ -103,7 +103,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	}
 	nvp.memAcct.gpuLimit = opts.GPUMemoryLimit
 	nvp.maxTimesliceUs = opts.MaxTimesliceUs
-	nvp.computeGate.init(opts.ComputePercent)
+	nvp.computeGate.init(opts.ComputePercent, false /* scheduled */)
 	if nvp.computeGate.enabled() {
 		log.Infof("nvproxy: GPU compute limited to %d%% of wall-clock time", opts.ComputePercent)
 		go nvp.computeGate.run()
