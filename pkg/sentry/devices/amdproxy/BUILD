@@ -14,6 +14,7 @@ go_library(
         "kfd.go",
         "kfd_handlers.go",
         "kfd_mmap.go",
+        "memquota.go",
         "kfd_unsafe.go",
         "seccomp_filters.go",
     ],

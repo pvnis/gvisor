@@ -53,6 +53,10 @@ type Options struct {
 	// If UseDevGofer is true, open device files via gofer.
 	UseDevGofer bool
 
+	// GPUMemoryLimit is the maximum number of bytes of device memory the
+	// sandbox may allocate at once. Zero means no limit.
+	GPUMemoryLimit uint64
+
 	// CUMask is the set of GPU compute units the sandbox may run on. A nil
 	// mask means every compute unit.
 	//
@@ -81,6 +85,10 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		cuMask:      opts.CUMask,
 		kfdFDs:      make(map[*kfdFD]struct{}),
 		renderFDs:   make(map[*renderFD]struct{}),
+	}
+	amdp.memAcct.init(opts.GPUMemoryLimit)
+	if opts.GPUMemoryLimit != 0 {
+		log.Infof("amdproxy: GPU memory limited to %d bytes", opts.GPUMemoryLimit)
 	}
 	if len(opts.CUMask) > 0 {
 		if opts.CUMask.Empty() {
@@ -131,6 +139,11 @@ type amdproxy struct {
 	// cuMask is the sandbox's compute unit ceiling, applied to every queue
 	// it creates. Immutable after Register.
 	cuMask amdconf.CUMask
+
+	// memAcct tracks GPU memory charged to this sandbox. It is shared by
+	// every device and file description in the sandbox, so it accounts the
+	// sandbox's aggregate usage across all of its processes.
+	memAcct memAccount
 
 	fdsMu     sync.Mutex `state:"nosave"`
 	kfdFDs    map[*kfdFD]struct{}

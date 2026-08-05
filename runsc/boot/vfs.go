@@ -1741,8 +1741,9 @@ func amdproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem)
 		return fmt.Errorf("invalid --amdproxy-cu-mask: %w", err)
 	}
 	devInfo, err := amdproxy.Register(vfsObj, &amdproxy.Options{
-		UseDevGofer: true,
-		CUMask:      cuMask,
+		UseDevGofer:    true,
+		CUMask:         cuMask,
+		GPUMemoryLimit: info.conf.AMDProxyGPUMemoryLimit,
 	})
 	if err != nil {
 		return fmt.Errorf("registering amdproxy driver: %w", err)

@@ -226,3 +226,77 @@ func (fd *kfdFD) destroyQueue(queueID uint32) error {
 	}
 	return nil
 }
+
+// kfdAllocMemoryOfGPU handles AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, charging the
+// allocation against the sandbox's GPU memory limit.
+//
+// The charge is taken before the ioctl is forwarded, so that two concurrent
+// allocations cannot both be admitted against the same headroom, and returned
+// if the driver refuses the allocation for its own reasons. When the limit
+// would be exceeded the driver is never called: the request is refused with
+// the error it would itself have returned, which the ROCm runtime reports as
+// an out-of-memory condition.
+func kfdAllocMemoryOfGPU(ki *kfdIoctlState) (uintptr, error) {
+	var params amdgpu.KFDIoctlAllocMemoryOfGPUArgs
+	if _, err := params.CopyIn(ki.t, ki.argAddr); err != nil {
+		return 0, err
+	}
+	acct := &ki.fd.dev.amdp.memAcct
+	kind := memKindOfFlags(params.Flags)
+	if !acct.admit(ki.ctx, kind, params.Size) {
+		return 0, linuxerr.ENOMEM
+	}
+	n, err := kfdIoctlInvoke(ki, &params)
+	if err != nil {
+		acct.release(kind, params.Size)
+		return n, err
+	}
+	acct.record(params.Handle, kind, params.Size)
+	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// kfdFreeMemoryOfGPU handles AMDKFD_IOC_FREE_MEMORY_OF_GPU, returning what the
+// allocation was charged.
+func kfdFreeMemoryOfGPU(ki *kfdIoctlState) (uintptr, error) {
+	var params amdgpu.KFDIoctlFreeMemoryOfGPUArgs
+	if _, err := params.CopyIn(ki.t, ki.argAddr); err != nil {
+		return 0, err
+	}
+	n, err := kfdIoctlInvoke(ki, &params)
+	if err != nil {
+		// The allocation still exists, so it stays charged.
+		return n, err
+	}
+	ki.fd.dev.amdp.memAcct.forget(params.Handle)
+	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// kfdAvailableMemory handles AMDKFD_IOC_AVAILABLE_MEMORY, reporting what the
+// sandbox may still allocate rather than what the device has.
+//
+// Frameworks size their allocations against this, so reporting the device's
+// free memory would have them plan for memory they can never get. It would
+// also disclose how much of the GPU the rest of the machine is using.
+func kfdAvailableMemory(ki *kfdIoctlState) (uintptr, error) {
+	var params amdgpu.KFDIoctlGetAvailableMemoryArgs
+	if _, err := params.CopyIn(ki.t, ki.argAddr); err != nil {
+		return 0, err
+	}
+	n, err := kfdIoctlInvoke(ki, &params)
+	if err != nil {
+		return n, err
+	}
+	if headroom, limited := ki.fd.dev.amdp.memAcct.availableVRAM(); limited && headroom < params.Available {
+		params.Available = headroom
+	}
+	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}

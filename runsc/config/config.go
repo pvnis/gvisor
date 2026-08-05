@@ -394,6 +394,10 @@ type Config struct {
 	// compute unit.
 	AMDProxyCUMask string `flag:"amdproxy-cu-mask"`
 
+	// AMDProxyGPUMemoryLimit is the maximum number of bytes of device memory
+	// that the sandbox may allocate. Zero means no limit.
+	AMDProxyGPUMemoryLimit uint64 `flag:"amdproxy-gpu-memory-limit"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

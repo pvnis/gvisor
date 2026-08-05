@@ -199,12 +199,6 @@ func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 		return kfdIoctlSimple[amdgpu.KFDIoctlSetEventArgs](ki)
 	case amdgpu.AMDKFD_IOC_RESET_EVENT:
 		return kfdIoctlSimple[amdgpu.KFDIoctlResetEventArgs](ki)
-	case amdgpu.AMDKFD_IOC_ALLOC_MEMORY_OF_GPU:
-		return kfdIoctlSimple[amdgpu.KFDIoctlAllocMemoryOfGPUArgs](ki)
-	case amdgpu.AMDKFD_IOC_FREE_MEMORY_OF_GPU:
-		return kfdIoctlSimple[amdgpu.KFDIoctlFreeMemoryOfGPUArgs](ki)
-	case amdgpu.AMDKFD_IOC_AVAILABLE_MEMORY:
-		return kfdIoctlSimple[amdgpu.KFDIoctlGetAvailableMemoryArgs](ki)
 	case amdgpu.AMDKFD_IOC_SET_SCRATCH_BACKING_VA:
 		return kfdIoctlSimple[amdgpu.KFDIoctlSetScratchBackingVAArgs](ki)
 	case amdgpu.AMDKFD_IOC_SET_TRAP_HANDLER:
@@ -225,6 +219,12 @@ func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 		return kfdSetCUMask(ki)
 	case amdgpu.AMDKFD_IOC_CREATE_QUEUE:
 		return kfdCreateQueue(ki)
+	case amdgpu.AMDKFD_IOC_ALLOC_MEMORY_OF_GPU:
+		return kfdAllocMemoryOfGPU(ki)
+	case amdgpu.AMDKFD_IOC_FREE_MEMORY_OF_GPU:
+		return kfdFreeMemoryOfGPU(ki)
+	case amdgpu.AMDKFD_IOC_AVAILABLE_MEMORY:
+		return kfdAvailableMemory(ki)
 	}
 	ctx.Warningf("amdproxy: unsupported KFD ioctl %s (%#x)", amdgpu.KFDIoctl(ki.cmd), ki.cmd)
 	return 0, linuxerr.EINVAL
