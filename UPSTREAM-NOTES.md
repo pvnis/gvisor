@@ -87,20 +87,49 @@ this note attributed it to Linux KVM being unable to back guest memory with a
 it: the pages are readable and mapped on the host, so `hva_to_pfn_remapped`
 has a present PTE to follow.
 
-What is not yet established is which part of the platform is at fault. The two
-candidates, neither confirmed:
+Both of the candidates that were open have since been checked, and neither is
+at fault. Tracing the whole translation for a failing 2 MiB mapping gives:
 
-- the KVM memory slot covering the device mapping's guest-physical range.
-  `machine.mapPhysical` skips slot creation when `hasSlot(physicalStart)`
-  already holds for the enclosing 8 GiB fault block, and `physicalRegions` is
-  computed once at startup from `/proc/self/maps`, before any device mapping
-  exists.
-- the guest page tables installed by `addressSpace.mapLocked`, even though
-  `MapFile` is called with the correct range and a single block.
+```
+MapFile     gva=7f1e94400000 fr=[100043000,100243000) blocks=1
+  block     hva=340557200000 len=200000
+mapLocked   gva=7f1e94400000 hva=340557200000 gpa=340757200000 len=200000
+mapPhysical gpa=340757200000 -> vstart=340400001000 pstart=340600001000
+            len=1977ff000 mmio=false hasSlot=true
+            prVirt=1000 prPhys=200001000 prLen=3405977ff000
+```
 
-Confirming which would need the guest-physical address and slot contents
-dumped for the failing range and compared against the Sentry virtual address
-that `MapInternal` returned.
+Every step of that is right:
+
+- the guest-physical address follows the region's linear map,
+  `prPhys + (hva - prVirt)` = `200001000 + 3405571ff000` = `340757200000`
+- the enclosing slot maps that address back to exactly the Sentry mapping,
+  `vstart + (gpa - pstart)` = `340400001000 + 1571ff000` = `340557200000`
+- the slot is not `mmio`, so it is a real memory slot, and it covers the range
+- the guest page tables are asked for the whole `200000` bytes at once
+
+So the memory slot and the guest page tables are both correct, and the Sentry
+can read every page of the mapping they point at.
+
+What remains is that this is specific to *device* memory. The same page walk
+over an ordinary `MAP_SHARED` file mapping of the same size, in the same
+sandbox on the same platform, succeeds for all 512 pages:
+
+```
+kvm, MAP_SHARED file:   mapped 2048 KiB -> all 512 pages OK
+kvm, GPU device memory: mapped 2048 KiB -> FIRST FAULT at page 1
+```
+
+The only difference left between those two is that the device's VMA is
+`VM_PFNMAP`/`VM_IO`. gVisor maps it into the guest through the ordinary
+memory-slot path, which is correct for normal memory and is where this breaks
+for device memory. The fix therefore belongs in gVisor, which has to
+recognise device memory and map it differently; the constraint it is running
+into is how KVM resolves `VM_PFNMAP` ranges behind a memslot.
+
+The next step is to find what KVM does with the guest fault for such a range:
+whether it exits to userspace as MMIO, or fails `hva_to_pfn_remapped`, which
+`kvm_stat` or a trace of `kvm_page_fault` on the host would show.
 
 gVisor already warns that `cudaMallocManaged()` is "flaky on -platform=kvm";
 this reduces that to a deterministic one-line reproducer.
