@@ -684,6 +684,36 @@ stands down. Losing it is safe in both directions: a container that sets the
 variable back only re-enables a second limiter on top of the Sentry's, which can
 restrict it further but never grant it more.
 
+### Removing the preload entirely
+
+The variable above leaves `libvgpu.so` mapped into the container and merely
+inert. On a node that runs only gVisor, the preload can be dropped altogether by
+blanking the key that HAMi's device plugin distributes:
+
+```
+kubectl -n kube-system patch cm hami-device-plugin --type merge \
+  -p '{"data":{"ld.so.preload":""}}'
+kubectl -n kube-system delete pod -l app.kubernetes.io/component=hami-device-plugin
+```
+
+The restart is required: that key is mounted into the plugin with a `subPath`,
+and ConfigMap volumes mounted that way never receive updates. Once the plugin
+comes back, containers get an empty `/etc/ld.so.preload` and the library is never
+loaded. The three bind mounts remain, and are inert without it.
+
+The same pod, requesting 512 MiB and attempting 768 MiB, across the three
+configurations:
+
+    libvgpu   annotation   device seen        outcome
+    loaded    none         512 / 512 MiB      refused at 512 MiB
+    dropped   none         11347 / 11790 MiB  allocated all 768 MiB
+    dropped   512 MiB      350 / 512 MiB      refused at 320 MiB
+
+The middle row is what the preload was there to prevent, and the last is the
+Sentry doing it instead. Prefer this to the environment variable only where no
+container on the node relies on HAMi's enforcement, since the change is
+node-wide: a `runc` pod on the same node has nothing else limiting it.
+
 Nothing a pod asks for is changed, so the scheduler continues to place pods
 exactly as before, and no device plugin of gVisor's own is needed. Note that
 `--nvproxy-gpu-scheduler-socket` must be configured on the runtime for the
