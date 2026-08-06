@@ -24,16 +24,19 @@ below needs a kernel >= 6.13 and sens1 cannot be upgraded.
 | GPU | discrete, 54 CUs, 12032 MiB | **Phoenix1 APU**, 12 CUs, ~14170 MiB |
 | `gpu_id` | 13623 | 40786 |
 | `/dev/kfd` major | 235 | **511** |
-| docker | yes | **no** |
-| `sudo` | passwordless | **needs a password** |
+| docker | yes | **yes** |
+| `sudo` | passwordless | **passwordless (`(ALL) NOPASSWD: ALL`)** |
 
 Nothing should hardcode a `gpu_id` or a KFD major: the major is dynamically
 allocated and genuinely differs. `~/amdtest/gputest.sh` reads both from the host.
 
-**Building on sensnucbox2:** `make build TARGETS=//runsc:runsc` runs bazel inside
-a docker container, and there is no docker there. Until that is set up, use the
-prebuilt static `~/amdtest/runsc` (from sens1 at `58f9fa8d4`). Getting a real
-build working is a prerequisite for any code change.
+**Building on sensnucbox2:** `sudo -n` is fully passwordless. The build system
+invokes docker, which requires sudo. Use the wrapper:
+```
+make build TARGETS=//runsc:runsc DOCKER_CLI_PATH=/home/dmd/.claude/jobs/5fee7787/tmp/sudodocker
+```
+where `sudodocker` is `exec sudo /usr/bin/docker "$@"`. After building, copy the
+output to `~/amdtest/runsc` (look in `bazel-bin/runsc/runsc_/runsc`).
 
 `~/amdtest/` holds every reproducer, a `Makefile`, `gputest.sh`, and baselines
 measured on sens1. Read `~/amdtest/README.md` first.
@@ -73,23 +76,28 @@ proxied device. See `UPSTREAM-NOTES.md`. **Not yet sent.**
 
 ## Next
 
-1. **Confirm the KVM fix on sensnucbox2's kernel** (task #24). This is the first
-   thing to do, and it is one command:
-   `cd ~/amdtest && ./gputest.sh pagewalk3 16384 fwd`.
-   On sens1 this prints `OK pages: 0 1024 2048 2560 3072 3584`. On >= 6.13 it
-   should print all 4096. If it does, the KVM platform is usable for AMD and the
-   whole picture changes — a HIP program becomes the next thing to try
-   (`make vecadd`, then run it under runsc).
+1. **`vecadd` end-to-end under KVM.** KVM is confirmed fixed on kernel 7.0.0
+   (task #24 done). The USERPTR problem is fixed (`HSA_USERPTR_FOR_PAGED_MEM=0`
+   now baked into `hiptest.sh`). GET_TILE_CONFIG is now implemented.
+   **Build the new runsc** (below) and run:
+   ```
+   cd ~/amdtest && ./hiptest.sh build/vecadd
+   ```
+   The next failure after GET_TILE_CONFIG is probably CREATE_QUEUE (struct size
+   fixed: 88→96 bytes, kernel 7.0.0 added `SdmaEngineID` and `MetadataRingSize`)
+   or SVM (`AMDKFD_IOC_SVM` — variable-length, not in the allowlist yet; the
+   struct has a flexible array member `attrs[]` and needs a custom handler that
+   copies `24 + nattr*8` bytes rather than just the fixed struct). Watch the runsc log for the next
+   unsupported ioctl warning.
 2. **`/dev/kfd` mappings are impossible on systrap** (task #18). Not a bug: KFD
    binds each mapping to the process holding the KFD context, and systrap maps
    from a stub process, so `mmap` returns `EINVAL`. Only the KFD mapping is
-   process-bound; the render node's is not. If KVM works on the new kernel this
-   stops being the blocker it was, but systrap remains unusable for AMD.
+   process-bound; the render node's is not. KVM is now usable.
 3. **sysfs topology leaks the real VRAM size** (task #22). A container under a
    quota still reads the device's full memory from the synthetic sysfs. An
    information leak and an inconsistency — a runtime sizing its pools from sysfs
    will over-commit. Rewrite the sizes to the sandbox's quota.
-4. Send the two fixes above upstream, and file the KVM issue.
+4. Send the two upstream fixes and file the KVM issue.
 
 ## Context worth having
 

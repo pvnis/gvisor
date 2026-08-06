@@ -167,6 +167,77 @@ func kfdSetCUMask(ki *kfdIoctlState) (uintptr, error) {
 	return n, err
 }
 
+// maxKFDTileConfigs is an upper bound on the number of tile or macro-tile
+// config entries KFD may return. GCN hardware has at most 44 tile modes and
+// 16 macro-tile modes; 256 gives ample room for future expansion.
+const maxKFDTileConfigs = 256
+
+// kfdGetTileConfig handles AMDKFD_IOC_GET_TILE_CONFIG. The parameters point
+// at two optional application arrays (tile configs and macro-tile configs)
+// that the driver fills in, so each non-null pointer is retargeted at a
+// Sentry buffer for the duration of the call and the result copied back.
+func kfdGetTileConfig(ki *kfdIoctlState) (uintptr, error) {
+	var params amdgpu.KFDIoctlGetTileConfigArgs
+	if _, err := params.CopyIn(ki.t, ki.argAddr); err != nil {
+		return 0, err
+	}
+
+	origTilePtr := params.TileConfigPtr
+	origMacroPtr := params.MacroTileConfigPtr
+
+	var tileConfigs []uint32
+	if params.NumTileConfigs > 0 && params.TileConfigPtr != 0 {
+		if params.NumTileConfigs > maxKFDTileConfigs {
+			return 0, linuxerr.EINVAL
+		}
+		tileConfigs = make([]uint32, params.NumTileConfigs)
+		defer runtime.KeepAlive(tileConfigs)
+		params.TileConfigPtr = uint64(uintptr(unsafe.Pointer(&tileConfigs[0])))
+	} else {
+		params.TileConfigPtr = 0
+	}
+
+	var macroTileConfigs []uint32
+	if params.NumMacroTileConfigs > 0 && params.MacroTileConfigPtr != 0 {
+		if params.NumMacroTileConfigs > maxKFDTileConfigs {
+			return 0, linuxerr.EINVAL
+		}
+		macroTileConfigs = make([]uint32, params.NumMacroTileConfigs)
+		defer runtime.KeepAlive(macroTileConfigs)
+		params.MacroTileConfigPtr = uint64(uintptr(unsafe.Pointer(&macroTileConfigs[0])))
+	} else {
+		params.MacroTileConfigPtr = 0
+	}
+
+	n, err := kfdIoctlInvoke(ki, &params)
+	params.TileConfigPtr = origTilePtr
+	params.MacroTileConfigPtr = origMacroPtr
+	if err != nil {
+		return n, err
+	}
+
+	if len(tileConfigs) > 0 && params.NumTileConfigs > 0 {
+		if params.NumTileConfigs > uint32(len(tileConfigs)) {
+			return n, linuxerr.EINVAL
+		}
+		if _, err := primitive.CopyUint32SliceOut(ki.t, hostarch.Addr(origTilePtr), tileConfigs[:params.NumTileConfigs]); err != nil {
+			return n, err
+		}
+	}
+	if len(macroTileConfigs) > 0 && params.NumMacroTileConfigs > 0 {
+		if params.NumMacroTileConfigs > uint32(len(macroTileConfigs)) {
+			return n, linuxerr.EINVAL
+		}
+		if _, err := primitive.CopyUint32SliceOut(ki.t, hostarch.Addr(origMacroPtr), macroTileConfigs[:params.NumMacroTileConfigs]); err != nil {
+			return n, err
+		}
+	}
+	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 // kfdCreateQueue handles AMDKFD_IOC_CREATE_QUEUE.
 //
 // The parameters name GPU virtual addresses rather than pointers the Sentry

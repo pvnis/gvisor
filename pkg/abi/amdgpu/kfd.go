@@ -42,7 +42,7 @@ const KFD_IOCTL_BASE = uint32('K')
 // numbers, which encode the size of their parameter struct.
 const (
 	SizeofKFDIoctlGetVersionArgs             = 8
-	SizeofKFDIoctlCreateQueueArgs            = 88
+	SizeofKFDIoctlCreateQueueArgs            = 96
 	SizeofKFDIoctlDestroyQueueArgs           = 8
 	SizeofKFDIoctlSetMemoryPolicyArgs        = 32
 	SizeofKFDIoctlGetClockCountersArgs       = 40
@@ -255,6 +255,8 @@ type KFDIoctlCreateQueueArgs struct {
 	CtxSaveRestoreAddress uint64
 	CtxSaveRestoreSize    uint32
 	CtlStackSize          uint32
+	SdmaEngineID          uint32
+	MetadataRingSize      uint32
 }
 
 // KFDIoctlDestroyQueueArgs is struct kfd_ioctl_destroy_queue_args.
