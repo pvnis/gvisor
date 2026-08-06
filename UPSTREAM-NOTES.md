@@ -187,23 +187,60 @@ The existing note that `cudaMallocManaged()` is "flaky on -platform=kvm" is a
 `g3doc/proposals/nvidia_driver_proxy.md`: UVM requires mapping virtual addresses
 to equal file offsets, which can make `MapInternal` unimplementable.
 
+#### Which host kernels are affected
+
+The guard was added by `f8be156be163` ("KVM: do not allow mapping valid but
+non-reference-counted pages", CVE-2021-22543), which landed in 5.13 and was
+backported to 5.12.x. That commit is where `kvm_try_get_pfn()` and the comment
+quoted above come from.
+
+It was removed by the 85-patch series "KVM: Stop grabbing references to
+PFNMAP'd pages" (David Stevens and Sean Christopherson), rebased onto v6.12-rc2
+and merged for **6.13**, which replaced the refcounted-page heuristic outright.
+The series exists for this exact case: its motivation cites mapping "non-
+refcounted struct page memory into the guest, for exposing GPU TTM buffers to
+KVM guests", and breakage of virtio-gpu blob resources with amdgpu. Same
+driver, same allocator, a different consumer of it.
+
+So:
+
+| host kernel | expected |
+| --- | --- |
+| < 5.12 | unaffected, predates the guard |
+| 5.12.x, 5.13 .. 6.12 | affected — one page per TTM allocation |
+| >= 6.13 | expected to work |
+
+Note that **6.12 is the LTS and does not have the fix**; the obvious "upgrade to
+the newest LTS" move lands one release short. 6.13 is itself EOL, so in practice
+target >= 6.14.
+
+This was measured on 6.8.0-134-lowlatency (Ubuntu 24.04.4). On that machine the
+`linux-image-lowlatency-hwe-24.04` metapackage is still 6.11 and would not help;
+`linux-lowlatency-hwe-24.04` is 7.0.0-28 and would.
+
+The kernel-version mapping is inferred from upstream history plus a signature
+match, not from reading 6.8's `kvm_main.c`. To confirm, run `pagewalk3` at
+16 MiB under `--platform=kvm`: it prints `OK pages: 0 1024 2048 2560 3072 3584`
+here, and should print all 4096 on a fixed kernel.
+
 #### Possible fixes
 
 In rough order of preference:
 
-1. Host kernel. This is a real KVM limitation, and upstream KVM has since
-   reworked `hva_to_pfn` to handle non-refcounted pfns. Worth retesting on a
-   newer host kernel than the 6.8 this was measured on, and worth reporting so
-   the requirement is documented either way.
+1. Host kernel. Upgrade to >= 6.13 per above. This is a real KVM limitation and
+   is already fixed upstream, so nothing needs to be written — but it should
+   still be reported to gVisor so the requirement is documented.
 2. gVisor. The KVM platform could avoid the ordinary memslot path for
-   `VM_PFNMAP` device memory. This is the fix that belongs in gVisor, but it is
-   not a small change.
+   `VM_PFNMAP` device memory, which would work on older hosts too. This is the
+   fix that belongs in gVisor, but it is not a small change, and it may not be
+   worth it for a bug with a known kernel fix.
 3. amdproxy. Nothing good — the allocation order is TTM's decision, made inside
    the ioctl the sandbox issues, and forcing order-0 would be both a
    host-configuration change and a performance regression.
 
-Until one of those lands, systrap is the platform to target for AMD, which
-leaves the `/dev/kfd` problem below as the blocker.
+Until the host is upgraded, systrap is the platform to target for AMD, which
+leaves the `/dev/kfd` problem below as the blocker. Note that a kernel upgrade
+does not help that one.
 
 ### KFD mappings are impossible on the systrap platform
 
