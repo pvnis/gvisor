@@ -45,6 +45,7 @@ import (
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/gpusched"
 	"gvisor.dev/gvisor/pkg/hostos"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/prometheus"
@@ -1408,6 +1409,16 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	s.Pid.Store(cmd.Process.Pid)
 	log.Infof("Sandbox started, PID: %d", cmd.Process.Pid)
 
+	// Tell the GPU scheduler where this sandbox lives on the host. It is the
+	// only party that can: the GPU driver reports what a sandbox used against
+	// the process that opened the device, and the sandbox itself runs in a
+	// process namespace where it is process 1 and cannot see that number. This
+	// is also the first moment it exists, which is why it is a connection of
+	// its own rather than part of the one donated above.
+	if conf.NVProxyGPUSchedulerSocket != "" {
+		announceToGPUScheduler(conf.NVProxyGPUSchedulerSocket, s.ID, cmd.Process.Pid)
+	}
+
 	return nil
 }
 
@@ -2636,4 +2647,26 @@ func (s *Sandbox) GetNetworkConfig() (*boot.CreateLinksAndRoutesArgs, error) {
 		return nil, fmt.Errorf("error getting network config (CID: %q): %w", s.ID, err)
 	}
 	return &networkArgs, nil
+}
+
+// announceToGPUScheduler reports a sandbox's host process ID to the GPU
+// scheduler, so that what the GPU driver reports can be attributed to it.
+//
+// A failure here costs the scheduler its measurements for this sandbox, which
+// falls back to judging it by whether it submitted anything, so it is logged
+// rather than being allowed to stop the sandbox from running.
+func announceToGPUScheduler(socket, id string, pid int) {
+	conn, err := net.DialTimeout("unix", socket, 2*time.Second)
+	if err != nil {
+		log.Warningf("Not reporting sandbox %q to the GPU scheduler; it will be scheduled without measuring what it uses: %v", id, err)
+		return
+	}
+	defer conn.Close()
+	if err := gpusched.NewConn(conn).SendHello(gpusched.Hello{
+		ID:           id,
+		PID:          pid,
+		AnnounceOnly: true,
+	}); err != nil {
+		log.Warningf("Reporting sandbox %q to the GPU scheduler: %v", id, err)
+	}
 }

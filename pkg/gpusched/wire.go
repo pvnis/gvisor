@@ -38,6 +38,23 @@ type Hello struct {
 	// MaxFraction caps its window as a fraction of each period, and is zero if
 	// it is uncapped.
 	MaxFraction float64 `json:"max_fraction,omitempty"`
+
+	// PID is the sandbox's process ID on the host, by which the GPU driver
+	// reports what it has been using. The sandbox cannot measure that itself:
+	// work is submitted on the application's behalf and how long the GPU spends
+	// on it is not visible from inside.
+	//
+	// A sandbox cannot fill this in either. It runs in a process namespace of
+	// its own, where it is process 1, and the number the driver reports is the
+	// one it has on the host. It is sent instead by runsc, which knows both, on
+	// a connection of its own; see AnnounceOnly.
+	PID int `json:"pid,omitempty"`
+
+	// AnnounceOnly marks a connection that exists only to report a sandbox's
+	// host process ID. runsc opens one after starting a sandbox, since that is
+	// the first moment the process ID exists, and closes it again immediately.
+	// Such a connection is not a client and receives no windows.
+	AnnounceOnly bool `json:"announce_only,omitempty"`
 }
 
 // Report is what a sandbox sends each period, describing what it did with the

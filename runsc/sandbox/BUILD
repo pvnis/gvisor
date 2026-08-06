@@ -27,6 +27,7 @@ go_library(
         "//pkg/coverage",
         "//pkg/fd",
         "//pkg/hostos",
+        "//pkg/gpusched",
         "//pkg/log",
         "//pkg/metric:metric_go_proto",
         "//pkg/prometheus",

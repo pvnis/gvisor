@@ -38,6 +38,25 @@ type Server struct {
 	// Charging it against the windows being computed for the next period would
 	// invent an overrun whenever a sandbox's share shrank.
 	prevGrants map[ID]Grant
+
+	// pids maps a sandbox to its process on the host, as announced by runsc.
+	// It is kept apart from the connections because the announcement and the
+	// sandbox's own connection arrive independently, in either order.
+	pids map[ID]int
+
+	// sampler measures what each sandbox actually took from the GPU, and is nil
+	// if nothing can. Without it a sandbox is credited with the window it was
+	// given whenever it submitted anything, which cannot distinguish a sandbox
+	// that used its window from one that ran far past it.
+	sampler Sampler
+}
+
+// SetSampler makes the scheduler judge sandboxes by what they took from the GPU
+// rather than by whether they submitted anything.
+func (s *Server) SetSampler(sampler Sampler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sampler = sampler
 }
 
 // serverConn is one connected sandbox.
@@ -54,6 +73,10 @@ type serverConn struct {
 	// whole period so that a sandbox's first report counts as activity rather
 	// than as having used nothing.
 	lastAllowance time.Duration
+
+	// pid is the sandbox's process on the host, by which the driver reports
+	// what it used.
+	pid int
 
 	// idleTicks counts consecutive periods in which the sandbox reported
 	// nothing. It is what keeps a sandbox from being judged idle by a single
@@ -77,6 +100,7 @@ func NewServer(period time.Duration) *Server {
 		period: period,
 		sched:  New(period),
 		conns:  make(map[ID]*serverConn),
+		pids:   make(map[ID]int),
 	}
 }
 
@@ -101,7 +125,16 @@ func (s *Server) handle(nc net.Conn) {
 	if err != nil || hello.ID == "" {
 		return
 	}
-	sc := &serverConn{id: ID(hello.ID), conn: conn, lastAllowance: s.period}
+	if hello.AnnounceOnly {
+		// runsc reporting where a sandbox lives on the host. It may arrive
+		// before or after the sandbox itself connects, so it is recorded
+		// separately and read when the windows are computed.
+		s.mu.Lock()
+		s.pids[ID(hello.ID)] = hello.PID
+		s.mu.Unlock()
+		return
+	}
+	sc := &serverConn{id: ID(hello.ID), conn: conn, lastAllowance: s.period, pid: hello.PID}
 
 	s.mu.Lock()
 	// A sandbox reconnecting under an ID already present replaces it, rather
@@ -116,6 +149,7 @@ func (s *Server) handle(nc net.Conn) {
 		if s.conns[sc.id] == sc {
 			delete(s.conns, sc.id)
 			s.sched.Remove(sc.id)
+			delete(s.pids, sc.id)
 		}
 		s.mu.Unlock()
 	}()
@@ -144,6 +178,10 @@ func (s *Server) tickLoop() {
 // than by waiting on a clock.
 func (s *Server) Tick() {
 	s.mu.Lock()
+	var measured map[int]float64
+	if s.sampler != nil {
+		measured = s.sampler.Sample()
+	}
 	// Take what each sandbox did with its last window. A sandbox that
 	// submitted nothing is idle, and its share goes to one that will use it.
 	for id, sc := range s.conns {
@@ -152,13 +190,29 @@ func (s *Server) Tick() {
 		} else {
 			sc.idleTicks++
 		}
-		if sc.idleTicks < idleTicksBeforeYielding {
-			// It is using the GPU. How much of its window it used cannot be
-			// seen from here; measuring that needs the GPU's own accounting.
-			s.sched.Observe(id, sc.lastAllowance)
-		} else {
+		if sc.idleTicks >= idleTicksBeforeYielding {
 			s.sched.Observe(id, 0)
+			continue
 		}
+		// It is using the GPU. Prefer what the driver says it took, which is
+		// the only account that includes work still running after the window
+		// closed; fall back to crediting it with the window it was given.
+		used := sc.lastAllowance
+		pid := sc.pid
+		if p, ok := s.pids[id]; ok {
+			// What runsc announced is authoritative: a sandbox reporting its
+			// own process ID reports the one it has inside its namespace.
+			pid = p
+		}
+		if util, ok := measured[pid]; ok && pid != 0 {
+			used = time.Duration(util * float64(s.period))
+			if used <= 0 {
+				// It submitted something, so it is not idle even if the GPU was
+				// busy with it for too little of the period to register.
+				used = time.Nanosecond
+			}
+		}
+		s.sched.Observe(id, used)
 	}
 	grants := s.sched.Grants()
 	conns := make(map[ID]*serverConn, len(s.conns))

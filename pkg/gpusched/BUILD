@@ -10,6 +10,8 @@ go_library(
     srcs = [
         "gpusched.go",
         "server.go",
+        "smi.go",
+        "usage.go",
         "wire.go",
     ],
     visibility = ["//:sandbox"],
@@ -21,6 +23,7 @@ go_test(
     srcs = [
         "gpusched_test.go",
         "server_test.go",
+        "smi_test.go",
     ],
     library = ":gpusched",
 )

@@ -31,8 +31,9 @@ import (
 
 // GPUScheduler implements subcommands.Command for the "gpu-scheduler" command.
 type GPUScheduler struct {
-	socket string
-	period time.Duration
+	socket  string
+	period  time.Duration
+	measure bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -67,6 +68,7 @@ Run one per GPU.
 func (g *GPUScheduler) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&g.socket, "socket", "/run/runsc-gpu-scheduler.sock", "path of the socket sandboxes connect to.")
 	f.DurationVar(&g.period, "period", gpusched.DefaultPeriod, "length of the cycle that windows are placed within.")
+	f.BoolVar(&g.measure, "measure-usage", true, "judge sandboxes by what they take from the GPU, as reported by nvidia-smi, rather than by whether they submitted anything. Scheduling continues without it if nvidia-smi cannot be run.")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -96,8 +98,22 @@ func (g *GPUScheduler) Execute(_ context.Context, f *flag.FlagSet, args ...any) 
 		util.Fatalf("setting permissions on %q: %v", g.socket, err)
 	}
 
+	server := gpusched.NewServer(g.period)
+	if g.measure {
+		// A sandbox cannot see how long the GPU spent on what it submitted, so
+		// without this a sandbox that runs far past its window is
+		// indistinguishable from one that keeps within it.
+		sampler, err := gpusched.NewSMISampler()
+		if err != nil {
+			log.Warningf("Not measuring GPU use, so sandboxes running past their window will not be charged for it: %v", err)
+		} else {
+			server.SetSampler(sampler)
+			log.Infof("Measuring GPU use per sandbox with nvidia-smi")
+		}
+	}
+
 	log.Infof("GPU scheduler listening on %q with a period of %v", g.socket, g.period)
-	if err := gpusched.NewServer(g.period).Serve(l); err != nil {
+	if err := server.Serve(l); err != nil {
 		util.Fatalf("serving: %v", err)
 	}
 	return subcommands.ExitSuccess

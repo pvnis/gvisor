@@ -355,7 +355,11 @@ func (g *computeGate) follow(schedFD int, id string, weight uint64, percent uint
 	}
 	go func() {
 		defer conn.Close()
-		if err := conn.SendHello(gpusched.Hello{ID: id, Weight: weight, MaxFraction: maxFraction}); err != nil {
+		// No process ID is sent: this sandbox runs in a namespace of its own
+		// where it is process 1, while the GPU driver reports the number it
+		// has on the host. runsc announces that separately.
+		hello := gpusched.Hello{ID: id, Weight: weight, MaxFraction: maxFraction}
+		if err := conn.SendHello(hello); err != nil {
 			log.Warningf("nvproxy: announcing to the GPU scheduler: %v", err)
 			return
 		}
