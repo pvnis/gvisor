@@ -383,7 +383,7 @@ allocating more than it asked for, so `webhook/pkg/gpushare` restates the
 request as the annotation above, which has it enforced in the Sentry where the
 container cannot reach it. The scheduler is unaffected and needs no changes,
 since the resource it reads is left as it was. See
-[Running under Kubernetes](#kubernetes) for how the rest of such a deployment
+[GPU slicing under Kubernetes](#kubernetes) for how the rest of such a deployment
 fits together.
 
 The limit applies to the sandbox rather than to individual containers, so it is
@@ -646,49 +646,59 @@ windows, and repayment is deliberately capped at one period so that a single
 long kernel cannot starve its author afterwards. A host without `nvidia-smi`
 still divides the GPU, by the weaker signal of what was submitted.
 
-## Running under Kubernetes {#kubernetes}
+## GPU slicing under Kubernetes {#kubernetes}
 
-A GPU-aware scheduler such as [HAMi](https://project-hami.io)'s comes as four
-parts, and only one of them needs replacing.
+One GPU can be divided between several gVisor pods, each holding an agreed share
+of its memory and its time, with nothing inside any of the pods responsible for
+keeping them to it. This section sets that up end to end.
 
-Its admission webhook and its scheduler decide which node and which device a pod
-runs on, and refuse to place more on a GPU than it can hold. That is placement,
-it runs on the control plane well away from the workload, and nothing about it
-needs to be trusted by the sandbox. Keep it. Its device plugin advertises the
-GPU to the kubelet, which is also needed.
+The work splits in two. Deciding *which* pods may share a GPU, and refusing to
+put more on one than it can hold, is placement, and a GPU-aware scheduler such
+as [HAMi](https://project-hami.io)'s already does it well; it runs on the
+control plane, well away from the workload, and nothing about it needs to be
+trusted by the sandbox. Holding each pod to what it was placed for is
+enforcement, and that is nvproxy's job.
 
-What its device plugin additionally does is preload `libvgpu.so` into every GPU
-container, and that is the part to drop. Inside a gVisor container it arrives
-as:
+HAMi comes as four parts, of which three are used unchanged:
 
-    /etc/ld.so.preload  ->  /usr/local/vgpu/libvgpu.so
-    CUDA_DEVICE_MEMORY_LIMIT_0=512m
-    CUDA_DEVICE_SM_LIMIT=30
+    hami-webhook          used     redirects GPU pods to HAMi's scheduler
+    hami-scheduler        used     placement and per-device accounting
+    hami-device-plugin    used     advertises the GPU to the kubelet
+    libvgpu.so            dropped  enforcement, but inside the container
 
-A limiter placed in the address space of the process it limits is reachable by
-that process, and this one can be switched off from inside with a documented
-environment variable, `CUDA_DISABLE_CONTROL=true`. Measured on a pod requesting
-512 MiB: with the library enforcing, the workload was refused at 512 MiB; with
-that one variable set, it saw the whole 12 GiB device and allocated 768 MiB
-unimpeded. With the runsc memory limit in place instead, the same attempt was
-refused at 320 MiB.
+The last is dropped because a limiter living in the address space of the process
+it limits is reachable by that process. On a pod requesting 512 MiB and
+attempting 768: with the library enforcing, the workload was refused at 512 MiB;
+with the single documented variable `CUDA_DISABLE_CONTROL=true` set, it saw the
+whole 11.7 GiB device and took all 768 MiB. With the runsc limit in place
+instead, the same attempt was refused at 320 MiB. See
+[Security](#security) for why the position of the enforcement is the whole
+point.
 
-`webhook/pkg/gpushare` therefore reads what the pod was scheduled against and
-restates it as runsc annotations:
+gVisor needs no device plugin and no scheduler of its own. Nothing a pod asks
+for is rewritten, so HAMi places pods exactly as it did before.
 
-    nvidia.com/gpumem: 512     ->  dev.gvisor.flag.nvproxy-gpu-memory-limit
-    nvidia.com/gpucores: 30    ->  dev.gvisor.flag.nvproxy-gpu-weight
+### 1. Install HAMi
 
-and sets `CUDA_DISABLE_CONTROL=true` so that the redundant in-container copy
-stands down. Losing it is safe in both directions: a container that sets the
-variable back only re-enables a second limiter on top of the Sentry's, which can
-restrict it further but never grant it more.
+```
+helm repo add hami-charts https://project-hami.github.io/HAMi/
+helm install hami hami-charts/hami -n kube-system \
+  --set devices.nvidia.passDeviceSpecsEnabled=true
+kubectl label node <node> gpu=on
+```
 
-### Removing the preload entirely
+`passDeviceSpecsEnabled=true` is required for gVisor: it puts the `/dev/nvidia*`
+nodes into `spec.Linux.Devices`, which is where nvproxy looks for them. Without
+it the sandbox comes up with no GPU.
 
-The variable above leaves `libvgpu.so` mapped into the container and merely
-inert. On a node that runs only gVisor, the preload can be dropped altogether by
-blanking the key that HAMi's device plugin distributes:
+The device plugin itself calls NVML, so it must not run under gVisor:
+
+```
+kubectl -n kube-system patch daemonset hami-device-plugin --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/runtimeClassName","value":"nvidia"}]'
+```
+
+### 2. Drop the preload
 
 ```
 kubectl -n kube-system patch cm hami-device-plugin --type merge \
@@ -696,38 +706,210 @@ kubectl -n kube-system patch cm hami-device-plugin --type merge \
 kubectl -n kube-system delete pod -l app.kubernetes.io/component=hami-device-plugin
 ```
 
-The restart is required: that key is mounted into the plugin with a `subPath`,
-and ConfigMap volumes mounted that way never receive updates. Once the plugin
-comes back, containers get an empty `/etc/ld.so.preload` and the library is never
-loaded. The three bind mounts remain, and are inert without it.
+The restart is required, and not optional in the way it usually is: that key is
+mounted into the plugin with a `subPath`, and ConfigMap volumes mounted that way
+never receive updates. Patching alone leaves the old value in place
+indefinitely.
 
-The same pod, requesting 512 MiB and attempting 768 MiB, across the three
-configurations:
+Once the plugin comes back, containers get an empty `/etc/ld.so.preload` and
+`libvgpu.so` is never loaded. It is still bind-mounted into the container, along
+with `/tmp/vgpulock`, and both are inert without the preload.
 
-    libvgpu   annotation   device seen        outcome
-    loaded    none         512 / 512 MiB      refused at 512 MiB
-    dropped   none         11347 / 11790 MiB  allocated all 768 MiB
-    dropped   512 MiB      350 / 512 MiB      refused at 320 MiB
+This is node-wide. On a node that also runs `runc` pods relying on HAMi to limit
+them, skip this step and let the admission webhook in step 6 stand the library
+down per-pod instead, which leaves it mapped but inert.
 
-The middle row is what the preload was there to prevent, and the last is the
-Sentry doing it instead. Prefer this to the environment variable only where no
-container on the node relies on HAMi's enforcement, since the change is
-node-wide: a `runc` pod on the same node has nothing else limiting it.
+### 3. Run the coordinator
 
-Nothing a pod asks for is changed, so the scheduler continues to place pods
-exactly as before, and no device plugin of gVisor's own is needed. Note that
-`--nvproxy-gpu-scheduler-socket` must be configured on the runtime for the
-`nvidia.com/gpucores` request to be enforced at all; without it the request
-governs placement only.
+`runsc gpu-scheduler` divides the GPU between the sandboxes sharing it. It runs
+on the host, outside every sandbox, which is what lets it give a sandbox the
+time its neighbours are not using and place each sandbox's window so that the
+windows do not overlap. One instance serves the node:
 
-Two further notes for this deployment:
+```
+# /etc/systemd/system/runsc-gpu-scheduler.service
+[Unit]
+Description=runsc GPU scheduler
+Before=k3s.service
 
--   The device plugin must be told to pass device specifications
-    (`devices.nvidia.passDeviceSpecsEnabled=true` in HAMi's chart), so that the
-    `/dev/nvidia*` nodes land in `spec.Linux.Devices` where nvproxy looks for
-    them.
--   The plugin itself needs NVML, so it runs under the NVIDIA runtime rather
-    than under gVisor.
+[Service]
+ExecStart=/usr/local/bin/runsc --debug --debug-log=/var/log/runsc-gpu-scheduler.log gpu-scheduler --socket=/run/runsc-gpu-scheduler.sock
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+```
+
+It must be running before the first GPU sandbox starts, hence the ordering:
+`runsc` connects to the socket while creating the sandbox, and a sandbox that
+cannot reach it **fails to start** rather than running unscheduled. This is
+deliberate -- a workload silently escaping its share is the failure worth
+avoiding -- but it does mean the coordinator is on the critical path for every
+GPU pod on the node.
+
+The `--debug-log` is worth setting. Without it the scheduler writes nothing
+anywhere, including to the journal, and there is no way to see that it started
+or what it is doing.
+
+### 4. Point the runtime at it
+
+```
+# /etc/containerd/runsc.toml
+[runsc_config]
+  nvproxy = "true"
+  nvproxy-gpu-scheduler-socket = "/run/runsc-gpu-scheduler.sock"
+  nvproxy-gpu-weight = "100"
+  nvproxy-gpu-memory-limit = "8589934592"
+  debug-log = "/var/log/runsc/%ID%/"
+```
+
+Both limits are ceilings: a pod may ask for less, never more. Setting the weight
+to 100 lets a pod's `nvidia.com/gpucores` request be taken literally as a
+percentage, and the memory ceiling should be at least the largest a single pod
+may request -- here 8 GiB. A pod asking for more than either fails to start
+rather than being quietly clamped, so a ceiling set too low is a confusing way
+to discover this.
+
+`debug-log` is what makes the check in step 8 possible; it is not otherwise
+required.
+
+`runsc` connects to the socket itself, before the sandbox starts, and hands the
+Sentry an already-open file descriptor. The sandbox never needs the ability to
+reach the host filesystem or to open a connection of its own.
+
+### 5. Let the annotations through
+
+```
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"
+  pod_annotations = ["dev.gvisor.*"]
+  container_annotations = ["dev.gvisor.*"]
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc.options]
+  TypeUrl = "io.containerd.runsc.v1.options"
+  ConfigPath = "/etc/containerd/runsc.toml"
+```
+
+Without the two `*_annotations` lines, CRI drops the annotations before they
+reach the OCI spec and every pod silently gets the runtime's defaults. This
+fails quietly, so it is worth checking (step 8) rather than assuming.
+
+### 6. Deploy the admission webhook
+
+The webhook in `webhook/` reads what each pod was scheduled against and restates
+it where the container cannot reach it:
+
+    nvidia.com/gpumem: 512     ->  dev.gvisor.flag.nvproxy-gpu-memory-limit
+    nvidia.com/gpucores: 30    ->  dev.gvisor.flag.nvproxy-gpu-weight
+
+It also sets `CUDA_DISABLE_CONTROL=true`, which is what stands `libvgpu.so` down
+on a node where step 2 was skipped. Losing that variable is safe in both
+directions: a container that sets it back only re-enables a second limiter on
+top of the Sentry's, which can restrict it further but never grant it more.
+
+The step is optional. Its whole job is deriving the two annotations, so a pod
+that writes them itself needs no webhook at all -- which is the simplest way to
+try the rest of this out.
+
+### 7. Request a slice
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: trainer
+spec:
+  runtimeClassName: gvisor
+  containers:
+    - name: trainer
+      image: myrepo/trainer:latest
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+          nvidia.com/gpumem: 2000    # MiB, enforced by the Sentry
+          nvidia.com/gpucores: 30    # share of the GPU, relative
+```
+
+`nvidia.com/gpu: 1` asks for one of the plugin's slots rather than a whole
+device; HAMi advertises `deviceSplitCount` (10 by default) of them per GPU, and
+that is what allows several pods onto one device.
+
+Without the webhook, state the two annotations directly:
+
+```yaml
+metadata:
+  annotations:
+    dev.gvisor.flag.nvproxy-gpu-memory-limit: "2097152000"
+    dev.gvisor.flag.nvproxy-gpu-weight: "30"
+```
+
+Both may only lower what the runtime allows: 2000 MiB and a weight of 30 are
+under the 8 GiB and 100 set in step 4. A pod asking for more than either fails
+to start rather than being quietly clamped.
+
+### 8. Check that it took
+
+Check first that the annotations survived CRI, since step 5 is the one that
+fails silently -- a missing `pod_annotations` line leaves every pod on the
+runtime's defaults with nothing to indicate it:
+
+```
+crictl inspectp <pod-id> | grep dev.gvisor.flag
+```
+
+Then that the sandbox is being scheduled, which the Sentry records once per
+change of window. This is the direct evidence, since it is the sandbox stating
+the share it was actually given:
+
+```
+grep "GPU window is now" /var/log/runsc/<sandbox-id>/*
+```
+
+```
+nvproxy: GPU window is now 40ms of every 100ms at phase 0s
+nvproxy: gating GPU submission through command buffer 0x5c00004a
+```
+
+A window covering the whole period on a contended GPU means the sandbox is not
+being scheduled; one that changes as other pods come and go means it is. The
+`phase` is what keeps two sandboxes from being given the same 40ms.
+
+The memory limit shows up in the pod's own view of the device: `nvidia-smi`
+inside the pod reports the figure it asked for rather than the hardware's.
+
+### What this does and does not divide
+
+Memory is a hard limit: an allocation past it is refused. Time is a share rather
+than a limit, and is work-conserving -- a sandbox gets its weight's share of
+what the *contending* sandboxes are asking for, and all of the GPU when they are
+idle. Two pods weighted 300 and 100 divide a contended GPU 3.00:1, with 99.1% of
+single-sandbox throughput retained.
+
+What is not divided is everything the hardware does not let software partition
+from outside: SM occupancy within a window, memory bandwidth, cache. A kernel
+that outlasts its window cannot be recalled, which is what bounds the accuracy
+of the division; see
+[Dividing a GPU between sandboxes](#gpu-scheduler) above. Where compute must be
+partitioned rather than shared, MIG enforces it in hardware, and HAMi can place
+pods onto MIG instances.
+
+### One GPU per node, for now
+
+The coordinator has no concept of a device: every sandbox that connects to it is
+treated as contending with every other. On a node with one GPU that is correct.
+On a node with several it is not -- HAMi will place pods across the devices, and
+two pods on *different* GPUs would still be given disjoint windows and take a
+fraction of the time each, though they never contend.
+
+There is no per-pod way around this today, since the socket is named in the
+runtime's configuration rather than in the pod's, so it cannot be varied per
+GPU. Until the coordinator learns which device each sandbox was placed on, use
+this on single-GPU nodes.
+
+Checkpointing does not work either; see
+[Checkpointing is not yet supported](#compute-limits) above. That applies to any
+sandbox with a GPU, not just a scheduled one.
 
 ## Security
 
