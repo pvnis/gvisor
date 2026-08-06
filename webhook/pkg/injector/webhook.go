@@ -25,7 +25,7 @@ import (
 
 	"github.com/mattbaird/jsonpatch"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/webhook/pkg/gpumem"
+	"gvisor.dev/gvisor/webhook/pkg/gpushare"
 	admv1beta1 "k8s.io/api/admission/v1beta1"
 	admregv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	v1 "k8s.io/api/core/v1"
@@ -180,8 +180,11 @@ func updatePod(pod *v1.Pod) {
 	gvisor := "gvisor"
 	pod.Spec.RuntimeClassName = &gvisor
 
-	// Have runsc enforce whatever GPU memory the pod was scheduled against.
-	gpumem.InjectLimit(pod)
+	// Have runsc enforce whatever share of a GPU the pod was scheduled
+	// against, and stand down the limiter that runs inside the container.
+	gpushare.InjectMemoryLimit(pod)
+	gpushare.InjectWeight(pod)
+	gpushare.StandDownHAMi(pod)
 
 	// We don't run SELinux test for gvisor.
 	// If SELinuxOptions are specified, this is usually for volume test to pass

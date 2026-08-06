@@ -14,7 +14,7 @@ go_library(
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/log",
-        "//webhook/pkg/gpumem",
+        "//webhook/pkg/gpushare",
         "@com_github_mattbaird_jsonpatch//:go_default_library",
         "@io_k8s_api//admission/v1beta1:go_default_library",
         "@io_k8s_api//admissionregistration/v1beta1:go_default_library",

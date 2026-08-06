@@ -379,10 +379,12 @@ Schedulers that understand GPU memory, such as
 [HAMi](https://project-hami.io)'s, have containers request it as an extended
 resource (`nvidia.com/gpumem`, in mebibytes) and use it to decide which node and
 GPU a pod is placed on. Placement alone does not stop a container from
-allocating more than it asked for, so `webhook/pkg/gpumem` restates the request
-as the annotation above, which has it enforced in the Sentry where the container
-cannot reach it. The scheduler is unaffected and needs no changes, since the
-resource it reads is left as it was.
+allocating more than it asked for, so `webhook/pkg/gpushare` restates the
+request as the annotation above, which has it enforced in the Sentry where the
+container cannot reach it. The scheduler is unaffected and needs no changes,
+since the resource it reads is left as it was. See
+[Running under Kubernetes](#kubernetes) for how the rest of such a deployment
+fits together.
 
 The limit applies to the sandbox rather than to individual containers, so it is
 the pod's peak demand: containers run together and their requests add up, while
@@ -560,15 +562,142 @@ with a GPU.
 
 ### It is a cap, not a share
 
-Each sandbox limits only itself. Time that one sandbox does not use is not
-redistributed to another, because a Sentry sees only its own sandbox; enforcing
-shares between sandboxes would require a coordinator outside all of them. The
-limit is therefore useful for holding a tenant to an agreed fraction of a GPU,
-not for dividing a GPU efficiently between tenants.
+A percentage caps a sandbox against the clock, and nothing more. Time that one
+sandbox does not use is not redistributed to another, because a Sentry sees only
+its own sandbox; and because every sandbox measures its period from its own
+start, two sandboxes each capped at 50% will as likely as not choose overlapping
+halves and contend anyway. The cap is useful for holding a tenant to an agreed
+fraction of a GPU, not for dividing a GPU between tenants.
 
-Time-slicing in the `k8s-device-plugin` divides GPU time between containers
-evenly by default and is work-conserving, but the shares cannot be assigned and
-are not enforced; the two mechanisms address different halves of the problem.
+The percentage is also only meaningful against a particular device. It is a
+share of wall-clock time during which submission is permitted, which is not a
+share of SMs, of memory bandwidth, or of anything else the hardware counts; two
+GPUs given the same figure will do very different amounts of work. To divide a
+GPU rather than cap its users, use the scheduler below.
+
+## Dividing a GPU between sandboxes {#gpu-scheduler}
+
+`runsc gpu-scheduler` is a coordinator that divides one GPU between the
+sandboxes sharing it. It runs on the host, outside every sandbox, which is what
+lets it do what a Sentry alone cannot: give a sandbox the time its neighbours
+are not using, and place each sandbox's window so that the windows do not
+overlap.
+
+```
+runsc gpu-scheduler --socket=/run/runsc-gpu-scheduler.sock
+```
+
+Sandboxes are pointed at it on the runtime, and each states its share:
+
+```
+--nvproxy-gpu-scheduler-socket=/run/runsc-gpu-scheduler.sock
+--nvproxy-gpu-weight=100
+```
+
+A container may lower its own weight, but not raise it:
+
+```
+"dev.gvisor.flag.nvproxy-gpu-weight": "30"
+```
+
+The socket is connected by `runsc` before the sandbox starts and handed to the
+Sentry as an already-open file descriptor, so the sandbox never needs the
+ability to reach the host's filesystem or to open a connection of its own.
+
+### Weights rather than percentages
+
+A weight is relative, so it needs no reference to the hardware: a sandbox gets
+its weight's share of what the *contending* sandboxes are actually asking for.
+Two sandboxes weighted 300 and 100 divide a contended GPU 3:1 whatever the
+device is, and either one gets all of it when the other is idle. Where the
+weights happen to sum to 100 the reading coincides with a percentage, which is
+what makes an existing `nvidia.com/gpucores` request usable as one directly.
+
+Idle sandboxes yield their share and reclaim it on their next submission, so the
+division is work-conserving. Measured with two sandboxes weighted 300 and 100:
+
+    weight   achieved   share
+      300     486.4/s   75.0%
+      100     161.9/s   25.0%
+      total   648.3/s   99.1% of the 654/s one sandbox reaches alone
+
+The 3.00:1 ratio is the assigned one, and less than 1% of the GPU is lost to the
+division.
+
+### Charging for what was taken, not what was asked for
+
+A sandbox cannot measure its own use of the GPU: work is submitted by writing to
+mapped memory, and how long the device spends on it is not visible from inside.
+Nor can the work be recalled once submitted, so a sandbox that launches one very
+long kernel keeps the GPU past the end of its window, and from the inside looks
+exactly like one that launched a short one.
+
+With `--measure-usage` (the default), the scheduler reads per-process GPU
+utilization from `nvidia-smi pmon` and charges each sandbox for what it actually
+consumed, taking the excess out of its next windows. Against a workload
+submitting kernels roughly 100 times longer than its equally-weighted neighbour:
+
+    without measurement   67.6% / 32.4%   2.08:1
+    with measurement      57.8% / 42.2%   1.37:1
+
+The remaining imbalance is inherent: a kernel that outlasts the period cannot be
+preempted by any software layer, `pmon` samples once a second against 100ms
+windows, and repayment is deliberately capped at one period so that a single
+long kernel cannot starve its author afterwards. A host without `nvidia-smi`
+still divides the GPU, by the weaker signal of what was submitted.
+
+## Running under Kubernetes {#kubernetes}
+
+A GPU-aware scheduler such as [HAMi](https://project-hami.io)'s comes as four
+parts, and only one of them needs replacing.
+
+Its admission webhook and its scheduler decide which node and which device a pod
+runs on, and refuse to place more on a GPU than it can hold. That is placement,
+it runs on the control plane well away from the workload, and nothing about it
+needs to be trusted by the sandbox. Keep it. Its device plugin advertises the
+GPU to the kubelet, which is also needed.
+
+What its device plugin additionally does is preload `libvgpu.so` into every GPU
+container, and that is the part to drop. Inside a gVisor container it arrives
+as:
+
+    /etc/ld.so.preload  ->  /usr/local/vgpu/libvgpu.so
+    CUDA_DEVICE_MEMORY_LIMIT_0=512m
+    CUDA_DEVICE_SM_LIMIT=30
+
+A limiter placed in the address space of the process it limits is reachable by
+that process, and this one can be switched off from inside with a documented
+environment variable, `CUDA_DISABLE_CONTROL=true`. Measured on a pod requesting
+512 MiB: with the library enforcing, the workload was refused at 512 MiB; with
+that one variable set, it saw the whole 12 GiB device and allocated 768 MiB
+unimpeded. With the runsc memory limit in place instead, the same attempt was
+refused at 320 MiB.
+
+`webhook/pkg/gpushare` therefore reads what the pod was scheduled against and
+restates it as runsc annotations:
+
+    nvidia.com/gpumem: 512     ->  dev.gvisor.flag.nvproxy-gpu-memory-limit
+    nvidia.com/gpucores: 30    ->  dev.gvisor.flag.nvproxy-gpu-weight
+
+and sets `CUDA_DISABLE_CONTROL=true` so that the redundant in-container copy
+stands down. Losing it is safe in both directions: a container that sets the
+variable back only re-enables a second limiter on top of the Sentry's, which can
+restrict it further but never grant it more.
+
+Nothing a pod asks for is changed, so the scheduler continues to place pods
+exactly as before, and no device plugin of gVisor's own is needed. Note that
+`--nvproxy-gpu-scheduler-socket` must be configured on the runtime for the
+`nvidia.com/gpucores` request to be enforced at all; without it the request
+governs placement only.
+
+Two further notes for this deployment:
+
+-   The device plugin must be told to pass device specifications
+    (`devices.nvidia.passDeviceSpecsEnabled=true` in HAMi's chart), so that the
+    `/dev/nvidia*` nodes land in `spec.Linux.Devices` where nvproxy looks for
+    them.
+-   The plugin itself needs NVML, so it runs under the NVIDIA runtime rather
+    than under gVisor.
 
 ## Security
 

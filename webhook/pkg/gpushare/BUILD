@@ -6,8 +6,11 @@ package(
 )
 
 go_library(
-    name = "gpumem",
-    srcs = ["gpumem.go"],
+    name = "gpushare",
+    srcs = [
+        "gpushare.go",
+        "hami.go",
+    ],
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/log",
@@ -16,10 +19,10 @@ go_library(
 )
 
 go_test(
-    name = "gpumem_test",
+    name = "gpushare_test",
     size = "small",
-    srcs = ["gpumem_test.go"],
-    library = ":gpumem",
+    srcs = ["gpushare_test.go"],
+    library = ":gpushare",
     deps = [
         "@io_k8s_api//core/v1:go_default_library",
         "@io_k8s_apimachinery//pkg/api/resource:go_default_library",
