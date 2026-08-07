@@ -32,11 +32,15 @@ Nothing should hardcode a `gpu_id` or a KFD major: the major is dynamically
 allocated and genuinely differs. `~/amdtest/gputest.sh` reads both from the host.
 
 **Building on sensnucbox2:** `sudo -n` is fully passwordless. The build system
-invokes docker, which requires sudo. Use the wrapper at `~/amdtest/sudodocker`
-(it is just `exec sudo /usr/bin/docker "$@"`):
+invokes docker. `dmd` is in the `docker` group (added 2026-08-07), so bare
+`docker` calls from `images.mk` work without the wrapper. Use:
 ```
-make build TARGETS=//runsc:runsc DOCKER_CLI_PATH=/home/dmd/amdtest/sudodocker
+sudo -u dmd -g docker make build TARGETS=//runsc:runsc DOCKER_CLI_PATH=/home/dmd/amdtest/sudodocker
 ```
+The `sudodocker` wrapper (`exec sudo /usr/bin/docker "$@"`) covers the places
+in `bazel.mk` that use `$(DOCKER_CLI_PATH)`. The `-g docker` covers the bare
+`docker` calls in `images.mk`. If a new shell already has the docker group
+active (`id` shows `docker`), plain `make build` works too.
 After building, copy `bazel-bin/runsc/runsc_/runsc` to both `~/amdtest/runsc`
 and `/usr/local/bin/runsc` — Docker and Kubernetes both run the latter.
 
@@ -93,11 +97,15 @@ proxied device. See `UPSTREAM-NOTES.md`. **Not yet sent.**
 
 ## Next
 
-1. **`AMDKFD_IOC_SVM` is still not in the allowlist.** `vecadd` does not need
-   it, but larger ROCm workloads will. It is variable-length: the struct has a
-   flexible array member `attrs[]`, so it needs a custom handler that copies
-   `24 + nattr*8` bytes rather than just the fixed struct. Run something bigger
-   than `vecadd` and watch the runsc log for the unsupported-ioctl warning.
+1. **SVM (`AMDKFD_IOC_SVM`) is forwarded but architecturally limited.** The
+   handler is implemented (`ae2b9b4ab`): it copies the full `24 + nattr*8`
+   contiguous buffer from the guest, passes it to the host, and copies back.
+   The ioctl reaches the driver; the driver returns EFAULT when it tries to
+   validate the VA range. Root cause: SVM operates on the *calling process's*
+   VA space, but under KVM the Sentry is the calling process, and guest VAs are
+   not in the Sentry's address space. Same root as the KFD-mmap process-binding
+   limitation. hipMallocManaged will not work; hipMalloc-based workloads
+   (vecadd) are unaffected.
 2. **`/dev/kfd` mappings are impossible on systrap** (task #18). Not a bug: KFD
    binds each mapping to the process holding the KFD context, and systrap maps
    from a stub process, so `mmap` returns `EINVAL`. Only the KFD mapping is
