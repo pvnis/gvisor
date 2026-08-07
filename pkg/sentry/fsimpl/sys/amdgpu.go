@@ -17,6 +17,7 @@ package sys
 import (
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -57,14 +58,20 @@ type amdGPUSysfsDirs struct {
 }
 
 // newAMDGPUSysfs builds the KFD sysfs subtrees from a host snapshot.
-func (fs *filesystem) newAMDGPUSysfs(ctx context.Context, creds *auth.Credentials, snap *amdsysfs.Snapshot) *amdGPUSysfsDirs {
+// memLimitBytes, when non-zero, is the container's GPU memory quota; the
+// topology's memory-bank sizes are rewritten to this value.
+func (fs *filesystem) newAMDGPUSysfs(ctx context.Context, creds *auth.Credentials, snap *amdsysfs.Snapshot, memLimitBytes uint64) *amdGPUSysfsDirs {
 	if snap == nil || snap.Topology == nil {
 		return nil
+	}
+	topo := snap.Topology
+	if memLimitBytes > 0 {
+		topo = applyMemoryLimit(topo, memLimitBytes)
 	}
 	// /sys/devices/virtual/kfd/kfd/topology/...
 	kfdDev := fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"kfd": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"topology": fs.newSnapshotDir(ctx, creds, snap.Topology),
+			"topology": fs.newSnapshotDir(ctx, creds, topo),
 		}),
 	})
 	// /sys/class/kfd/kfd -> ../../devices/virtual/kfd/kfd, matching the
@@ -200,4 +207,128 @@ func (fs *filesystem) newSnapshotDir(ctx context.Context, creds *auth.Credential
 		contents[name] = fs.newSnapshotDir(ctx, creds, sub)
 	}
 	return fs.newDir(ctx, creds, defaultSysDirMode, contents)
+}
+
+// applyMemoryLimit returns a shallow copy of topo with GPU memory-bank
+// size_in_bytes fields rewritten to limitBytes. Only banks with heap_type 1
+// (local/VRAM) are rewritten; system-RAM banks (heap_type 0) are left alone.
+// local_mem_size in the per-node properties is also rewritten, covering
+// discrete GPUs where that field is non-zero.
+//
+// Only the Dir nodes that contain memory size fields are cloned; the rest of
+// the tree is shared with the original snapshot.
+func applyMemoryLimit(topo *amdsysfs.Dir, limitBytes uint64) *amdsysfs.Dir {
+	nodesDir := topo.Dirs["nodes"]
+	if nodesDir == nil {
+		return topo
+	}
+	newNodes := &amdsysfs.Dir{
+		Files: nodesDir.Files,
+		Dirs:  make(map[string]*amdsysfs.Dir, len(nodesDir.Dirs)),
+	}
+	for name, node := range nodesDir.Dirs {
+		newNodes.Dirs[name] = rewriteNodeMemory(node, limitBytes)
+	}
+	newTopo := &amdsysfs.Dir{
+		Files: topo.Files,
+		Dirs:  make(map[string]*amdsysfs.Dir, len(topo.Dirs)),
+	}
+	for name, d := range topo.Dirs {
+		newTopo.Dirs[name] = d
+	}
+	newTopo.Dirs["nodes"] = newNodes
+	return newTopo
+}
+
+// rewriteNodeMemory returns a shallow copy of node with memory sizes rewritten.
+func rewriteNodeMemory(node *amdsysfs.Dir, limitBytes uint64) *amdsysfs.Dir {
+	if node == nil {
+		return nil
+	}
+	newNode := &amdsysfs.Dir{
+		Files: make(map[string]string, len(node.Files)),
+		Dirs:  make(map[string]*amdsysfs.Dir, len(node.Dirs)),
+	}
+	for k, v := range node.Files {
+		newNode.Files[k] = v
+	}
+	for k, v := range node.Dirs {
+		newNode.Dirs[k] = v
+	}
+	// Rewrite local_mem_size only when the kernel reports a non-zero value
+	// (discrete GPU). APU nodes report local_mem_size 0 to indicate that the
+	// GPU uses the system NUMA memory rather than dedicated VRAM; writing the
+	// quota there would misrepresent the memory topology.
+	if props, ok := newNode.Files["properties"]; ok {
+		if propUint64(props, "local_mem_size") > 0 {
+			newNode.Files["properties"] = rewriteProp(props, "local_mem_size", limitBytes)
+		}
+	}
+	if memBanks := node.Dirs["mem_banks"]; memBanks != nil {
+		newBanks := &amdsysfs.Dir{
+			Files: memBanks.Files,
+			Dirs:  make(map[string]*amdsysfs.Dir, len(memBanks.Dirs)),
+		}
+		for name, bank := range memBanks.Dirs {
+			if bank != nil {
+				if props, ok := bank.Files["properties"]; ok && memBankHeapType(props) == 1 {
+					newBank := &amdsysfs.Dir{
+						Files: make(map[string]string, len(bank.Files)),
+						Dirs:  bank.Dirs,
+					}
+					for k, v := range bank.Files {
+						newBank.Files[k] = v
+					}
+					newBank.Files["properties"] = rewriteProp(props, "size_in_bytes", limitBytes)
+					newBanks.Dirs[name] = newBank
+					continue
+				}
+			}
+			newBanks.Dirs[name] = bank
+		}
+		newNode.Dirs["mem_banks"] = newBanks
+	}
+	return newNode
+}
+
+// rewriteProp replaces the value of the named key in a sysfs properties string.
+// Each line has the form "key value\n"; if key is found, its value is replaced
+// with the decimal representation of newVal.
+func rewriteProp(data, key string, newVal uint64) string {
+	lines := strings.SplitAfter(data, "\n")
+	for i, line := range lines {
+		k, _, ok := strings.Cut(line, " ")
+		if ok && k == key {
+			lines[i] = key + " " + strconv.FormatUint(newVal, 10) + "\n"
+		}
+	}
+	return strings.Join(lines, "")
+}
+
+// memBankHeapType returns the heap_type value from a mem_banks properties
+// string, or -1 if it cannot be parsed.
+func memBankHeapType(data string) int {
+	for _, line := range strings.Split(data, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if ok && k == "heap_type" {
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+				return n
+			}
+		}
+	}
+	return -1
+}
+
+// propUint64 returns the value of the named key in a sysfs properties string,
+// or 0 if the key is absent or cannot be parsed.
+func propUint64(data, key string) uint64 {
+	for _, line := range strings.Split(data, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if ok && k == key {
+			if n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
 }

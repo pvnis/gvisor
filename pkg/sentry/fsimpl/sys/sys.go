@@ -65,6 +65,11 @@ type InternalData struct {
 	// AMD GPU topology (/sys/devices/virtual/kfd, /sys/class/kfd) is
 	// constructed.
 	AMDGPUSysfs *amdsysfs.Snapshot
+	// AMDGPUMemoryLimit, when non-zero, is the container's GPU memory quota
+	// in bytes. The topology's per-node memory-bank sizes are rewritten to
+	// this value so that runtimes which size their pools from sysfs do not
+	// over-commit.
+	AMDGPUMemoryLimit uint64
 	// RDMASysfs, when non-nil, is the host sysfs snapshot from which the
 	// RDMA device topology (/sys/devices/pci..., /sys/class/infiniband*,
 	// /sys/class/net, /sys/class/pci_bus, /sys/bus/pci/devices,
@@ -190,7 +195,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			}
 			kernelSub["iommu_groups"] = fs.newDir(ctx, creds, defaultSysDirMode, iommuGroups)
 		}
-		if amdDirs := fs.newAMDGPUSysfs(ctx, creds, idata.AMDGPUSysfs); amdDirs != nil {
+		if amdDirs := fs.newAMDGPUSysfs(ctx, creds, idata.AMDGPUSysfs, idata.AMDGPUMemoryLimit); amdDirs != nil {
 			virtualSub["kfd"] = amdDirs.kfd
 			classSub["kfd"] = amdDirs.class
 			if amdDirs.module != nil {
