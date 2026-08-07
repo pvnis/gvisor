@@ -50,12 +50,27 @@ type Hello struct {
 	// a connection of its own; see AnnounceOnly.
 	PID int `json:"pid,omitempty"`
 
-	// AnnounceOnly marks a connection that exists only to report a sandbox's
-	// host process ID. runsc opens one after starting a sandbox, since that is
-	// the first moment the process ID exists, and closes it again immediately.
-	// Such a connection is not a client and receives no windows.
+	// Devices are the GPUs the sandbox was given, named in whatever form they
+	// were allocated to it: a UUID, an index, or minor:N for a device node.
+	// The scheduler resolves them, so a name it does not recognize costs the
+	// sandbox its place on that device rather than being an error.
+	//
+	// It is sent by runsc for the same reason as PID: what a sandbox can see of
+	// its own devices is the container's view, and the scheduler needs the
+	// host's. AllDevices means every GPU on the host.
+	Devices []string `json:"devices,omitempty"`
+
+	// AnnounceOnly marks a connection that exists only to report what runsc
+	// knows about a sandbox and the sandbox does not. runsc opens one after
+	// starting a sandbox, since that is the first moment the process ID exists,
+	// and closes it again immediately. Such a connection is not a client and
+	// receives no windows.
 	AnnounceOnly bool `json:"announce_only,omitempty"`
 }
+
+// AllDevices is the device name meaning every GPU on the host, which is what a
+// container permitted all of them is using.
+const AllDevices = "all"
 
 // Report is what a sandbox sends each period, describing what it did with the
 // window it was given.

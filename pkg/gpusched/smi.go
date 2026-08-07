@@ -33,11 +33,11 @@ import (
 // rather than inside anything it schedules.
 type SMISampler struct {
 	mu sync.Mutex
-	// utilization is the most recent reading for each process.
-	utilization map[int]float64
-	// updated is when each process was last reported, used to forget processes
-	// that have stopped using the GPU.
-	updated map[int]time.Time
+	// utilization is the most recent reading for each process on each GPU.
+	utilization Usage
+	// updated is when each was last reported, used to forget processes that
+	// have stopped using the GPU.
+	updated map[Proc]time.Time
 	// stale is how long a reading is honoured before the process is treated as
 	// no longer using the GPU.
 	stale time.Duration
@@ -60,8 +60,8 @@ func NewSMISampler() (*SMISampler, error) {
 		return nil, fmt.Errorf("starting nvidia-smi: %w", err)
 	}
 	s := &SMISampler{
-		utilization: make(map[int]float64),
-		updated:     make(map[int]time.Time),
+		utilization: make(Usage),
+		updated:     make(map[Proc]time.Time),
 		// Two sampling intervals, so that a single missed line does not make a
 		// busy process look idle.
 		stale: 3 * time.Second,
@@ -74,13 +74,13 @@ func NewSMISampler() (*SMISampler, error) {
 func (s *SMISampler) read(r interface{ Read([]byte) (int, error) }) {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
-		pid, util, ok := parsePmonLine(sc.Text())
+		proc, util, ok := parsePmonLine(sc.Text())
 		if !ok {
 			continue
 		}
 		s.mu.Lock()
-		s.utilization[pid] = util
-		s.updated[pid] = time.Now()
+		s.utilization[proc] = util
+		s.updated[proc] = time.Now()
 		s.mu.Unlock()
 	}
 }
@@ -91,47 +91,55 @@ func (s *SMISampler) read(r interface{ Read([]byte) (int, error) }) {
 //	# gpu        pid  type    sm   mem   enc   dec   jpg   ofa  command
 //	    0     718623     C    99     0     -     -     -     -  runsc-sandbox
 //
-// A process with no work executing reports "-" rather than a number.
-func parsePmonLine(line string) (pid int, util float64, ok bool) {
+// A process with no work executing reports "-" rather than a number. A process
+// using more than one GPU is reported once per GPU, which is why the first
+// column is read rather than skipped: without it the work a process did on one
+// device would be charged against its share of another.
+func parsePmonLine(line string) (proc Proc, util float64, ok bool) {
 	line = strings.TrimSpace(line)
 	if line == "" || strings.HasPrefix(line, "#") {
-		return 0, 0, false
+		return Proc{}, 0, false
 	}
 	f := strings.Fields(line)
 	if len(f) < 4 {
-		return 0, 0, false
+		return Proc{}, 0, false
+	}
+	index, err := strconv.Atoi(f[0])
+	if err != nil {
+		return Proc{}, 0, false
 	}
 	pid, err := strconv.Atoi(f[1])
 	if err != nil {
-		return 0, 0, false
+		return Proc{}, 0, false
 	}
+	proc = Proc{Device: DeviceID(index), PID: pid}
 	if f[3] == "-" {
 		// Present but idle.
-		return pid, 0, true
+		return proc, 0, true
 	}
 	sm, err := strconv.ParseFloat(f[3], 64)
 	if err != nil {
-		return 0, 0, false
+		return Proc{}, 0, false
 	}
-	return pid, sm / 100, true
+	return proc, sm / 100, true
 }
 
 // Sample implements Sampler.Sample.
-func (s *SMISampler) Sample() map[int]float64 {
+func (s *SMISampler) Sample() Usage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	out := make(map[int]float64, len(s.utilization))
-	for pid, u := range s.utilization {
-		if now.Sub(s.updated[pid]) > s.stale {
+	out := make(Usage, len(s.utilization))
+	for proc, u := range s.utilization {
+		if now.Sub(s.updated[proc]) > s.stale {
 			// The process has stopped being reported, so it is no longer using
 			// the GPU; leaving its last reading in place would hold a share for
 			// something that has gone.
-			delete(s.utilization, pid)
-			delete(s.updated, pid)
+			delete(s.utilization, proc)
+			delete(s.updated, proc)
 			continue
 		}
-		out[pid] = u
+		out[proc] = u
 	}
 	return out
 }

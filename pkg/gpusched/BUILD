@@ -8,6 +8,7 @@ package(
 go_library(
     name = "gpusched",
     srcs = [
+        "device.go",
         "gpusched.go",
         "server.go",
         "smi.go",
@@ -15,12 +16,14 @@ go_library(
         "wire.go",
     ],
     visibility = ["//:sandbox"],
+    deps = ["//pkg/log"],
 )
 
 go_test(
     name = "gpusched_test",
     size = "small",
     srcs = [
+        "device_test.go",
         "gpusched_test.go",
         "server_test.go",
         "smi_test.go",

@@ -25,29 +25,39 @@ func TestParsePmonLine(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		line     string
-		wantPID  int
+		wantProc Proc
 		wantUtil float64
 		wantOK   bool
 	}{
 		{
 			name:     "a sandbox saturating the GPU",
 			line:     "    0     718623     C     99      0      -      -      -      -    runsc-sandbox",
-			wantPID:  718623,
+			wantProc: Proc{Device: 0, PID: 718623},
 			wantUtil: 0.99,
 			wantOK:   true,
 		},
 		{
 			name:     "a partly busy process",
 			line:     "    0     718623     C     25      0      -      -      -      -    runsc-sandbox",
-			wantPID:  718623,
+			wantProc: Proc{Device: 0, PID: 718623},
 			wantUtil: 0.25,
 			wantOK:   true,
 		},
 		{
-			name:    "present but with nothing executing",
-			line:    "    0     718623     C      -      -      -      -      -      -    runsc-sandbox",
-			wantPID: 718623,
-			wantOK:  true,
+			// The same process on the host's second GPU, which is a different
+			// thing entirely: what it took from one device says nothing about
+			// its share of another.
+			name:     "a process on another GPU",
+			line:     "    1     718623     C     40      0      -      -      -      -    runsc-sandbox",
+			wantProc: Proc{Device: 1, PID: 718623},
+			wantUtil: 0.40,
+			wantOK:   true,
+		},
+		{
+			name:     "present but with nothing executing",
+			line:     "    0     718623     C      -      -      -      -      -      -    runsc-sandbox",
+			wantProc: Proc{Device: 0, PID: 718623},
+			wantOK:   true,
 		},
 		{name: "the header", line: "# gpu         pid   type     sm    mem    enc    dec"},
 		{name: "the units row", line: "# Idx           #    C/G      %      %      %      %"},
@@ -55,16 +65,16 @@ func TestParsePmonLine(t *testing.T) {
 		{name: "blank", line: "   "},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			pid, util, ok := parsePmonLine(test.line)
+			proc, util, ok := parsePmonLine(test.line)
 			if ok != test.wantOK {
 				t.Fatalf("parsePmonLine(%q) ok = %v, want %v", test.line, ok, test.wantOK)
 			}
 			if !ok {
 				return
 			}
-			if pid != test.wantPID || util != test.wantUtil {
-				t.Errorf("parsePmonLine(%q) = pid %d, util %v; want pid %d, util %v",
-					test.line, pid, util, test.wantPID, test.wantUtil)
+			if proc != test.wantProc || util != test.wantUtil {
+				t.Errorf("parsePmonLine(%q) = %+v, util %v; want %+v, util %v",
+					test.line, proc, util, test.wantProc, test.wantUtil)
 			}
 		})
 	}
@@ -74,16 +84,18 @@ func TestParsePmonLine(t *testing.T) {
 // reported stops being counted, rather than holding a share of the GPU on the
 // strength of its last reading.
 func TestSMISamplerForgetsDepartedProcesses(t *testing.T) {
+	fresh := Proc{Device: 0, PID: 100}
+	departed := Proc{Device: 0, PID: 200}
 	s := &SMISampler{
-		utilization: map[int]float64{100: 0.9, 200: 0.5},
-		updated:     map[int]time.Time{100: time.Now(), 200: time.Now().Add(-time.Minute)},
+		utilization: Usage{fresh: 0.9, departed: 0.5},
+		updated:     map[Proc]time.Time{fresh: time.Now(), departed: time.Now().Add(-time.Minute)},
 		stale:       3 * time.Second,
 	}
 	got := s.Sample()
-	if _, ok := got[100]; !ok {
+	if _, ok := got[fresh]; !ok {
 		t.Errorf("a process reported just now was dropped")
 	}
-	if _, ok := got[200]; ok {
+	if _, ok := got[departed]; ok {
 		t.Errorf("a process last reported a minute ago is still counted")
 	}
 }
@@ -103,7 +115,7 @@ func TestServerChargesMeasuredOverrun(t *testing.T) {
 
 	// The hog takes the whole GPU despite being granted half of it; the victim
 	// takes only what it was given.
-	s.SetSampler(&FakeSampler{Utilization: map[int]float64{111: 1.0, 222: 0.5}})
+	s.SetSampler(&FakeSampler{Utilization: Usage{{PID: 111}: 1.0, {PID: 222}: 0.5}})
 
 	var hogGrant, victimGrant Grant
 	for i := 0; i < 6; i++ {
@@ -130,7 +142,7 @@ func TestServerUsesMeasurementOverSubmission(t *testing.T) {
 	waitForClients(t, s, 2)
 
 	// Both submit every period, but "light" hardly uses the GPU.
-	s.SetSampler(&FakeSampler{Utilization: map[int]float64{111: 0.02, 222: 0.9}})
+	s.SetSampler(&FakeSampler{Utilization: Usage{{PID: 111}: 0.02, {PID: 222}: 0.9}})
 
 	var lightGrant Grant
 	for i := 0; i < 4; i++ {
@@ -188,7 +200,7 @@ func TestServerTakesPIDFromAnnouncement(t *testing.T) {
 	waitForClients(t, s, 2)
 
 	// The announced process is taking the whole GPU despite its window.
-	s.SetSampler(&FakeSampler{Utilization: map[int]float64{4242: 1.0, 555: 0.5}})
+	s.SetSampler(&FakeSampler{Utilization: Usage{{PID: 4242}: 1.0, {PID: 555}: 0.5}})
 
 	var hogGrant, victimGrant Grant
 	for i := 0; i < 6; i++ {
