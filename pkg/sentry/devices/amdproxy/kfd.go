@@ -222,6 +222,8 @@ func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 		return kfdSetCUMask(ki)
 	case amdgpu.AMDKFD_IOC_CREATE_QUEUE:
 		return kfdCreateQueue(ki)
+	case amdgpu.AMDKFD_IOC_SVM:
+		return kfdSVM(ki)
 	case amdgpu.AMDKFD_IOC_ALLOC_MEMORY_OF_GPU:
 		return kfdAllocMemoryOfGPU(ki)
 	case amdgpu.AMDKFD_IOC_FREE_MEMORY_OF_GPU:

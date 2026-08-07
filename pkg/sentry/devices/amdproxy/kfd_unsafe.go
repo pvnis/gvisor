@@ -176,6 +176,50 @@ const maxKFDTileConfigs = 256
 // WAIT_EVENTS call. 256 is generous; real code rarely exceeds a handful.
 const maxKFDWaitEvents = 256
 
+// maxKFDSVMAttrs is an upper bound on the number of SVM attributes in a
+// single AMDKFD_IOC_SVM call. 8 attribute types times up to 8 GPUs gives 64.
+const maxKFDSVMAttrs = 64
+
+// kfdSVM handles AMDKFD_IOC_SVM, which sets or queries shared virtual memory
+// properties for a virtual address range.
+//
+// The parameter layout is a fixed 24-byte header (KFDIoctlSVMArgs) followed
+// immediately by NAttr KFDIoctlSVMAttribute structs. The ioctl command
+// encodes only the header size, but the kernel reads the full flat buffer.
+// kfdSVM copies the entire block from the application, forwards it to the
+// host, and copies the result back so that GET_ATTR can fill in attr values.
+func kfdSVM(ki *kfdIoctlState) (uintptr, error) {
+	var header amdgpu.KFDIoctlSVMArgs
+	if _, err := header.CopyIn(ki.t, ki.argAddr); err != nil {
+		return 0, err
+	}
+	if header.NAttr > maxKFDSVMAttrs {
+		return 0, linuxerr.EINVAL
+	}
+	attrBytes := int(header.NAttr) * amdgpu.SizeofKFDIoctlSVMAttribute
+	buf := make([]byte, amdgpu.SizeofKFDIoctlSVMArgs+attrBytes)
+	header.MarshalBytes(buf[:amdgpu.SizeofKFDIoctlSVMArgs])
+	if header.NAttr > 0 {
+		if _, err := ki.t.CopyInBytes(ki.argAddr+hostarch.Addr(amdgpu.SizeofKFDIoctlSVMArgs), buf[amdgpu.SizeofKFDIoctlSVMArgs:]); err != nil {
+			return 0, err
+		}
+	}
+	defer runtime.KeepAlive(buf)
+	n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(ki.fd.hostFD), uintptr(ki.cmd), uintptr(unsafe.Pointer(&buf[0])))
+	if errno != 0 {
+		return n, errno
+	}
+	if _, err := ki.t.CopyOutBytes(ki.argAddr, buf[:amdgpu.SizeofKFDIoctlSVMArgs]); err != nil {
+		return n, err
+	}
+	if header.NAttr > 0 {
+		if _, err := ki.t.CopyOutBytes(ki.argAddr+hostarch.Addr(amdgpu.SizeofKFDIoctlSVMArgs), buf[amdgpu.SizeofKFDIoctlSVMArgs:]); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
 // kfdGetTileConfig handles AMDKFD_IOC_GET_TILE_CONFIG. The parameters point
 // at two optional application arrays (tile configs and macro-tile configs)
 // that the driver fills in, so each non-null pointer is retargeted at a

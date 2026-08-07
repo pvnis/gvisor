@@ -69,6 +69,7 @@ const (
 	SizeofKFDIoctlAllocQueueGWSArgs          = 16
 	SizeofKFDIoctlSMIEventsArgs              = 8
 	SizeofKFDIoctlSVMArgs                    = 24
+	SizeofKFDIoctlSVMAttribute               = 8
 	SizeofKFDIoctlSetXNACKModeArgs           = 4
 	SizeofKFDIoctlCRIUArgs                   = 56
 	SizeofKFDIoctlGetAvailableMemoryArgs     = 16
@@ -551,6 +552,60 @@ type KFDIoctlSMIEventsArgs struct {
 	_      structs.HostLayout
 	GPUID  uint32
 	AnonFD uint32
+}
+
+// SVM ioctl operations, from enum kfd_ioctl_svm_op.
+const (
+	KFD_IOCTL_SVM_OP_SET_ATTR = 0
+	KFD_IOCTL_SVM_OP_GET_ATTR = 1
+)
+
+// SVM attribute types, from enum kfd_ioctl_svm_attr_type.
+const (
+	KFD_IOCTL_SVM_ATTR_PREFERRED_LOC   = 0
+	KFD_IOCTL_SVM_ATTR_PREFETCH_LOC    = 1
+	KFD_IOCTL_SVM_ATTR_ACCESS          = 2
+	KFD_IOCTL_SVM_ATTR_ACCESS_IN_PLACE = 3
+	KFD_IOCTL_SVM_ATTR_NO_ACCESS       = 4
+	KFD_IOCTL_SVM_ATTR_SET_FLAGS       = 5
+	KFD_IOCTL_SVM_ATTR_CLR_FLAGS       = 6
+	KFD_IOCTL_SVM_ATTR_GRANULARITY     = 7
+)
+
+// SVM attribute flags, from KFD_IOCTL_SVM_FLAG_*.
+const (
+	KFD_IOCTL_SVM_FLAG_HOST_ACCESS       = 0x01
+	KFD_IOCTL_SVM_FLAG_COHERENT          = 0x02
+	KFD_IOCTL_SVM_FLAG_HIVE_LOCAL        = 0x04
+	KFD_IOCTL_SVM_FLAG_GPU_RO            = 0x08
+	KFD_IOCTL_SVM_FLAG_GPU_EXEC          = 0x10
+	KFD_IOCTL_SVM_FLAG_GPU_READ_MOSTLY   = 0x20
+	KFD_IOCTL_SVM_FLAG_GPU_ALWAYS_MAPPED = 0x40
+	KFD_IOCTL_SVM_FLAG_EXT_COHERENT      = 0x80
+)
+
+// KFDIoctlSVMArgs is the fixed-size header of struct kfd_ioctl_svm_args.
+// The complete ioctl parameter is this header followed by NAttr
+// KFDIoctlSVMAttribute structs, contiguous in memory. The kernel reads
+// the whole flat buffer even though the ioctl command number encodes only
+// the header size (24 bytes).
+//
+// +marshal
+type KFDIoctlSVMArgs struct {
+	_         structs.HostLayout
+	StartAddr uint64
+	Size      uint64
+	Op        uint32
+	NAttr     uint32
+}
+
+// KFDIoctlSVMAttribute is struct kfd_ioctl_svm_attribute.
+//
+// +marshal
+type KFDIoctlSVMAttribute struct {
+	_     structs.HostLayout
+	Type  uint32
+	Value uint32
 }
 
 // KFDIoctlSetXNACKModeArgs is struct kfd_ioctl_set_xnack_mode_args.
