@@ -577,11 +577,14 @@ GPU rather than cap its users, use the scheduler below.
 
 ## Dividing a GPU between sandboxes {#gpu-scheduler}
 
-`runsc gpu-scheduler` is a coordinator that divides one GPU between the
-sandboxes sharing it. It runs on the host, outside every sandbox, which is what
-lets it do what a Sentry alone cannot: give a sandbox the time its neighbours
-are not using, and place each sandbox's window so that the windows do not
-overlap.
+`runsc gpu-scheduler` is a coordinator that divides a GPU between the sandboxes
+sharing it. It runs on the host, outside every sandbox, which is what lets it do
+what a Sentry alone cannot: give a sandbox the time its neighbours are not
+using, and place each sandbox's window so that the windows do not overlap.
+
+One instance serves the whole node. Each of the node's GPUs is divided
+separately, so sandboxes placed on different devices do not take time from one
+another; see [Nodes with several GPUs](#kubernetes) below.
 
 ```
 runsc gpu-scheduler --socket=/run/runsc-gpu-scheduler.sock
@@ -645,6 +648,15 @@ preempted by any software layer, `pmon` samples once a second against 100ms
 windows, and repayment is deliberately capped at one period so that a single
 long kernel cannot starve its author afterwards. A host without `nvidia-smi`
 still divides the GPU, by the weaker signal of what was submitted.
+
+**Prefer `--measure-usage=false` for now.** How `pmon` reports the `sm` column
+is not yet understood well enough to charge against it. Two pods running an
+identical kernel loop at equal weights divide the GPU exactly, at 324 and 324
+launches per second against 654 for a pod running alone, with measurement off --
+and collapse to 31 and 618 with it on, because `pmon` credits most of the device
+to whichever pod is being throttled and the repayment above then throttles it
+further. The defence against long kernels is real, but it currently costs more
+than it saves on ordinary workloads.
 
 ## GPU slicing under Kubernetes {#kubernetes}
 
@@ -733,7 +745,7 @@ Description=runsc GPU scheduler
 Before=k3s.service
 
 [Service]
-ExecStart=/usr/local/bin/runsc --debug --debug-log=/var/log/runsc-gpu-scheduler.log gpu-scheduler --socket=/run/runsc-gpu-scheduler.sock
+ExecStart=/usr/local/bin/runsc --debug --debug-log=/var/log/runsc-gpu-scheduler.log gpu-scheduler --socket=/run/runsc-gpu-scheduler.sock --measure-usage=false
 Restart=always
 RestartSec=1
 
@@ -894,18 +906,44 @@ of the division; see
 partitioned rather than shared, MIG enforces it in hardware, and HAMi can place
 pods onto MIG instances.
 
-### One GPU per node, for now
+### Nodes with several GPUs
 
-The coordinator has no concept of a device: every sandbox that connects to it is
-treated as contending with every other. On a node with one GPU that is correct.
-On a node with several it is not -- HAMi will place pods across the devices, and
-two pods on *different* GPUs would still be given disjoint windows and take a
-fraction of the time each, though they never contend.
+One coordinator handles every GPU on the node. It divides each device
+separately, so pods that HAMi placed on different GPUs are not held to shares of
+one another, and there is still a single socket and a single service to run.
 
-There is no per-pod way around this today, since the socket is named in the
-runtime's configuration rather than in the pod's, so it cannot be varied per
-GPU. Until the coordinator learns which device each sandbox was placed on, use
-this on single-GPU nodes.
+The devices are enumerated with `nvidia-smi` when the coordinator starts, which
+it logs:
+
+```
+I0807 02:47:01.452710  865388 gpuscheduler.go:113] Scheduling 2 GPUs separately
+```
+
+`runsc` reports which GPUs a sandbox was given, in whichever form they were
+allocated to it -- a UUID from a device plugin, an index from `docker --gpus`,
+or a device node injected by a CRI runtime -- and the coordinator resolves them.
+Under CRI a pod's sandbox is created from the pause container's spec, which
+names no GPU, so a sandbox is scheduled against every other whose device is
+unknown for the fraction of a second before its first GPU container starts. Both
+placements are logged:
+
+```
+Sandbox "d1719cd1..." is competing for GPU [any]
+Sandbox "d1719cd1..." is competing for GPU [0]
+```
+
+A sandbox left on `[any]` after its containers have started means the devices
+could not be resolved -- most often because `nvidia-smi` could not be run when
+the coordinator started, which it warns about. That costs the division its
+precision on a multi-GPU node, since such sandboxes are all scheduled together;
+it cannot let one take more than it was granted.
+
+A pod holding more than one GPU is counted by each of them, and is held to the
+smallest window any of them granted. It has one gate covering every device it
+holds, so it can only be given one window, and anything wider would let it
+exceed its share of whichever device granted the smallest. A pod that holds one
+GPU to itself and shares another is therefore held to the shared device's window
+on both, which leaves the unshared one idle for the rest of each period.
 
 Checkpointing does not work either; see
 [Checkpointing is not yet supported](#compute-limits) above. That applies to any

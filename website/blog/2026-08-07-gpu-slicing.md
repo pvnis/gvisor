@@ -344,6 +344,16 @@ once submitted; `pmon` samples once a second while windows are 100ms; and
 recovery is deliberately capped at one period. This mitigates the attack
 substantially. It does not eliminate it.
 
+It also, as it turns out, costs more than it should. Measured after the fact on
+two pods running an *identical* kernel loop at equal weights, `pmon` attributes
+most of the GPU to whichever pod is being throttled — and the debt mechanism
+then throttles it further, which is self-reinforcing. The division collapses to
+31 against 618 launches per second, where turning the measurement off gives 324
+and 324. So the sampling that defends against long kernels currently misprices
+the ordinary case badly, and `--measure-usage=false` is the better setting until
+that is understood. This is a defect in how `sm` is being read, not in the debt
+accounting it feeds.
+
 ## Part 5: Kubernetes, without the injection
 
 None of the above is useful in a cluster unless something translates what a pod
@@ -442,15 +452,15 @@ quota, and is held to it by something it has no access to.
     feel the period.
 *   **Long kernels still overshoot.** Mitigated, not solved, and bounded by
     what `pmon`'s 1Hz sampling can see.
-*   **One GPU per node.** This is the sharpest limitation. The coordinator has
-    no concept of a device — `Hello` carries no GPU identity and the `pmon`
-    parser ignores the GPU column — so on a multi-GPU node, pods placed on
-    *different* GPUs are still handed disjoint windows and each gets a fraction
-    of the time despite never contending. There is no per-pod workaround,
-    because the socket is named in the runtime configuration rather than the
-    pod's. Fixing it means threading the placed device UUID (which HAMi already
-    writes to `hami.io/vgpu-devices-allocated`) through to the coordinator and
-    keying schedulers by device.
+*   **The usage measurement misprices the ordinary case.** With
+    `--measure-usage=true`, two identical pods at equal weights end up at 31 and
+    618 launches per second instead of 324 each. See below.
+*   **A pod holding several GPUs gets one window.** Each device counts it, and
+    it is held to the smallest window any of them granted — the only safe
+    choice, since the gate covers every device it holds at once and anything
+    wider would let it exceed its share of the most contended one. A pod that
+    has one GPU to itself and shares another is therefore throttled on both,
+    leaving the unshared device idle for the rest of each period.
 *   **No checkpoint/restore for CUDA sandboxes.** Only `rmAllocObject` and
     `rootClient` implement `Restore`; `miscObject` and `osDescMem` do not, and
     those cover the OS events every CUDA context creates. In practice no
@@ -477,14 +487,25 @@ All figures from an RTX 5070.
 | Two pods, no scheduler | 324 each |
 | Long-kernel abuse, without measurement | 67.6% / 32.4% (2.08:1) |
 | Long-kernel abuse, with measurement | 57.8% / 42.2% (1.37:1) |
+| Two identical pods, equal weights, measurement off | 324 / 324 |
+| Two identical pods, equal weights, measurement on | 31 / 618 |
+| Two pods on separate GPUs, one coordinator | a whole device each |
 | Cost to an mmap-heavy thread under a 25% cap | ~20% of unlimited rate |
 | Cost to a compute-bound thread under a 25% cap | none measurable |
 
 ## Where this goes next
 
-The multi-GPU limitation is the most likely thing to bite a real deployment and
-the most clearly-shaped piece of work: the device identity exists at placement
-time, it just is not carried through to the coordinator.
+The measurement is the weak point. `nvidia-smi pmon`'s `sm` column is what the
+overrun accounting is built on, and it does not appear to measure what the
+scheduler assumes. Two pods running an identical kernel loop at equal weights
+divide the GPU exactly in half with `--measure-usage=false` (324 and 324
+launches per second, against 654 for a pod running alone) and 31 against 618
+with it on:
+`pmon` attributes the *larger* share to the pod achieving one twentieth of the
+throughput, and the debt mechanism then pins it at the 5ms floor and keeps it
+there. The long-kernel defence that measurement exists to provide is real, but
+it is currently paid for with a worse division of the ordinary case, and the
+sampling needs to be understood before it can be trusted.
 
 Beyond that, the honest summary is that GPU sharing under an adversarial threat
 model is bounded by a hardware fact — work submitted to a GPU cannot be
