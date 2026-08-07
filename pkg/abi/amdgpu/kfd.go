@@ -507,6 +507,20 @@ type KFDIoctlResetEventArgs struct {
 	Pad     uint32
 }
 
+// KFDEventData is struct kfd_event_data.
+//
+// The union (memory_exception_data / hw_exception_data / signal_event_data)
+// is represented as a raw byte array; the sentry does not interpret it.
+//
+// +marshal slice:KFDEventDataSlice
+type KFDEventData struct {
+	_               structs.HostLayout
+	ExceptionData   [32]byte
+	KFDEventDataExt uint64
+	EventID         uint32
+	Pad             uint32
+}
+
 // KFDIoctlWaitEventsArgs is struct kfd_ioctl_wait_events_args.
 //
 // +marshal

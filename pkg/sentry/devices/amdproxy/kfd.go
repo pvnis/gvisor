@@ -160,7 +160,7 @@ type kfdIoctlState struct {
 //
 // Every other KFD ioctl is denied, and each needs handling this package does
 // not yet implement: ioctls carrying pointers to application buffers
-// (GET_PROCESS_APERTURES, WAIT_EVENTS, GET_QUEUE_WAVE_STATE, GET_DMABUF_INFO);
+// (GET_PROCESS_APERTURES, GET_QUEUE_WAVE_STATE, GET_DMABUF_INFO);
 // ioctls carrying file descriptors (IMPORT_DMABUF, EXPORT_DMABUF, SMI_EVENTS);
 // and ioctls with variable-length or otherwise unvalidated parameters
 // (SVM, CRIU_OP, DBG_TRAP).
@@ -210,6 +210,8 @@ func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 		return kfdIoctlSimple[amdgpu.KFDIoctlRuntimeEnableArgs](ki)
 	case amdgpu.AMDKFD_IOC_GET_TILE_CONFIG:
 		return kfdGetTileConfig(ki)
+	case amdgpu.AMDKFD_IOC_WAIT_EVENTS:
+		return kfdWaitEvents(ki)
 	case amdgpu.AMDKFD_IOC_ACQUIRE_VM:
 		return kfdAcquireVM(ki)
 	case amdgpu.AMDKFD_IOC_GET_PROCESS_APERTURES_NEW:

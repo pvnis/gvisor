@@ -172,6 +172,10 @@ func kfdSetCUMask(ki *kfdIoctlState) (uintptr, error) {
 // 16 macro-tile modes; 256 gives ample room for future expansion.
 const maxKFDTileConfigs = 256
 
+// maxKFDWaitEvents is an upper bound on the number of events in a single
+// WAIT_EVENTS call. 256 is generous; real code rarely exceeds a handful.
+const maxKFDWaitEvents = 256
+
 // kfdGetTileConfig handles AMDKFD_IOC_GET_TILE_CONFIG. The parameters point
 // at two optional application arrays (tile configs and macro-tile configs)
 // that the driver fills in, so each non-null pointer is retargeted at a
@@ -231,6 +235,41 @@ func kfdGetTileConfig(ki *kfdIoctlState) (uintptr, error) {
 		if _, err := primitive.CopyUint32SliceOut(ki.t, hostarch.Addr(origMacroPtr), macroTileConfigs[:params.NumMacroTileConfigs]); err != nil {
 			return n, err
 		}
+	}
+	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// kfdWaitEvents handles AMDKFD_IOC_WAIT_EVENTS. The parameters point at an
+// application array of kfd_event_data structs, each holding an event_id input
+// and exception-data outputs, so the pointer is retargeted at a Sentry buffer.
+//
+// WAIT_EVENTS can block for its Timeout duration; unix.Syscall is used so
+// the Go runtime may schedule other goroutines on this OS thread while waiting.
+func kfdWaitEvents(ki *kfdIoctlState) (uintptr, error) {
+	var params amdgpu.KFDIoctlWaitEventsArgs
+	if _, err := params.CopyIn(ki.t, ki.argAddr); err != nil {
+		return 0, err
+	}
+	if params.NumEvents == 0 || params.NumEvents > maxKFDWaitEvents {
+		return 0, linuxerr.EINVAL
+	}
+	events := make([]amdgpu.KFDEventData, params.NumEvents)
+	if _, err := amdgpu.CopyKFDEventDataSliceIn(ki.t, hostarch.Addr(params.EventsPtr), events); err != nil {
+		return 0, err
+	}
+	defer runtime.KeepAlive(events)
+	origPtr := params.EventsPtr
+	params.EventsPtr = uint64(uintptr(unsafe.Pointer(&events[0])))
+	n, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(ki.fd.hostFD), uintptr(ki.cmd), uintptr(unsafe.Pointer(&params)))
+	params.EventsPtr = origPtr
+	if errno != 0 {
+		return n, errno
+	}
+	if _, err := amdgpu.CopyKFDEventDataSliceOut(ki.t, hostarch.Addr(origPtr), events); err != nil {
+		return n, err
 	}
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err
