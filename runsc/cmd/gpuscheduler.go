@@ -56,11 +56,14 @@ see how many others are competing with it, nor whether they are using the GPU at
 all. This command runs outside every sandbox and decides for them.
 
 Sandboxes connect to the socket given by --socket, which they are pointed at
-with the runsc flag --nvproxy-gpu-scheduler-socket. Those using the GPU divide
-each period in proportion to their weights, so one running alone receives all of
-it, and they are given windows that do not overlap so that they take turns.
+with the runsc flag --nvproxy-gpu-scheduler-socket. Those using the same GPU
+divide each period in proportion to their weights, so one running alone receives
+all of it, and they are given windows that do not overlap so that they take
+turns.
 
-Run one per GPU.
+Run one per host. Each of the host's GPUs is divided separately, so sandboxes
+placed on different devices do not take time from one another; runsc reports
+which GPUs a sandbox was given when it starts it.
 `
 }
 
@@ -99,6 +102,16 @@ func (g *GPUScheduler) Execute(_ context.Context, f *flag.FlagSet, args ...any) 
 	}
 
 	server := gpusched.NewServer(g.period)
+	// Learn what GPUs the host has, so that sandboxes placed on different ones
+	// are not held to shares of each other. Without this every sandbox competes
+	// with every other, which is right for a host with one GPU and merely
+	// wasteful on a host with several.
+	if table, err := gpusched.NewDeviceTable(); err != nil {
+		log.Warningf("Scheduling every sandbox together: the host's GPUs could not be enumerated, so sandboxes on different devices cannot be told apart: %v", err)
+	} else {
+		server.SetDeviceTable(table)
+		log.Infof("Scheduling %d GPUs separately", table.Devices())
+	}
 	if g.measure {
 		// A sandbox cannot see how long the GPU spent on what it submitted, so
 		// without this a sandbox that runs far past its window is

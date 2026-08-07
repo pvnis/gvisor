@@ -24,6 +24,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
+	"gvisor.dev/gvisor/pkg/gpusched"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/runsc/config"
@@ -252,24 +253,93 @@ func IsLegacyCudaImage(spec *specs.Spec) bool {
 	return len(cudaVersion) > 0 && len(requireCuda) == 0
 }
 
+// nvidiaDeviceRegex matches the basename of a regular NVIDIA frontend device
+// node, whose number is the device's minor.
+var nvidiaDeviceRegex = regexp.MustCompile(`^nvidia(\d+)$`)
+
+// nvidiaDeviceMinor returns the minor number of a regular NVIDIA frontend
+// device node, and whether dev is one.
+func nvidiaDeviceMinor(dev specs.LinuxDevice) (uint32, bool) {
+	ms := nvidiaDeviceRegex.FindStringSubmatch(filepath.Base(dev.Path))
+	if ms == nil {
+		return 0, false
+	}
+	minor, err := strconv.ParseUint(ms[1], 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	if minor > nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX {
+		return 0, false
+	}
+	if dev.Major != nvgpu.NV_MAJOR_DEVICE_NUMBER || dev.Minor != int64(minor) {
+		return 0, false
+	}
+	return uint32(minor), true
+}
+
+// NvidiaDeviceNames returns the GPUs a container has been given, named in
+// whichever way they were allocated to it.
+//
+// They are reported to the GPU scheduler, which divides each device between the
+// sandboxes on it and so must know which those are. No single name will do:
+// a device plugin allocates by UUID through NVIDIA_VISIBLE_DEVICES, Docker's
+// --gpus takes indices, and a CRI runtime injects device nodes and names
+// nothing. All of them are collected here and resolved by the scheduler, which
+// is the only party that can see what the host actually has.
+//
+// gpusched.AllDevices means the container was permitted every GPU. An empty
+// result means nothing could be determined, and leaves the sandbox scheduled
+// against every other sandbox whose devices are unknown -- a smaller share than
+// it may be due, but never a larger one.
+//
+// This is derived from the same fields that decide which GPUs the container can
+// actually reach, so a spec that misstates them misstates its own access in the
+// same direction and gains nothing by it.
+func NvidiaDeviceNames(spec *specs.Spec, conf *config.Config) []string {
+	var names []string
+	seen := make(map[string]struct{})
+	add := func(name string) {
+		if name == "" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+
+	// Device nodes, as a CRI runtime or the GKE device plugin injects them.
+	if spec.Linux != nil {
+		for _, dev := range spec.Linux.Devices {
+			if minor, ok := nvidiaDeviceMinor(dev); ok {
+				add(gpusched.MinorName(int(minor)))
+			}
+		}
+	}
+
+	// NVIDIA_VISIBLE_DEVICES, as a device plugin or Docker's --gpus sets it.
+	if spec.Process != nil {
+		switch nvd := nvidiaVisibleDevsEnvVar(spec.Process.Env, findNvidiaHook(spec, conf)); nvd {
+		case "", "void", "none":
+			// No GPU, or driver functionality without one.
+		case "all":
+			add(gpusched.AllDevices)
+		default:
+			for _, dev := range strings.Split(nvd, ",") {
+				add(strings.TrimSpace(dev))
+			}
+		}
+	}
+	return names
+}
+
 // removeNvproxyFrontendDevices removes regular Nvidia frontend devices from
 // both o and n, since we handle these by remapping.
 func removeNvproxyFrontendDevices(field, cName string, o, n []specs.LinuxDevice) ([]specs.LinuxDevice, []specs.LinuxDevice, error) {
-	nvidiaDeviceRegex := regexp.MustCompile(`^nvidia(\d+)$`)
 	shouldDelete := func(dev specs.LinuxDevice) bool {
-		basename := filepath.Base(dev.Path)
-		ms := nvidiaDeviceRegex.FindStringSubmatch(basename)
-		if ms == nil {
-			return false
-		}
-		minor, err := strconv.ParseUint(ms[1], 10, 32)
-		if err != nil {
-			return false
-		}
-		if minor > nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX {
-			return false
-		}
-		return dev.Major == nvgpu.NV_MAJOR_DEVICE_NUMBER && dev.Minor == int64(minor)
+		_, ok := nvidiaDeviceMinor(dev)
+		return ok
 	}
 	o = slices.DeleteFunc(slices.Clone(o), shouldDelete)
 	n = slices.DeleteFunc(slices.Clone(n), shouldDelete)

@@ -22,6 +22,7 @@ go_library(
     deps = [
         "//pkg/abi/linux",
         "//pkg/abi/nvgpu",
+        "//pkg/gpusched",
         "//pkg/log",
         "//pkg/rdma",
         "//pkg/sentry/devices/nvproxy/nvconf",
@@ -43,10 +44,13 @@ go_test(
     size = "small",
     srcs = [
         "gofer_conf_test.go",
+        "nvidia_test.go",
         "specutils_test.go",
     ],
     library = ":specutils",
     deps = [
+        "//pkg/abi/nvgpu",
+        "//pkg/gpusched",
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//runsc/config",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",

@@ -531,6 +531,18 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 	if err := s.call(boot.ContMgrStartSubcontainer, &args, nil); err != nil {
 		return fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
 	}
+
+	// Tell the GPU scheduler which GPUs this container brought with it. Under
+	// CRI the sandbox is created from the pause container's spec, which holds
+	// no GPU of its own, so this is the first point at which the devices a pod
+	// was allocated are known. The containers of a pod share one sandbox and so
+	// one window on the GPU, which is why they are reported under the sandbox's
+	// ID and accumulate rather than replace one another.
+	if conf.NVProxyGPUSchedulerSocket != "" {
+		if devices := specutils.NvidiaDeviceNames(spec, conf); len(devices) > 0 {
+			announceToGPUScheduler(conf.NVProxyGPUSchedulerSocket, s.ID, 0, devices)
+		}
+	}
 	return nil
 }
 
@@ -1409,14 +1421,15 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	s.Pid.Store(cmd.Process.Pid)
 	log.Infof("Sandbox started, PID: %d", cmd.Process.Pid)
 
-	// Tell the GPU scheduler where this sandbox lives on the host. It is the
-	// only party that can: the GPU driver reports what a sandbox used against
-	// the process that opened the device, and the sandbox itself runs in a
-	// process namespace where it is process 1 and cannot see that number. This
-	// is also the first moment it exists, which is why it is a connection of
-	// its own rather than part of the one donated above.
+	// Tell the GPU scheduler where this sandbox lives on the host and which
+	// GPUs it holds. It is the only party that can: the GPU driver reports what
+	// a sandbox used against the process that opened the device, and the
+	// sandbox itself runs in a process namespace where it is process 1 and
+	// cannot see that number, nor how the host names the devices it was given.
+	// The process ID is also only known now, which is why this is a connection
+	// of its own rather than part of the one donated above.
 	if conf.NVProxyGPUSchedulerSocket != "" {
-		announceToGPUScheduler(conf.NVProxyGPUSchedulerSocket, s.ID, cmd.Process.Pid)
+		announceToGPUScheduler(conf.NVProxyGPUSchedulerSocket, s.ID, cmd.Process.Pid, specutils.NvidiaDeviceNames(args.Spec, conf))
 	}
 
 	return nil
@@ -2649,22 +2662,28 @@ func (s *Sandbox) GetNetworkConfig() (*boot.CreateLinksAndRoutesArgs, error) {
 	return &networkArgs, nil
 }
 
-// announceToGPUScheduler reports a sandbox's host process ID to the GPU
-// scheduler, so that what the GPU driver reports can be attributed to it.
+// announceToGPUScheduler reports what the scheduler needs to know about a
+// sandbox and the sandbox cannot report itself: which host process it is, so
+// that what the GPU driver reports can be attributed to it, and which GPUs it
+// was given, so that it is scheduled against the sandboxes it actually competes
+// with.
 //
-// A failure here costs the scheduler its measurements for this sandbox, which
-// falls back to judging it by whether it submitted anything, so it is logged
+// A failure here costs the sandbox its measurements, which falls back to
+// judging it by whether it submitted anything, and its place on a particular
+// device, which falls back to competing with every sandbox whose device is
+// unknown. Both are smaller shares rather than larger ones, so this is logged
 // rather than being allowed to stop the sandbox from running.
-func announceToGPUScheduler(socket, id string, pid int) {
+func announceToGPUScheduler(socket, id string, pid int, devices []string) {
 	conn, err := net.DialTimeout("unix", socket, 2*time.Second)
 	if err != nil {
-		log.Warningf("Not reporting sandbox %q to the GPU scheduler; it will be scheduled without measuring what it uses: %v", id, err)
+		log.Warningf("Not reporting sandbox %q to the GPU scheduler; it will be scheduled without measuring what it uses and without knowing which GPU it is on: %v", id, err)
 		return
 	}
 	defer conn.Close()
 	if err := gpusched.NewConn(conn).SendHello(gpusched.Hello{
 		ID:           id,
 		PID:          pid,
+		Devices:      devices,
 		AnnounceOnly: true,
 	}); err != nil {
 		log.Warningf("Reporting sandbox %q to the GPU scheduler: %v", id, err)
