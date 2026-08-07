@@ -1016,6 +1016,7 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 			EnableTPUProxyPaths: specutils.TPUProxyEnabled(spec, conf),
 			RDMASysfs:           rdmaSysfs,
 			AMDGPUSysfs:         amdGPUSysfs,
+			AMDGPUMemoryLimit:   conf.AMDProxyGPUMemoryLimit,
 		}
 		if len(productName) > 0 {
 			sysData.ProductName = productName
@@ -1694,7 +1695,15 @@ func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *contai
 		// KFD's device major number is allocated dynamically, so the Sentry's
 		// does not match the host's. DRM render nodes need no such treatment:
 		// their major number is statically assigned and identical in both.
-		if info.amdproxyDevInfo != nil && major != info.amdproxyDevInfo.KFDDevMajor {
+		if info.amdproxyDevInfo == nil {
+			// amdproxy never registered, so nothing serves the major number
+			// this node is about to be created with and every open() of it
+			// will fail with ENXIO. Registration keys off the *root*
+			// container's spec, which under Kubernetes is the pause
+			// container and carries no devices, so a pod only gets here
+			// when --amdproxy was not passed to the sandbox.
+			log.Warningf("amdproxy: creating /dev/kfd with host major %d but amdproxy is not registered; opening it will fail with ENXIO. Is --amdproxy set for this sandbox?", major)
+		} else if major != info.amdproxyDevInfo.KFDDevMajor {
 			major = info.amdproxyDevInfo.KFDDevMajor
 			log.Infof("Switching /dev/kfd device major number from %d to %d", devSpec.Major, major)
 		}
