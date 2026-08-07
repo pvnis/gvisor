@@ -180,6 +180,16 @@ doc(
     permalink = "/blog/2026/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent/",
 )
 
+doc(
+    name = "gpu_slicing",
+    src = "2026-08-07-gpu-slicing.md",
+    authors = [
+        "dmd",
+    ],
+    layout = "post",
+    permalink = "/blog/2026/08/07/slicing-a-gpu-between-untrusted-containers/",
+)
+
 docs(
     name = "posts",
     deps = [

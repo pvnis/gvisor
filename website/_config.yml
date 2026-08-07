@@ -61,6 +61,9 @@ authors:
   igudger:
     name: Ian Gudger
     email: igudger@google.com
+  dmd:
+    name: Dan Mihai Dumitriu
+    email: dmd@pavonis.ch
   fvoznika:
     name: Fabricio Voznika
     email: fvoznika@google.com
