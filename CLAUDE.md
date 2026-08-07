@@ -25,21 +25,31 @@ below needs a kernel >= 6.13 and sens1 cannot be upgraded.
 | `gpu_id` | 13623 | 40786 |
 | `/dev/kfd` major | 235 | **511** |
 | docker | yes | **yes** |
+| kubernetes | no | **yes, with the AMD device plugin** |
 | `sudo` | passwordless | **passwordless (`(ALL) NOPASSWD: ALL`)** |
 
 Nothing should hardcode a `gpu_id` or a KFD major: the major is dynamically
 allocated and genuinely differs. `~/amdtest/gputest.sh` reads both from the host.
 
 **Building on sensnucbox2:** `sudo -n` is fully passwordless. The build system
-invokes docker, which requires sudo. Use the wrapper:
+invokes docker, which requires sudo. Use the wrapper at `~/amdtest/sudodocker`
+(it is just `exec sudo /usr/bin/docker "$@"`):
 ```
-make build TARGETS=//runsc:runsc DOCKER_CLI_PATH=/home/dmd/.claude/jobs/5fee7787/tmp/sudodocker
+make build TARGETS=//runsc:runsc DOCKER_CLI_PATH=/home/dmd/amdtest/sudodocker
 ```
-where `sudodocker` is `exec sudo /usr/bin/docker "$@"`. After building, copy the
-output to `~/amdtest/runsc` (look in `bazel-bin/runsc/runsc_/runsc`).
+After building, copy `bazel-bin/runsc/runsc_/runsc` to both `~/amdtest/runsc`
+and `/usr/local/bin/runsc` — Docker and Kubernetes both run the latter.
+
+**Check the hash, not bazel's summary.** Bazel reports "0 processes, 0 total
+actions" for a build whose output did change, and its `bazel-bin` symlink can
+point at a stale tree; `bazel clean` did *not* force a rebuild here. Confirm
+with `sha256sum` against the deployed binary, and confirm a specific change
+landed with `strings runsc | grep <a string you just added>`.
 
 `~/amdtest/` holds every reproducer, a `Makefile`, `gputest.sh`, and baselines
-measured on sens1. Read `~/amdtest/README.md` first.
+measured on sens1. Read `~/amdtest/README.md` first. `~/amdtest/k8s/` holds the
+Kubernetes pod specs and the shim config — read its README before touching
+anything Kubernetes-side.
 
 ## Done, and verified against hardware
 
@@ -57,9 +67,16 @@ measured on sens1. Read `~/amdtest/README.md` first.
 - `pkg/sentry/devices/amdproxy/amdconf` — leaf package for the `CUMask` type, so
   `runsc/config` does not import sentry code. Mirrors `nvconf`.
 - `pkg/amdsysfs` + `pkg/sentry/fsimpl/sys/amdgpu.go` — bounded host sysfs
-  snapshot and the synthetic KFD topology / PCI / DRM tree.
+  snapshot and the synthetic KFD topology / PCI / DRM tree. The topology
+  reports the *sandbox's quota* as the VRAM size, not the device's: a pod
+  holding 2 GiB reads 2147483648 where the host reads 14859169792.
 - runsc plumbing, including annotation overrides with narrow-only / lower-only
   validators, so a container cannot widen its own mask or raise its own limit.
+- **`vecadd` runs end to end** — a real HIP kernel, correct results, on all
+  three paths: `hiptest.sh`'s OCI bundle, Docker, and Kubernetes. Under
+  Kubernetes the AMD device plugin supplies the per-pod quota and the Sentry
+  enforces it: a pod asking for 4 × 512 MiB with `amd.com/cu-mask: "0x3f"`
+  gets exactly 2 GiB and 6 CUs, narrowed from the node's 0xfff ceiling.
 
 ## Two fixes that belong upstream, not here
 
@@ -76,28 +93,24 @@ proxied device. See `UPSTREAM-NOTES.md`. **Not yet sent.**
 
 ## Next
 
-1. **`vecadd` end-to-end under KVM.** KVM is confirmed fixed on kernel 7.0.0
-   (task #24 done). The USERPTR problem is fixed (`HSA_USERPTR_FOR_PAGED_MEM=0`
-   now baked into `hiptest.sh`). GET_TILE_CONFIG is now implemented.
-   **Build the new runsc** (below) and run:
-   ```
-   cd ~/amdtest && ./hiptest.sh build/vecadd
-   ```
-   The next failure after GET_TILE_CONFIG is probably CREATE_QUEUE (struct size
-   fixed: 88→96 bytes, kernel 7.0.0 added `SdmaEngineID` and `MetadataRingSize`)
-   or SVM (`AMDKFD_IOC_SVM` — variable-length, not in the allowlist yet; the
-   struct has a flexible array member `attrs[]` and needs a custom handler that
-   copies `24 + nattr*8` bytes rather than just the fixed struct). Watch the runsc log for the next
-   unsupported ioctl warning.
+1. **`AMDKFD_IOC_SVM` is still not in the allowlist.** `vecadd` does not need
+   it, but larger ROCm workloads will. It is variable-length: the struct has a
+   flexible array member `attrs[]`, so it needs a custom handler that copies
+   `24 + nattr*8` bytes rather than just the fixed struct. Run something bigger
+   than `vecadd` and watch the runsc log for the unsupported-ioctl warning.
 2. **`/dev/kfd` mappings are impossible on systrap** (task #18). Not a bug: KFD
    binds each mapping to the process holding the KFD context, and systrap maps
    from a stub process, so `mmap` returns `EINVAL`. Only the KFD mapping is
    process-bound; the render node's is not. KVM is now usable.
-3. **sysfs topology leaks the real VRAM size** (task #22). A container under a
-   quota still reads the device's full memory from the synthetic sysfs. An
-   information leak and an inconsistency — a runtime sizing its pools from sysfs
-   will over-commit. Rewrite the sizes to the sandbox's quota.
-4. Send the two upstream fixes and file the KVM issue.
+3. Send the two upstream fixes and file the KVM issue.
+4. Registration keys off the **root** container's spec (`registerFilesystems`
+   takes `&l.root`), so under Kubernetes — where the root is the pause
+   container and carries no devices — spec-based detection never fires and a
+   pod depends on `--amdproxy` being set for the whole sandbox. nvproxy has the
+   same shape, so this is upstream's design rather than a local bug, but it
+   means the flag is mandatory in Kubernetes and per-pod opt-in via the spec
+   alone does not work. Worth revisiting if pods without GPUs should not pay
+   for the looser seccomp filter.
 
 ## Context worth having
 
@@ -122,6 +135,33 @@ plausible reasoning about code that was never run. What settled it was a
 tracepoint and a probe that printed *which* pages worked. If a claim about this
 codebase matters, there is almost always a reproducer that can decide it, and
 `~/amdtest/` is where they live.
+
+**The Kubernetes config file is not runsc's config file.** `/etc/runsc/config.toml`
+— what containerd's `ConfigPath` points at — is decoded into
+`pkg/shim/v1/runsc.Options`. runsc flags belong under a `[runsc_config]` table;
+unknown top-level keys are dropped without a word. It had been written in
+runsc's own flat format, where only `root` happened to match a field, so every
+pod silently ran with no `--amdproxy`, no `--platform=kvm`, and no debug log.
+
+That failure mode is worth recognising by shape: `open("/dev/kfd")` returned
+**ENXIO**, and amdproxy logged *nothing*, because the workload's spec still
+lists `/dev/kfd` so gVisor still creates the node — with the host's major
+number and nothing registered behind it. The `open` dies in VFS dispatch,
+before any driver code runs. **Absence of a log line from the subsystem you
+suspect is evidence the subsystem was never reached, not evidence it is quiet.**
+`createDeviceFile` now warns in exactly this case. `~/amdtest/k8s/` holds the
+corrected config, the pod specs, and the diagnostic steps.
+
+Two smaller Kubernetes traps, both of which cost real time here:
+- `/var/log/pods/<pod>/gvisor.log` is the **user** log — compat events only.
+  Sentry warnings go to `/var/log/runsc/`, and if that directory has no recent
+  `*.boot.txt`, debug logging never reached runsc at all.
+- containerd's `k8s.io` image store is **separate from docker's**. A stale
+  `vecadd` there, invisible to `docker images`, was missing
+  `libamd_comgr.so.3` and reported "no ROCm-capable device is detected" —
+  which reads like a proxy failure but arrives *after* the sandbox has already
+  enumerated the GPU. `AMD_LOG_LEVEL=4` plus `LD_DEBUG=libs` in the pod env
+  named it in one run. Compare both stores before believing any K8s-only bug.
 
 **Conventions.** Hand-written Go needs gofmt's alignment; use bazel's gofmt
 binary rather than eyeballing struct tags. New ABI structs need `+marshal` and
