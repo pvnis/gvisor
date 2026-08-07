@@ -81,6 +81,14 @@ anything Kubernetes-side.
   Kubernetes the AMD device plugin supplies the per-pod quota and the Sentry
   enforces it: a pod asking for 4 × 512 MiB with `amd.com/cu-mask: "0x3f"`
   gets exactly 2 GiB and 6 CUs, narrowed from the node's 0xfff ceiling.
+- **Two containers sharing the GPU simultaneously, verified end to end.**
+  `vecadd-a` (cu-mask `0x03f`, CUs 0–5, 2 GiB) and `vecadd-b` (cu-mask
+  `0xfc0`, CUs 6–11, 2 GiB) ran at the same time under both Docker
+  (`hiptest.sh -f`) and Kubernetes (`~/amdtest/k8s/vecadd-{a,b}.yaml`); both
+  produced `RESULT CORRECT`. Concurrent `memprobe` confirmed each sandbox sees
+  exactly its own 2048 MiB ceiling regardless of what the other allocates.
+  The boot log shows each Sentry received its own disjoint flags from the
+  device plugin's per-pod annotations.
 
 ## Two fixes that belong upstream, not here
 
