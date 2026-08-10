@@ -995,6 +995,71 @@ func TestNVProxyMaxTimesliceDefault(t *testing.T) {
 	}
 }
 
+// TestNVProxyMinComputePreemption tests that the GPU preemption mode floor
+// defaults to unrestricted and that an unusable value is rejected at
+// configuration time rather than at sandbox start.
+func TestNVProxyMinComputePreemption(t *testing.T) {
+	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+	RegisterFlags(testFlags)
+	c, err := NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.NVProxyMinComputePreemption != "" {
+		t.Errorf("NVProxyMinComputePreemption = %q, want %q", c.NVProxyMinComputePreemption, "")
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() with the default = %v, want nil", err)
+	}
+	for _, mode := range []string{"wfi", "cta", "cilp"} {
+		c.NVProxyMinComputePreemption = mode
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate() with %q = %v, want nil", mode, err)
+		}
+	}
+	// "none" is the plausible wrong guess, and silently accepting it would
+	// leave the sandbox unrestricted while looking configured.
+	c.NVProxyMinComputePreemption = "none"
+	if err := c.Validate(); err == nil {
+		t.Errorf("Validate() with %q = nil, want an error", "none")
+	}
+}
+
+// TestNVProxyMinComputePreemptionOverride tests that a container may annotate
+// itself into being more preemptible than the runtime requires, but never less.
+//
+// Getting the direction wrong here would be worse than for the other GPU
+// limits: this one decides whether the GPU can reclaim the device from the
+// sandbox at all, so a container able to lower it could annotate away the
+// enforcement entirely.
+func TestNVProxyMinComputePreemptionOverride(t *testing.T) {
+	c := &Config{NVProxyMinComputePreemption: "cta"}
+	for _, test := range []struct {
+		value   string
+		wantErr bool
+	}{
+		{value: "cilp", wantErr: false}, // more preemptible, allowed
+		{value: "cta", wantErr: false},  // equal, allowed
+		{value: "wfi", wantErr: true},   // less preemptible, refused
+		{value: "", wantErr: true},      // empty means wfi, so also refused
+		{value: "bogus", wantErr: true},
+	} {
+		err := checkNVProxyMinComputePreemption(c, flagNVProxyMinComputePreempt, test.value)
+		if gotErr := err != nil; gotErr != test.wantErr {
+			t.Errorf("checkNVProxyMinComputePreemption(runtime=cta, %q) error = %v, wantErr %t", test.value, err, test.wantErr)
+		}
+	}
+
+	// With no requirement on the runtime, anything a container asks for is a
+	// restriction on itself and is allowed.
+	unset := &Config{}
+	for _, value := range []string{"wfi", "cta", "cilp"} {
+		if err := checkNVProxyMinComputePreemption(unset, flagNVProxyMinComputePreempt, value); err != nil {
+			t.Errorf("checkNVProxyMinComputePreemption(runtime unset, %q) = %v, want nil", value, err)
+		}
+	}
+}
+
 // TestNVProxyGPUComputePercentOverride tests that the GPU compute annotation
 // may lower the runtime's share but not raise it.
 func TestNVProxyGPUComputePercentOverride(t *testing.T) {

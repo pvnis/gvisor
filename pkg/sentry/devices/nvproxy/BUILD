@@ -109,6 +109,7 @@ go_test(
         "computegate_test.go",
         "memquota_test.go",
         "nvproxy_test.go",
+        "preemption_test.go",
     ],
     library = ":nvproxy",
     deps = [

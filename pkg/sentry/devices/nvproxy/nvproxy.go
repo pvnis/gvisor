@@ -62,6 +62,11 @@ type Options struct {
 	// that the sandbox may request. Zero means no limit.
 	MaxTimesliceUs uint64
 
+	// MinComputePreemption is the least preemptible GPU compute
+	// context-switch mode the sandbox may select. WFI means no limit, since
+	// WFI is already the least preemptible mode there is.
+	MinComputePreemption nvconf.ComputePreemption
+
 	// ComputePercent is the percentage of wall-clock time during which the
 	// sandbox may submit work to the GPU. Zero means no limit.
 	ComputePercent uint64
@@ -115,6 +120,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	}
 	nvp.memAcct.gpuLimit = opts.GPUMemoryLimit
 	nvp.maxTimesliceUs = opts.MaxTimesliceUs
+	nvp.minComputePreemption = opts.MinComputePreemption
 	scheduled := opts.SchedulerFD >= 0
 	nvp.computeGate.init(opts.ComputePercent, scheduled)
 	if scheduled {
@@ -127,6 +133,9 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	}
 	if opts.MaxTimesliceUs != 0 {
 		log.Infof("nvproxy: GPU scheduler timeslice limited to %d us", opts.MaxTimesliceUs)
+	}
+	if opts.MinComputePreemption != nvconf.ComputePreemptionWFI {
+		log.Infof("nvproxy: GPU compute preemption mode required to be at least %s", opts.MinComputePreemption)
 	}
 	if opts.GPUMemoryLimit != 0 {
 		log.Infof("nvproxy: GPU memory limited to %d bytes", opts.GPUMemoryLimit)
@@ -252,6 +261,7 @@ type nvproxy struct {
 	version                nvconf.DriverVersion
 	capsEnabled            nvconf.DriverCaps
 	maxTimesliceUs         uint64
+	minComputePreemption   nvconf.ComputePreemption
 	computeGate            computeGate
 	useDevGofer            bool
 	procDriverNvidiaParams string

@@ -10,6 +10,7 @@ go_library(
         "caps.go",
         "hostsettings.go",
         "nvconf.go",
+        "preemption.go",
         "version.go",
     ],
     visibility = [

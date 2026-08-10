@@ -1699,12 +1699,17 @@ func nvproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem, 
 	if err != nil {
 		return fmt.Errorf("NVIDIA driver capabilities: %w", err)
 	}
+	minComputePreemption, err := nvconf.ParseComputePreemption(info.conf.NVProxyMinComputePreemption)
+	if err != nil {
+		return fmt.Errorf("NVIDIA compute preemption mode: %w", err)
+	}
 	devInfo, err := nvproxy.Register(vfsObj, &nvproxy.Options{
 		DriverVersion:          nvidiaDriverVersion,
 		DriverCaps:             driverCaps,
 		AllowUnsupportedDriver: info.conf.NVProxyAllowUnsupportedDriver,
 		GPUMemoryLimit:         info.conf.NVProxyGPUMemoryLimit,
 		MaxTimesliceUs:         info.conf.NVProxyMaxTimesliceUs,
+		MinComputePreemption:   minComputePreemption,
 		ComputePercent:         info.conf.NVProxyGPUComputePercent,
 		SchedulerFD:            info.gpuSchedulerFD,
 		SchedulerWeight:        info.conf.NVProxyGPUWeight,

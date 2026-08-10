@@ -382,6 +382,11 @@ type Config struct {
 	// means no limit.
 	NVProxyMaxTimesliceUs uint64 `flag:"nvproxy-max-timeslice-us"`
 
+	// NVProxyMinComputePreemption is the least preemptible GPU compute
+	// context-switch mode the sandbox may select: "wfi", "cta" or "cilp".
+	// Empty, like "wfi", means no limit.
+	NVProxyMinComputePreemption string `flag:"nvproxy-min-compute-preemption"`
+
 	// NVProxyGPUComputePercent is the percentage of wall-clock time during
 	// which the sandbox may submit work to the GPU. Zero means no limit.
 	NVProxyGPUComputePercent uint64 `flag:"nvproxy-gpu-compute-percent"`
@@ -509,6 +514,9 @@ func (c *Config) Validate() error {
 	}
 	if c.NumNetworkChannels <= 0 {
 		return fmt.Errorf("num_network_channels must be > 0, got: %d", c.NumNetworkChannels)
+	}
+	if _, err := nvconf.ParseComputePreemption(c.NVProxyMinComputePreemption); err != nil {
+		return fmt.Errorf("nvproxy-min-compute-preemption: %w", err)
 	}
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")

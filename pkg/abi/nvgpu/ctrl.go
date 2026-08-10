@@ -711,6 +711,43 @@ const (
 	NV2080_CTRL_CMD_GSP_GET_FEATURES = 0x20803601
 )
 
+// Compute context-switch preemption modes, from
+// src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h.
+//
+// The values are ordered by increasing preemptibility, which is what makes a
+// "minimum" meaningful: WFI lets the running work run to completion, CTA
+// preempts at thread block boundaries, and CILP preempts within an
+// instruction. Which one is in effect decides what
+// NVA06C_CTRL_CMD_PREEMPT actually costs.
+const (
+	NV2080_CTRL_SET_CTXSW_PREEMPTION_MODE_COMPUTE_WFI  = 0x00000000
+	NV2080_CTRL_SET_CTXSW_PREEMPTION_MODE_COMPUTE_CTA  = 0x00000001
+	NV2080_CTRL_SET_CTXSW_PREEMPTION_MODE_COMPUTE_CILP = 0x00000002
+)
+
+// Bits in NV2080_CTRL_GR_SET_CTXSW_PREEMPTION_MODE_PARAMS.Flags that select
+// which of the two mode fields the call actually applies. Confusingly, the bit
+// named CILP is what enables the *compute* mode field, whatever value that
+// field holds.
+const (
+	NV2080_CTRL_GR_SET_CTXSW_PREEMPTION_MODE_FLAGS_CILP_SET = 1 << 0
+	NV2080_CTRL_GR_SET_CTXSW_PREEMPTION_MODE_FLAGS_GFXP_SET = 1 << 1
+)
+
+// NV2080_CTRL_GR_SET_CTXSW_PREEMPTION_MODE_PARAMS is the parameter type for
+// NV2080_CTRL_CMD_GR_SET_CTXSW_PREEMPTION_MODE, from
+// src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gr.h.
+//
+// +marshal
+type NV2080_CTRL_GR_SET_CTXSW_PREEMPTION_MODE_PARAMS struct {
+	_               structs.HostLayout
+	Flags           uint32
+	HChannel        Handle
+	GfxpPreemptMode uint32
+	CilpPreemptMode uint32
+	GRRouteInfo     NV0080_CTRL_GR_ROUTE_INFO
+}
+
 // +marshal
 type NV2080_CTRL_GR_GET_INFO_PARAMS struct {
 	_ structs.HostLayout

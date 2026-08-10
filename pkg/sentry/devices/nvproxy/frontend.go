@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -1117,6 +1118,60 @@ func ctrlSetTimeslice(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETE
 		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INSUFFICIENT_PERMISSIONS)
 	}
 	return rmControlSimple(fi, ioctlParams)
+}
+
+// ctrlSetCtxswPreemptionMode handles
+// NV2080_CTRL_CMD_GR_SET_CTXSW_PREEMPTION_MODE.
+//
+// The context-switch preemption mode decides what happens when the GPU is told
+// to switch a channel group off an engine. Under WFI the work already running
+// runs to completion; under CTA it stops at a thread block boundary; under CILP
+// it stops within an instruction. So this setting, and not the preempt command
+// itself, is what determines whether a sandbox can be removed from the GPU
+// promptly or only whenever it happens to finish.
+//
+// The driver marks this control NON_PRIVILEGED, which means a sandbox may set
+// it on its own channels. An adversarial sandbox therefore selects WFI and
+// makes itself the hardest thing on the machine to evict -- and because
+// submission never enters the Sentry, this ioctl is the only place that can be
+// refused. Same shape as the timeslice above: a knob that only affects the
+// caller's standing relative to everyone else sharing the GPU.
+func ctrlSetCtxswPreemptionMode(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
+	min := fi.fd.dev.nvp.minComputePreemption
+	if min == nvconf.ComputePreemptionWFI {
+		return rmControlSimple(fi, ioctlParams)
+	}
+	var ctrlParams nvgpu.NV2080_CTRL_GR_SET_CTXSW_PREEMPTION_MODE_PARAMS
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+	if mode, deny := computePreemptionDenied(ctrlParams.Flags, ctrlParams.CilpPreemptMode, min); deny {
+		fi.ctx.Warningf("nvproxy: denied request to set GPU compute preemption mode %s, which is less preemptible than the required minimum of %s",
+			mode, min)
+		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INSUFFICIENT_PERMISSIONS)
+	}
+	return rmControlSimple(fi, ioctlParams)
+}
+
+// computePreemptionDenied reports whether a
+// NV2080_CTRL_CMD_GR_SET_CTXSW_PREEMPTION_MODE request carrying flags and
+// cilpPreemptMode must be refused, given that the sandbox may select nothing
+// less preemptible than min. It also returns the requested mode, for the log.
+//
+// Split out from the handler above only so that the policy can be tested
+// without standing up an ioctl.
+func computePreemptionDenied(flags, cilpPreemptMode uint32, min nvconf.ComputePreemption) (nvconf.ComputePreemption, bool) {
+	mode := nvconf.ComputePreemption(cilpPreemptMode)
+	// The compute mode field is applied only if its flag bit is set. Without
+	// the bit the value is ignored by the driver, so the request says nothing
+	// about preemptibility and there is nothing to refuse.
+	if flags&nvgpu.NV2080_CTRL_GR_SET_CTXSW_PREEMPTION_MODE_FLAGS_CILP_SET == 0 {
+		return mode, false
+	}
+	return mode, mode < min
 }
 
 func ctrlHasFrontendFD[Params any, PtrParams hasFrontendFDPtr[Params]](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {

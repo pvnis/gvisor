@@ -25,32 +25,34 @@ import (
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/runsc/flag"
 )
 
 // Reused flag names.
 const (
-	flagDebug                   = "debug"
-	flagDebugCommand            = "debug-command"
-	flagDebugToUserLog          = "debug-to-user-log"
-	flagStrace                  = "strace"
-	flagStraceSyscalls          = "strace-syscalls"
-	flagStraceLogSize           = "strace-log-size"
-	flagHostUDS                 = "host-uds"
-	flagNetDisconnectOK         = "net-disconnect-ok"
-	flagReproduceNFTables       = "reproduce-nftables"
-	flagOCISeccomp              = "oci-seccomp"
-	flagOverlay2                = "overlay2"
-	flagAllowFlagOverride       = "allow-flag-override"
-	flagPauseExternalNetworking = "pause-external-networking"
-	flagAllowConnectedOnSave    = "allow-connected-on-save"
-	flagQDisc                   = "qdisc"
-	flagQDiscTBFRate            = "qdisc-tbf-rate"
-	flagQDiscTBFBurst           = "qdisc-tbf-burst"
-	flagMountCgroupV2           = "mount-cgroup-v2"
-	flagNVProxyGPUComputePct    = "nvproxy-gpu-compute-percent"
-	flagNVProxyGPUWeight        = "nvproxy-gpu-weight"
-	flagNVProxyGPUMemLimit      = "nvproxy-gpu-memory-limit"
+	flagDebug                    = "debug"
+	flagDebugCommand             = "debug-command"
+	flagDebugToUserLog           = "debug-to-user-log"
+	flagStrace                   = "strace"
+	flagStraceSyscalls           = "strace-syscalls"
+	flagStraceLogSize            = "strace-log-size"
+	flagHostUDS                  = "host-uds"
+	flagNetDisconnectOK          = "net-disconnect-ok"
+	flagReproduceNFTables        = "reproduce-nftables"
+	flagOCISeccomp               = "oci-seccomp"
+	flagOverlay2                 = "overlay2"
+	flagAllowFlagOverride        = "allow-flag-override"
+	flagPauseExternalNetworking  = "pause-external-networking"
+	flagAllowConnectedOnSave     = "allow-connected-on-save"
+	flagQDisc                    = "qdisc"
+	flagQDiscTBFRate             = "qdisc-tbf-rate"
+	flagQDiscTBFBurst            = "qdisc-tbf-burst"
+	flagMountCgroupV2            = "mount-cgroup-v2"
+	flagNVProxyGPUComputePct     = "nvproxy-gpu-compute-percent"
+	flagNVProxyGPUWeight         = "nvproxy-gpu-weight"
+	flagNVProxyGPUMemLimit       = "nvproxy-gpu-memory-limit"
+	flagNVProxyMinComputePreempt = "nvproxy-min-compute-preemption"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
 	defaultQDiscTBFRate  = uint64(0)
@@ -189,6 +191,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Uint64(flagNVProxyGPUWeight, 0, "this sandbox's share of a GPU relative to others scheduled alongside it. Only meaningful with --nvproxy-gpu-scheduler-socket. 0 is treated as 1.")
 	flagSet.Uint64(flagNVProxyGPUComputePct, 0, "percentage of wall-clock time during which the sandbox may submit work to the GPU. Submission is held in the Sentry outside that share, so the limit cannot be bypassed from within the sandbox. 0 means no limit.")
 	flagSet.Uint64("nvproxy-max-timeslice-us", 0, "longest GPU scheduler timeslice, in microseconds, that a sandbox may request for its channel groups. A longer timeslice increases the sandbox's share of the GPU relative to others sharing it. 0 means no limit.")
+	flagSet.String(flagNVProxyMinComputePreempt, "", "least preemptible GPU compute context-switch mode a sandbox may select: \"wfi\", \"cta\" or \"cilp\". Under wfi the GPU cannot take work away from a sandbox until that work finishes on its own, so a sandbox that selects it resists being descheduled. Empty means no limit.")
 	flagSet.Uint64(flagNVProxyGPUMemLimit, 0, "maximum number of bytes of GPU memory that the sandbox may allocate, counting device memory and address space reserved for CUDA unified memory. 0 means no limit.")
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("rdmaproxy", false, "WIP: enable RDMA support for containers with /dev/infiniband/uverbs* devices.")
@@ -211,26 +214,50 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 var overrideAllowlist = map[string]struct {
 	check func(c *Config, name string, value string) error
 }{
-	flagDebug:                   {},
-	flagDebugCommand:            {},
-	flagDebugToUserLog:          {},
-	flagStrace:                  {},
-	flagStraceSyscalls:          {},
-	flagStraceLogSize:           {},
-	flagHostUDS:                 {},
-	flagNetDisconnectOK:         {},
-	flagReproduceNFTables:       {},
-	flagOverlay2:                {check: checkOverlay2},
-	flagOCISeccomp:              {check: checkOciSeccomp},
-	flagPauseExternalNetworking: {},
-	flagAllowConnectedOnSave:    {},
-	flagQDisc:                   {check: checkQDisc},
-	flagQDiscTBFRate:            {check: checkQDiscTBFRate},
-	flagQDiscTBFBurst:           {check: checkQDiscTBFBurst},
-	flagMountCgroupV2:           {},
-	flagNVProxyGPUMemLimit:      {check: checkNVProxyGPUMemoryLimit},
-	flagNVProxyGPUComputePct:    {check: checkNVProxyGPUComputePercent},
-	flagNVProxyGPUWeight:        {check: checkNVProxyGPUWeight},
+	flagDebug:                    {},
+	flagDebugCommand:             {},
+	flagDebugToUserLog:           {},
+	flagStrace:                   {},
+	flagStraceSyscalls:           {},
+	flagStraceLogSize:            {},
+	flagHostUDS:                  {},
+	flagNetDisconnectOK:          {},
+	flagReproduceNFTables:        {},
+	flagOverlay2:                 {check: checkOverlay2},
+	flagOCISeccomp:               {check: checkOciSeccomp},
+	flagPauseExternalNetworking:  {},
+	flagAllowConnectedOnSave:     {},
+	flagQDisc:                    {check: checkQDisc},
+	flagQDiscTBFRate:             {check: checkQDiscTBFRate},
+	flagQDiscTBFBurst:            {check: checkQDiscTBFBurst},
+	flagMountCgroupV2:            {},
+	flagNVProxyGPUMemLimit:       {check: checkNVProxyGPUMemoryLimit},
+	flagNVProxyGPUComputePct:     {check: checkNVProxyGPUComputePercent},
+	flagNVProxyGPUWeight:         {check: checkNVProxyGPUWeight},
+	flagNVProxyMinComputePreempt: {check: checkNVProxyMinComputePreemption},
+}
+
+// checkNVProxyMinComputePreemption ensures that a container may make itself
+// more preemptible than the runtime requires, but never less.
+//
+// The direction matters more here than for the other GPU limits. This one is
+// not a share of anything: it decides whether the GPU can take work away from
+// the sandbox at all. A sandbox permitted to lower it back to WFI could
+// annotate away the very property that lets the host reclaim the device, so
+// only tightening is allowed.
+func checkNVProxyMinComputePreemption(c *Config, name string, value string) error {
+	want, err := nvconf.ParseComputePreemption(value)
+	if err != nil {
+		return fmt.Errorf("invalid %s annotation: %w", name, err)
+	}
+	runtime, err := nvconf.ParseComputePreemption(c.NVProxyMinComputePreemption)
+	if err != nil {
+		return fmt.Errorf("%s configured on the runtime: %w", name, err)
+	}
+	if want < runtime {
+		return fmt.Errorf("%s=%q is less preemptible than the %q required by the runtime; annotations may only raise it", name, value, runtime)
+	}
+	return nil
 }
 
 // checkNVProxyGPUWeight ensures that a container may reduce its share of a GPU
