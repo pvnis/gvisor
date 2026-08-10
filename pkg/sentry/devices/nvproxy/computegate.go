@@ -118,15 +118,34 @@ type computeGate struct {
 	// kernels, the GPU is waiting for work to finish rather than taking the
 	// engine away, and a long enough kernel still overruns.
 	//
-	// Measured against 9ms kernels it is bimodal, and stubbornly so: five runs
-	// of the same configuration gave mean preempts of 295us, 4.06ms, 294us,
-	// 6.47ms and 287us. Something puts a sandbox into one regime or the other
-	// for its whole life. Which is why this is instrumentation rather than a
-	// one-off measurement -- the distribution matters more than any single
-	// number, and a single number is misleading.
+	// Measured against 9ms kernels, the bulk is always fast: 92-100% of
+	// preempts complete within 1ms whatever else happens. What varies between
+	// otherwise identical runs is whether a tail exists at all. Seven of
+	// sixteen runs had one, and in those 7-11% of preempts took over 10ms;
+	// in the rest not a single preempt did.
+	//
+	// Within a run the slow ones are tightly clustered -- 47.3/47.9/48.4ms in
+	// one, 26.5/26.6/27.6ms in another -- at a value that differs per run but
+	// lands near three to five times the kernel duration, and they are spread
+	// across all of the sandbox's channel groups rather than concentrated in
+	// whichever one carries the compute. That is the shape of waiting for a
+	// few queued kernels to drain, not of a fixed timeout or a bad channel.
+	//
+	// Which is why this is instrumentation rather than a one-off measurement:
+	// any single number is misleading, and the mean most of all.
 	preemptCount   atomicbitops.Uint64
 	preemptTotalNs atomicbitops.Uint64
 	preemptMaxNs   atomicbitops.Uint64
+
+	// preemptUnder1ms, preemptUnder10ms and preemptOver10ms bucket those
+	// durations.
+	//
+	// A mean on its own cannot distinguish "every preempt is slow" from "most
+	// are fast and a few are terrible", and those call for opposite responses:
+	// the first is the mechanism being wrong, the second is a tail to chase.
+	preemptUnder1ms  atomicbitops.Uint64
+	preemptUnder10ms atomicbitops.Uint64
+	preemptOver10ms  atomicbitops.Uint64
 
 	// preemptOverranPeriod records that a preempt has taken longer than a whole
 	// period, which is the point at which preempting synchronously starts
@@ -446,7 +465,7 @@ func (g *computeGate) preemptAll() {
 		if !g.notedPreempt.Swap(true) {
 			log.Infof("nvproxy: preempted GPU channel group %v at the end of the sandbox's window, taking %v", hObject, took)
 		}
-		g.recordPreempt(took)
+		g.recordPreempt(hObject, took)
 	}
 }
 
@@ -456,7 +475,7 @@ const preemptReportInterval = 256
 
 // recordPreempt accumulates how long a preempt took and periodically reports
 // the distribution so far.
-func (g *computeGate) recordPreempt(took time.Duration) {
+func (g *computeGate) recordPreempt(hObject nvgpu.Handle, took time.Duration) {
 	ns := uint64(took.Nanoseconds())
 	if took >= g.currentGrant().Period && !g.preemptOverranPeriod.Swap(true) {
 		log.Warningf("nvproxy: a GPU preempt took %v, longer than the whole %v period; "+
@@ -470,9 +489,24 @@ func (g *computeGate) recordPreempt(took time.Duration) {
 		}
 	}
 	total := g.preemptTotalNs.Add(ns)
+	switch {
+	case took < time.Millisecond:
+		g.preemptUnder1ms.Add(1)
+	case took < 10*time.Millisecond:
+		g.preemptUnder10ms.Add(1)
+	default:
+		// Name the channel group for the first few. Whether the slow preempts
+		// are spread across a sandbox's channel groups or concentrated in one
+		// decides where to look next: the GPU's state, or whichever group is
+		// actually carrying the compute.
+		if n := g.preemptOver10ms.Add(1); n <= 8 {
+			log.Infof("nvproxy: slow GPU preempt of channel group %v took %v", hObject, took)
+		}
+	}
 	if n := g.preemptCount.Add(1); n%preemptReportInterval == 0 {
-		log.Infof("nvproxy: %d GPU preempts, mean %v, max %v",
-			n, time.Duration(total/n), time.Duration(g.preemptMaxNs.Load()))
+		log.Infof("nvproxy: %d GPU preempts, mean %v, max %v; %d under 1ms, %d under 10ms, %d over",
+			n, time.Duration(total/n), time.Duration(g.preemptMaxNs.Load()),
+			g.preemptUnder1ms.Load(), g.preemptUnder10ms.Load(), g.preemptOver10ms.Load())
 	}
 }
 
