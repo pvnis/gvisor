@@ -15,17 +15,19 @@ Work happens directly in the working directory, not a worktree.
 
 ## Where the work runs
 
-It moved from **sens1** to **sensnucbox2** on 2026-08-06, because the KVM bug
-below needs a kernel >= 6.13 and sens1 cannot be upgraded.
+Both hosts now run it. sens1 was rebooted into **kernel 7.0.0-28** on
+2026-08-10, so the KVM bug below no longer applies there either. It has k3s +
+vCluster; sensnucbox2 has the APU.
 
 | | sens1 | sensnucbox2 |
 | --- | --- | --- |
-| OS / kernel | Ubuntu 24.04.4, 6.8.0-134-lowlatency | Ubuntu 26.04, 7.0.0-generic |
-| GPU | discrete, 54 CUs, 12032 MiB | **Phoenix1 APU**, 12 CUs, ~14170 MiB |
-| `gpu_id` | 13623 | 40786 |
-| `/dev/kfd` major | 235 | **511** |
+| OS / kernel | Ubuntu 24.04.4, **7.0.0-28-generic** | Ubuntu 26.04, 7.0.0-generic |
+| GPU | **Navi 32 discrete, gfx1101, 54 CUs, 12272 MiB** | **Phoenix1 APU**, gfx1103, 12 CUs, ~14170 MiB |
+| ROCm | **7.2** | 7.1 |
+| `gpu_id` | **63860** (changes on reboot) | 40786 |
+| `/dev/kfd` major | **234** (dynamic) | **511** (dynamic) |
 | docker | yes | **yes** |
-| kubernetes | no | **yes, with the AMD device plugin** |
+| kubernetes | **k3s + vCluster + AMD device plugin** | **yes, with the AMD device plugin** |
 | `sudo` | passwordless | **passwordless (`(ALL) NOPASSWD: ALL`)** |
 
 Nothing should hardcode a `gpu_id` or a KFD major: the major is dynamically
@@ -127,6 +129,25 @@ proxied device. See `UPSTREAM-NOTES.md`. **Not yet sent.**
    means the flag is mandatory in Kubernetes and per-pod opt-in via the spec
    alone does not work. Worth revisiting if pods without GPUs should not pay
    for the looser seccomp filter.
+
+## Two traps found on sens1 that the APU host never hit
+
+**containerd does not pass pod annotations to the sandbox spec.** The CRI
+plugin copies only its own `io.kubernetes.cri.*` annotations. Without
+`pod_annotations = ["dev.gvisor.*"]` on the runtime handler, every
+`dev.gvisor.flag.amdproxy-*` annotation is dropped and each pod silently runs
+with the **node-wide ceiling** from `/etc/runsc/config.toml` rather than its
+own quota. Measured: a pod asking for 4 x 512 MiB allocated 12032 MiB. It is
+silent — the flags simply arrive at their configured defaults. Adding the glob
+fixes it; the same pod then stops at exactly 2048 MiB. See
+`~/amdtest/k8s/` for the working config. This is worth checking on
+sensnucbox2, where the quota may never have been per-pod.
+
+**The device plugin does not survive a kubelet restart.** It registers once and
+has no re-register loop, so after `systemctl restart k3s` the pod stays
+`Running` while the node advertises `amd.com/gpu-vram-mib: 0` and every GPU pod
+sits `Pending` with `Insufficient amd.com/gpu-vram-mib`. Delete the plugin pod
+to re-register.
 
 ## Context worth having
 
