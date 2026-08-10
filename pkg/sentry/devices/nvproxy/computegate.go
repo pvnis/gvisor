@@ -107,6 +107,32 @@ type computeGate struct {
 	// notedPreempt records that a successful preempt has already been reported,
 	// for the same reason in the other direction.
 	notedPreempt atomicbitops.Bool
+
+	// preemptCount, preemptTotalNs and preemptMaxNs summarize how long the
+	// preempts have taken.
+	//
+	// Because the control is issued with bWait set, this is the time for the
+	// GPU to actually switch the channel group off its engine, not merely to
+	// accept the request. It is the number that says whether a sandbox is
+	// really bounded by its window: if it tracks the length of the sandbox's
+	// kernels, the GPU is waiting for work to finish rather than taking the
+	// engine away, and a long enough kernel still overruns.
+	//
+	// Measured against 9ms kernels it is bimodal, and stubbornly so: five runs
+	// of the same configuration gave mean preempts of 295us, 4.06ms, 294us,
+	// 6.47ms and 287us. Something puts a sandbox into one regime or the other
+	// for its whole life. Which is why this is instrumentation rather than a
+	// one-off measurement -- the distribution matters more than any single
+	// number, and a single number is misleading.
+	preemptCount   atomicbitops.Uint64
+	preemptTotalNs atomicbitops.Uint64
+	preemptMaxNs   atomicbitops.Uint64
+
+	// preemptOverranPeriod records that a preempt has taken longer than a whole
+	// period, which is the point at which preempting synchronously starts
+	// costing revocations. It exists to catch that happening rather than to
+	// prevent it.
+	preemptOverranPeriod atomicbitops.Bool
 }
 
 // init prepares g to gate submission, permitting it for the given share of each
@@ -352,6 +378,21 @@ func (g *computeGate) run() {
 		// new submissions, so that work evicted by the preempt cannot simply be
 		// replaced in the gap between the two.
 		g.revoke()
+		// Preempt synchronously, immediately after revoking.
+		//
+		// Doing this on a separate goroutine was tried and reverted. It keeps
+		// the loop's timing independent of the GPU, but it lands the preempt at
+		// an arbitrary later moment, which may be inside the sandbox's *next*
+		// window -- evicting work the sandbox is entitled to run. Preempting at
+		// the instant the window closes is the whole point, so the correctness
+		// argument decides it. (Latency was measured both ways and does not:
+		// preempt duration varies enough run to run that the two are
+		// indistinguishable on the numbers.)
+		//
+		// The cost of staying synchronous is that a preempt outlasting a whole
+		// period would cost one revocation. The longest seen is 66ms against a
+		// 100ms period, so that does not happen today; preemptOverranPeriod
+		// reports it if it ever starts to.
 		g.preemptAll()
 	}
 }
@@ -389,7 +430,10 @@ func (g *computeGate) preemptAll() {
 	}
 	g.mu.Unlock()
 	for hObject, tsg := range tsgs {
-		if err := preemptChannelGroup(tsg.fd, tsg.hClient, hObject); err != nil {
+		start := time.Now()
+		err := preemptChannelGroup(tsg.fd, tsg.hClient, hObject)
+		took := time.Since(start)
+		if err != nil {
 			if !g.warnedPreempt.Swap(true) {
 				log.Warningf("nvproxy: failed to preempt GPU channel group %v: %v; "+
 					"GPU time is bounded by revoking submission alone, so work already running may overrun the sandbox's window", hObject, err)
@@ -400,8 +444,35 @@ func (g *computeGate) preemptAll() {
 		// from one that never ran because the sandbox had no channel groups to
 		// preempt -- both are silent, and only one of them is enforcement.
 		if !g.notedPreempt.Swap(true) {
-			log.Infof("nvproxy: preempted GPU channel group %v at the end of the sandbox's window", hObject)
+			log.Infof("nvproxy: preempted GPU channel group %v at the end of the sandbox's window, taking %v", hObject, took)
 		}
+		g.recordPreempt(took)
+	}
+}
+
+// preemptReportInterval is how many preempts separate the summaries below. At
+// one period each, this is a line every few tens of seconds.
+const preemptReportInterval = 256
+
+// recordPreempt accumulates how long a preempt took and periodically reports
+// the distribution so far.
+func (g *computeGate) recordPreempt(took time.Duration) {
+	ns := uint64(took.Nanoseconds())
+	if took >= g.currentGrant().Period && !g.preemptOverranPeriod.Swap(true) {
+		log.Warningf("nvproxy: a GPU preempt took %v, longer than the whole %v period; "+
+			"the sandbox's mappings were not revoked for that period and it may have submitted work outside its window",
+			took, g.currentGrant().Period)
+	}
+	for {
+		max := g.preemptMaxNs.Load()
+		if ns <= max || g.preemptMaxNs.CompareAndSwap(max, ns) {
+			break
+		}
+	}
+	total := g.preemptTotalNs.Add(ns)
+	if n := g.preemptCount.Add(1); n%preemptReportInterval == 0 {
+		log.Infof("nvproxy: %d GPU preempts, mean %v, max %v",
+			n, time.Duration(total/n), time.Duration(g.preemptMaxNs.Load()))
 	}
 }
 
