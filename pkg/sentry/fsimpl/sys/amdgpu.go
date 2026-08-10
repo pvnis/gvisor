@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/amdsysfs"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
@@ -55,6 +56,11 @@ type amdGPUSysfsDirs struct {
 	classDRM kernfs.Inode
 	// devChar holds the /sys/dev/char symlinks naming the render nodes.
 	devChar map[string]kernfs.Inode
+	// node is the /sys/devices/system/node subtree. ROCr reads this to
+	// locate the nearest CPU agent (HSA_AMD_AGENT_INFO_NEAREST_CPU) and
+	// to initialise several other GPU agent attributes that depend on
+	// having resolved a CPU neighbourhood.
+	node kernfs.Inode
 }
 
 // newAMDGPUSysfs builds the KFD sysfs subtrees from a host snapshot.
@@ -85,6 +91,19 @@ func (fs *filesystem) newAMDGPUSysfs(ctx context.Context, creds *auth.Credential
 		dirs.module = fs.newSnapshotDir(ctx, creds, snap.Module)
 	}
 	fs.newAMDGPUPCI(ctx, creds, snap, dirs)
+	// ROCr reads /sys/devices/system/node to resolve the nearest CPU agent.
+	// Without it, HSA_AMD_AGENT_INFO_NEAREST_CPU and several dependent
+	// attributes (SCRATCH_LIMIT_MAX, CLOCK_COUNTERS, ...) return
+	// HSA_STATUS_ERROR_INVALID_ARGUMENT, and hipGetDeviceCount fails.
+	k := kernel.KernelFromContext(ctx)
+	cores := uint(k.ApplicationCores())
+	dirs.node = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+		"node0": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"cpumap":   fs.newStaticFile(ctx, creds, defaultSysMode, fullCPUMask(cores)+"\n"),
+			"cpulist":  fs.newStaticFile(ctx, creds, defaultSysMode, cpuListString(cores)),
+			"distance": fs.newStaticFile(ctx, creds, defaultSysMode, "10\n"),
+		}),
+	})
 	return dirs
 }
 

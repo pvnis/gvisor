@@ -195,6 +195,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			}
 			kernelSub["iommu_groups"] = fs.newDir(ctx, creds, defaultSysDirMode, iommuGroups)
 		}
+		var amdNUMANode kernfs.Inode
 		if amdDirs := fs.newAMDGPUSysfs(ctx, creds, idata.AMDGPUSysfs, idata.AMDGPUMemoryLimit); amdDirs != nil {
 			virtualSub["kfd"] = amdDirs.kfd
 			classSub["kfd"] = amdDirs.class
@@ -217,6 +218,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			for name, sub := range amdDirs.devChar {
 				devCharSub[name] = sub
 			}
+			amdNUMANode = amdDirs.node
 		}
 		if idata.RDMASysfs != nil {
 			rdmaDirs, err := fs.newRDMASysfs(ctx, creds, idata.RDMASysfs)
@@ -227,7 +229,6 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 				// The TPU-proxy devices and the RDMA ConnectX devices come from
 				// two different accelerator stacks and aren't exposed to the
 				// same sandbox today, so a shared /sys/devices root complex
-				// shouldn't occur. Deep-merging two sealed kernfs subtrees
 				// isn't supported, so reject an overlap.
 				if _, ok := devicesSub[name]; ok {
 					return nil, nil, fmt.Errorf("TPU proxy and RDMA sysfs both populate /sys/devices/%s", name)
@@ -243,6 +244,11 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			if rdmaDirs.node != nil {
 				systemSub["node"] = rdmaDirs.node
 			}
+		}
+		// If RDMA didn't supply a NUMA node subtree but AMD GPU did, use the
+		// AMD one. RDMA takes priority because it may have richer NUMA data.
+		if _, hasNode := systemSub["node"]; !hasNode && amdNUMANode != nil {
+			systemSub["node"] = amdNUMANode
 		}
 	}
 	if len(pciDevices) > 0 {
