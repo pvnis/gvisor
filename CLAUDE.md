@@ -75,7 +75,12 @@ anything Kubernetes-side.
 - `pkg/amdsysfs` + `pkg/sentry/fsimpl/sys/amdgpu.go` — bounded host sysfs
   snapshot and the synthetic KFD topology / PCI / DRM tree. The topology
   reports the *sandbox's quota* as the VRAM size, not the device's: a pod
-  holding 2 GiB reads 2147483648 where the host reads 14859169792.
+  holding 2 GiB reads 2147483648 where the host reads 14859169792. The
+  file also synthesises `/sys/devices/system/node/node0/{cpumap,cpulist,
+  distance}` so that ROCr can resolve the nearest CPU agent without a host
+  bind mount; without this, NEAREST_CPU, MEMORY_PROPERTIES,
+  SCRATCH_LIMIT_MAX, SCRATCH_LIMIT_CURRENT, and CLOCK_COUNTERS all return
+  HSA_STATUS_ERROR_INVALID_ARGUMENT (`14e55b2dc`).
 - runsc plumbing, including annotation overrides with narrow-only / lower-only
   validators, so a container cannot widen its own mask or raise its own limit.
 - **`vecadd` runs end to end** — a real HIP kernel, correct results, on all
