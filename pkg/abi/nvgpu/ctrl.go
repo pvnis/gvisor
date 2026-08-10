@@ -165,7 +165,7 @@ type NV0000_CTRL_SYSTEM_GET_P2P_CAPS_PARAMS struct {
 }
 
 // NV0000_CTRL_SYSTEM_GET_P2P_CAPS_PARAMS_V550 is the updated version of
-// NV0000_CTRL_SYSTEM_GET_P2P_CAPS_PARAMS since 550.40.07.
+// NV0000_CTRL_SYSTEM_GET_P2P_CAPS_PARAMS since 545.40.07.
 //
 // +marshal
 type NV0000_CTRL_SYSTEM_GET_P2P_CAPS_PARAMS_V550 struct {
@@ -438,9 +438,20 @@ const (
 	NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE = 0x00000016
 )
 
-// NV2080_CTRL_FB_INFO_MAX_LIST_SIZE is the number of entries in
-// NV2080_CTRL_FB_GET_INFO_V2_PARAMS.FBInfoList.
-const NV2080_CTRL_FB_INFO_MAX_LIST_SIZE = 128
+// Numbers of entries in NV2080_CTRL_FB_GET_INFO_V2_PARAMS.FBInfoList, which
+// the driver has grown over time as it defined more NV2080_CTRL_FB_INFO_INDEX
+// values.
+//
+// The array is inline, so this length is part of the struct's size and the
+// driver rejects a control whose parameter size does not match its own. There
+// is therefore no single definition that works everywhere, and each of these
+// belongs to the versions that use it.
+const (
+	NV2080_CTRL_FB_INFO_MAX_LIST_SIZE      = 0x36 // 54, up to 545
+	NV2080_CTRL_FB_INFO_MAX_LIST_SIZE_V545 = 0x37 // 55
+	NV2080_CTRL_FB_INFO_MAX_LIST_SIZE_V560 = 0x39 // 57
+	NV2080_CTRL_FB_INFO_MAX_LIST_SIZE_V580 = 0x80 // 128
+)
 
 // NV2080_CTRL_FB_INFO is an entry of
 // NV2080_CTRL_FB_GET_INFO_V2_PARAMS.FBInfoList, from
@@ -453,17 +464,98 @@ type NV2080_CTRL_FB_INFO struct {
 	Data  uint32
 }
 
+// HasFBInfoList is implemented by the NV2080_CTRL_FB_GET_INFO_V2_PARAMS
+// variants below, which differ only in how many entries their inline list
+// holds.
+type HasFBInfoList interface {
+	// FBInfoCount returns the number of entries the caller has filled in.
+	FBInfoCount() uint32
+
+	// FBInfoEntries returns the whole list, whatever its length.
+	FBInfoEntries() []NV2080_CTRL_FB_INFO
+}
+
 // NV2080_CTRL_FB_GET_INFO_V2_PARAMS is the parameter type for
 // NV2080_CTRL_CMD_FB_GET_INFO_V2, from
 // src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h. Unlike
 // NV2080_CTRL_FB_GET_INFO_PARAMS, the info list is inline rather than behind a
-// pointer.
+// pointer, so the list length below is part of the ABI.
 //
 // +marshal
 type NV2080_CTRL_FB_GET_INFO_V2_PARAMS struct {
 	_              structs.HostLayout
 	FBInfoListSize uint32
 	FBInfoList     [NV2080_CTRL_FB_INFO_MAX_LIST_SIZE]NV2080_CTRL_FB_INFO
+}
+
+// FBInfoCount implements HasFBInfoList.FBInfoCount.
+func (p *NV2080_CTRL_FB_GET_INFO_V2_PARAMS) FBInfoCount() uint32 {
+	return p.FBInfoListSize
+}
+
+// FBInfoEntries implements HasFBInfoList.FBInfoEntries.
+func (p *NV2080_CTRL_FB_GET_INFO_V2_PARAMS) FBInfoEntries() []NV2080_CTRL_FB_INFO {
+	return p.FBInfoList[:]
+}
+
+// NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V545 is the updated version of
+// NV2080_CTRL_FB_GET_INFO_V2_PARAMS since 545.
+//
+// +marshal
+type NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V545 struct {
+	_              structs.HostLayout
+	FBInfoListSize uint32
+	FBInfoList     [NV2080_CTRL_FB_INFO_MAX_LIST_SIZE_V545]NV2080_CTRL_FB_INFO
+}
+
+// FBInfoCount implements HasFBInfoList.FBInfoCount.
+func (p *NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V545) FBInfoCount() uint32 {
+	return p.FBInfoListSize
+}
+
+// FBInfoEntries implements HasFBInfoList.FBInfoEntries.
+func (p *NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V545) FBInfoEntries() []NV2080_CTRL_FB_INFO {
+	return p.FBInfoList[:]
+}
+
+// NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V560 is the updated version of
+// NV2080_CTRL_FB_GET_INFO_V2_PARAMS since 560.
+//
+// +marshal
+type NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V560 struct {
+	_              structs.HostLayout
+	FBInfoListSize uint32
+	FBInfoList     [NV2080_CTRL_FB_INFO_MAX_LIST_SIZE_V560]NV2080_CTRL_FB_INFO
+}
+
+// FBInfoCount implements HasFBInfoList.FBInfoCount.
+func (p *NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V560) FBInfoCount() uint32 {
+	return p.FBInfoListSize
+}
+
+// FBInfoEntries implements HasFBInfoList.FBInfoEntries.
+func (p *NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V560) FBInfoEntries() []NV2080_CTRL_FB_INFO {
+	return p.FBInfoList[:]
+}
+
+// NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V580 is the updated version of
+// NV2080_CTRL_FB_GET_INFO_V2_PARAMS since 580.
+//
+// +marshal
+type NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V580 struct {
+	_              structs.HostLayout
+	FBInfoListSize uint32
+	FBInfoList     [NV2080_CTRL_FB_INFO_MAX_LIST_SIZE_V580]NV2080_CTRL_FB_INFO
+}
+
+// FBInfoCount implements HasFBInfoList.FBInfoCount.
+func (p *NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V580) FBInfoCount() uint32 {
+	return p.FBInfoListSize
+}
+
+// FBInfoEntries implements HasFBInfoList.FBInfoEntries.
+func (p *NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V580) FBInfoEntries() []NV2080_CTRL_FB_INFO {
+	return p.FBInfoList[:]
 }
 
 // NvxxxCtrlXxxGetInfoParams is used to represent the following:

@@ -322,6 +322,11 @@ type hasStatusPtr[T any] interface {
 	nvgpu.HasStatus
 }
 
+type hasFBInfoListPtr[T any] interface {
+	marshalPtr[T]
+	nvgpu.HasFBInfoList
+}
+
 type hasFrontendFDAndStatusPtr[T any] interface {
 	marshalPtr[T]
 	nvgpu.HasFrontendFD

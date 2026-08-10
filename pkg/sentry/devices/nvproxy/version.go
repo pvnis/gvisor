@@ -266,7 +266,7 @@ func Init() {
 					nvgpu.NV2080_CTRL_CMD_CE_GET_CAPS_V2:                                   ctrlHandler(rmControlSimple, compUtil|nvconf.CapGraphics),
 					nvgpu.NV2080_CTRL_CMD_CE_GET_ALL_CAPS:                                  ctrlHandler(rmControlSimple, compUtil),
 					nvgpu.NV2080_CTRL_CMD_EVENT_SET_NOTIFICATION:                           ctrlHandler(rmControlSimple, compUtil),
-					nvgpu.NV2080_CTRL_CMD_FB_GET_INFO_V2:                                   ctrlHandler(ctrlFBGetInfoV2, compUtil),
+					nvgpu.NV2080_CTRL_CMD_FB_GET_INFO_V2:                                   ctrlHandler(ctrlFBGetInfoV2[nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS], compUtil),
 					nvgpu.NV2080_CTRL_CMD_FB_GET_FS_INFO:                                   ctrlHandler(rmControlSimple, nvconf.CapProfiling),
 					nvgpu.NV2080_CTRL_CMD_FB_GET_GPU_CACHE_INFO:                            ctrlHandler(rmControlSimple, nvconf.CapGraphics),
 					nvgpu.NV2080_CTRL_CMD_FB_GET_FB_REGION_INFO:                            ctrlHandler(rmControlSimple, nvconf.CapGraphics),
@@ -809,6 +809,7 @@ func Init() {
 		v545_23_06 := addUnsupportedDriverABI(545, 23, 06, func() *driverABI {
 			abi := v535_113_01()
 			abi.controlCmd[nvgpu.NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO] = ctrlHandler(ctrlHasFrontendFD[nvgpu.NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545], compUtil)
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_FB_GET_INFO_V2] = ctrlHandler(ctrlFBGetInfoV2[nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V545], compUtil)
 			abi.controlCmd[nvgpu.NV0000_CTRL_CMD_GPU_GET_ACTIVE_DEVICE_IDS] = ctrlHandler(rmControlSimple, compUtil)
 			abi.controlCmd[nvgpu.NV00DE_CTRL_CMD_REQUEST_DATA_POLL] = ctrlHandler(rmControlSimple, compUtil)
 			abi.allocationClass[nvgpu.RM_USER_SHARED_DATA] = allocHandler(rmAllocSimple[nvgpu.NV00DE_ALLOC_PARAMETERS_V545], compUtil)
@@ -826,6 +827,7 @@ func Init() {
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
 				info.ControlInfos[nvgpu.NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO] = ioctlInfoWithStructName("NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO", nvgpu.NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS_V545{}, "NV0000_CTRL_OS_UNIX_GET_EXPORT_OBJECT_INFO_PARAMS")
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_FB_GET_INFO_V2] = ioctlInfoWithStructName("NV2080_CTRL_CMD_FB_GET_INFO_V2", nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V545{}, "NV2080_CTRL_FB_GET_INFO_V2_PARAMS")
 				info.ControlInfos[nvgpu.NV0000_CTRL_CMD_GPU_GET_ACTIVE_DEVICE_IDS] = simpleIoctlInfo("NV0000_CTRL_CMD_GPU_GET_ACTIVE_DEVICE_IDS", "NV0000_CTRL_GPU_GET_ACTIVE_DEVICE_IDS_PARAMS")
 				info.ControlInfos[nvgpu.NV00DE_CTRL_CMD_REQUEST_DATA_POLL] = simpleIoctlInfo("NV00DE_CTRL_CMD_REQUEST_DATA_POLL", "NV00DE_CTRL_REQUEST_DATA_POLL_PARAMS")
 				info.AllocationInfos[nvgpu.RM_USER_SHARED_DATA] = ioctlInfoWithStructName("RM_USER_SHARED_DATA", nvgpu.NV00DE_ALLOC_PARAMETERS_V545{}, "NV00DE_ALLOC_PARAMETERS")
@@ -948,6 +950,7 @@ func Init() {
 		// 560.28.03 is an intermediate unqualified version from the main branch.
 		v560_28_03 := addUnsupportedDriverABI(560, 28, 03, func() *driverABI {
 			abi := v555_42_02()
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_FB_GET_INFO_V2] = ctrlHandler(ctrlFBGetInfoV2[nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V560], compUtil)
 			abi.allocationClass[nvgpu.NVCDB0_VIDEO_DECODER] = allocHandler(rmAllocSimple[nvgpu.NV_BSP_ALLOCATION_PARAMETERS], nvconf.CapVideo)
 			abi.allocationClass[nvgpu.NVCDD1_VIDEO_NVJPG] = allocHandler(rmAllocSimple[nvgpu.NV_NVJPG_ALLOCATION_PARAMETERS], nvconf.CapVideo)
 			abi.allocationClass[nvgpu.NVCDFA_VIDEO_OFA] = allocHandler(rmAllocSimple[nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545], nvconf.CapVideo)
@@ -962,6 +965,7 @@ func Init() {
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_FB_GET_INFO_V2] = ioctlInfoWithStructName("NV2080_CTRL_CMD_FB_GET_INFO_V2", nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V560{}, "NV2080_CTRL_FB_GET_INFO_V2_PARAMS")
 				info.AllocationInfos[nvgpu.NVCDB0_VIDEO_DECODER] = ioctlInfo("NVCDB0_VIDEO_DECODER", nvgpu.NV_BSP_ALLOCATION_PARAMETERS{})
 				info.AllocationInfos[nvgpu.NVCDD1_VIDEO_NVJPG] = ioctlInfo("NVCDD1_VIDEO_NVJPG", nvgpu.NV_NVJPG_ALLOCATION_PARAMETERS{})
 				info.AllocationInfos[nvgpu.NVCDFA_VIDEO_OFA] = ioctlInfoWithStructName("NVCDFA_VIDEO_OFA", nvgpu.NV_OFA_ALLOCATION_PARAMETERS_V545{}, "NV_OFA_ALLOCATION_PARAMETERS")
@@ -1062,6 +1066,7 @@ func Init() {
 
 		v580_65_06 := addDriverABI(580, 65, 06, "04b10867af585e765cfbfdcf39ed5f4bd112375bebab0172eaa187c6aa5024ff", "e02acdc0d20d4a541aa5026bfddb1b9b4fc6bc64ae3b04ff9cb9c892700cf9c4", func() *driverABI {
 			abi := v575_51_02()
+			abi.controlCmd[nvgpu.NV2080_CTRL_CMD_FB_GET_INFO_V2] = ctrlHandler(ctrlFBGetInfoV2[nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V580], compUtil)
 			abi.frontendIoctl[nvgpu.NV_ESC_RM_MAP_MEMORY_DMA] = feHandler(frontendIoctlSimple[nvgpu.NVOS46_PARAMETERS_V580], nvconf.CapGraphics|nvconf.CapVideo)
 			abi.allocationClass[nvgpu.FERMI_VASPACE_A] = allocHandler(rmAllocSimple[nvgpu.NV_VASPACE_ALLOCATION_PARAMETERS_V580], compUtil)
 			abi.allocationClass[nvgpu.NVCEB7_VIDEO_ENCODER] = allocHandler(rmAllocSimple[nvgpu.NV_MSENC_ALLOCATION_PARAMETERS], nvconf.CapVideo)
@@ -1073,6 +1078,7 @@ func Init() {
 			prevGetInfo := abi.getInfo
 			abi.getInfo = func() *DriverABIInfo {
 				info := prevGetInfo()
+				info.ControlInfos[nvgpu.NV2080_CTRL_CMD_FB_GET_INFO_V2] = ioctlInfoWithStructName("NV2080_CTRL_CMD_FB_GET_INFO_V2", nvgpu.NV2080_CTRL_FB_GET_INFO_V2_PARAMS_V580{}, "NV2080_CTRL_FB_GET_INFO_V2_PARAMS")
 				info.FrontendInfos[nvgpu.NV_ESC_EXPORT_TO_DMABUF_FD] = ioctlInfoWithStructName("NV_ESC_EXPORT_TO_DMABUF_FD", nvgpu.IoctlExportToDMABufFD_V580{}, "nv_ioctl_export_to_dma_buf_fd_t")
 				info.FrontendInfos[nvgpu.NV_ESC_RM_MAP_MEMORY_DMA] = ioctlInfoWithStructName("NV_ESC_RM_MAP_MEMORY_DMA", nvgpu.NVOS46_PARAMETERS_V580{}, "NVOS46_PARAMETERS")
 				info.AllocationInfos[nvgpu.FERMI_VASPACE_A] = ioctlInfoWithStructName("FERMI_VASPACE_A", nvgpu.NV_VASPACE_ALLOCATION_PARAMETERS_V580{}, "NV_VASPACE_ALLOCATION_PARAMETERS")
