@@ -391,6 +391,11 @@ type Config struct {
 	// which the sandbox may submit work to the GPU. Zero means no limit.
 	NVProxyGPUComputePercent uint64 `flag:"nvproxy-gpu-compute-percent"`
 
+	// NVProxyGPUPreempt preempts the sandbox's GPU channel groups when its
+	// window closes, evicting work already running rather than only preventing
+	// more from being submitted.
+	NVProxyGPUPreempt bool `flag:"nvproxy-gpu-preempt"`
+
 	// NVProxyGPUSchedulerSocket is the path of a GPU scheduler dividing the
 	// GPU between the sandboxes sharing it. Empty means the sandbox is not
 	// scheduled and keeps whatever fixed share it was configured with.

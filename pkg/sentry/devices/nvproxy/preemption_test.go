@@ -117,3 +117,84 @@ func TestSetCtxswPreemptionModeParamsSize(t *testing.T) {
 		t.Errorf("NV2080_CTRL_GR_SET_CTXSW_PREEMPTION_MODE_PARAMS.SizeBytes() = %d, want %d", got, want)
 	}
 }
+
+// TestPreemptParamsSize tests the layout of the preempt control's parameters.
+// The Sentry builds these itself rather than copying them from the sandbox, so
+// a wrong size means the driver reads the wrong bytes.
+func TestPreemptParamsSize(t *testing.T) {
+	var p nvgpu.NVA06C_CTRL_PREEMPT_PARAMS
+	// NvBool bWait + NvBool bManualTimeout, padded to the alignment of the
+	// NvU32 timeoutUs that follows.
+	if got, want := p.SizeBytes(), 8; got != want {
+		t.Errorf("NVA06C_CTRL_PREEMPT_PARAMS.SizeBytes() = %d, want %d", got, want)
+	}
+}
+
+// TestPreemptTimeoutWithinDriverMaximum tests that the timeout nvproxy asks for
+// is one the driver will accept, and that it is short enough to be affordable
+// within a scheduling period.
+func TestPreemptTimeoutWithinDriverMaximum(t *testing.T) {
+	if got := preemptChannelGroupTimeout.Microseconds(); got > nvgpu.NVA06C_CTRL_CMD_PREEMPT_MAX_MANUAL_TIMEOUT_US {
+		t.Errorf("preemptChannelGroupTimeout = %d us, exceeds the driver maximum of %d us",
+			got, nvgpu.NVA06C_CTRL_CMD_PREEMPT_MAX_MANUAL_TIMEOUT_US)
+	}
+	if preemptChannelGroupTimeout >= computeGatePeriod {
+		t.Errorf("preemptChannelGroupTimeout = %v, which is not shorter than the %v period it must fit inside",
+			preemptChannelGroupTimeout, computeGatePeriod)
+	}
+}
+
+// TestPreemptDisabledByDefault tests that preemption is opt-in, so that
+// enabling the compute gate does not silently start evicting work.
+func TestPreemptDisabledByDefault(t *testing.T) {
+	g := newGate(50)
+	if g.preempt {
+		t.Errorf("preempt = true by default, want false")
+	}
+	// With preemption off, channel groups are not tracked at all: there is
+	// nothing to preempt, so retaining the handles would be pure bookkeeping.
+	g.addChannelGroup(&frontendFD{}, nvgpu.Handle{Val: 1}, nvgpu.Handle{Val: 2})
+	if got := len(g.tsgs); got != 0 {
+		t.Errorf("tracked %d channel groups with preemption disabled, want 0", got)
+	}
+}
+
+// TestChannelGroupTracking tests that channel groups are remembered while they
+// exist and forgotten when they do not.
+//
+// Forgetting matters for correctness rather than tidiness: the driver reuses
+// handles, so a stale record would have nvproxy preempting whatever object
+// later inherits the handle.
+func TestChannelGroupTracking(t *testing.T) {
+	g := &computeGate{}
+	g.init(50 /* percent */, false /* scheduled */, true /* preempt */)
+
+	fd1, fd2 := &frontendFD{}, &frontendFD{}
+	hClient := nvgpu.Handle{Val: 0xc1}
+	hA, hB := nvgpu.Handle{Val: 0xa}, nvgpu.Handle{Val: 0xb}
+
+	g.addChannelGroup(fd1, hClient, hA)
+	g.addChannelGroup(fd2, hClient, hB)
+	if got, want := len(g.tsgs), 2; got != want {
+		t.Fatalf("tracked %d channel groups, want %d", got, want)
+	}
+	if got := g.tsgs[hA].fd; got != fd1 {
+		t.Errorf("channel group %v is reached through the wrong file description", hA)
+	}
+
+	// Freeing one leaves the other.
+	g.removeChannelGroup(hA)
+	if _, ok := g.tsgs[hA]; ok {
+		t.Errorf("channel group %v still tracked after being freed", hA)
+	}
+	if _, ok := g.tsgs[hB]; !ok {
+		t.Errorf("channel group %v dropped by an unrelated free", hB)
+	}
+
+	// Releasing a file description drops the groups reached through it, since
+	// its host FD is about to become invalid.
+	g.forget(fd2)
+	if got, want := len(g.tsgs), 0; got != want {
+		t.Errorf("tracked %d channel groups after releasing their file description, want %d", got, want)
+	}
+}

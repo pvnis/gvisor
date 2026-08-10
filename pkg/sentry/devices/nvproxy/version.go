@@ -677,7 +677,7 @@ func Init() {
 							nvgpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE:                                  simpleIoctlInfo("NVA06C_CTRL_CMD_GPFIFO_SCHEDULE", "NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS"),
 							nvgpu.NVA06C_CTRL_CMD_SET_TIMESLICE:                                    ioctlInfo("NVA06C_CTRL_CMD_SET_TIMESLICE", nvgpu.NVA06C_CTRL_SET_TIMESLICE_PARAMS{}),
 							nvgpu.NVA06C_CTRL_CMD_GET_TIMESLICE:                                    simpleIoctlInfo("NVA06C_CTRL_CMD_GET_TIMESLICE", "NVA06C_CTRL_GET_TIMESLICE_PARAMS"),
-							nvgpu.NVA06C_CTRL_CMD_PREEMPT:                                          simpleIoctlInfo("NVA06C_CTRL_CMD_PREEMPT", "NVA06C_CTRL_PREEMPT_PARAMS"),
+							nvgpu.NVA06C_CTRL_CMD_PREEMPT:                                          ioctlInfo("NVA06C_CTRL_CMD_PREEMPT", nvgpu.NVA06C_CTRL_PREEMPT_PARAMS{}),
 							nvgpu.NVA06F_CTRL_CMD_GPFIFO_SCHEDULE:                                  simpleIoctlInfo("NVA06F_CTRL_CMD_GPFIFO_SCHEDULE", "NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS"),
 							nvgpu.NVA06F_CTRL_CMD_BIND:                                             simpleIoctlInfo("NVA06F_CTRL_CMD_BIND", "NVA06F_CTRL_BIND_PARAMS"),
 							nvgpu.NVC56F_CTRL_CMD_GET_KMB:                                          simpleIoctlInfo("NVC56F_CTRL_CMD_GET_KMB", "NVC56F_CTRL_CMD_GET_KMB_PARAMS"),

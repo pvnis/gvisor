@@ -24,7 +24,7 @@ import (
 
 func newGate(percent uint64) *computeGate {
 	g := &computeGate{}
-	g.init(percent, false /* scheduled */)
+	g.init(percent, false /* scheduled */, false /* preempt */)
 	return g
 }
 

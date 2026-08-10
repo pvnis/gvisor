@@ -43,6 +43,7 @@ go_library(
     name = "nvproxy",
     srcs = [
         "computegate.go",
+        "computegate_unsafe.go",
         "fds_mutex.go",
         "frontend.go",
         "frontend_mmap.go",

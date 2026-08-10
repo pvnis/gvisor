@@ -923,6 +923,10 @@ func rmFree(fi *frontendIoctlState) (uintptr, error) {
 	var deferReleases []func()
 	if err == nil && ioctlParams.Status == nvgpu.NV_OK {
 		deferReleases = fi.fd.dev.nvp.objFree(fi.ctx, client, ioctlParams.HObjectOld)
+		// The handle may be reused by a later allocation, so the compute gate
+		// must not go on believing it names a preemptible channel group. This
+		// is a no-op for handles that never did.
+		fi.fd.dev.nvp.computeGate.removeChannelGroup(ioctlParams.HObjectOld)
 	}
 	unlock()
 	for _, release := range deferReleases {
@@ -1679,6 +1683,9 @@ func rmAllocChannelGroup(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAM
 		// src/nvidia/src/kernel/gpu/fifo/kernel_channel_group_api.c:kchangrpapiConstruct_IMPL()
 		// => refAddDependant().
 		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace)
+		// A channel group is the unit the GPU schedules, and therefore the unit
+		// the compute gate preempts when the sandbox's window closes.
+		fi.fd.dev.nvp.computeGate.addChannelGroup(fi.fd, ioctlParams.HRoot, ioctlParams.HObjectNew)
 		// Note: When the channel group's engine type is GR, which is always
 		// true unless MIG is enabled, kchangrpapiConstruct_IMPL() constructs a
 		// KERNEL_GRAPHICS_CONTEXT whose lifetime is the same as the channel

@@ -71,6 +71,11 @@ type Options struct {
 	// sandbox may submit work to the GPU. Zero means no limit.
 	ComputePercent uint64
 
+	// Preempt is true if the sandbox's channel groups should be preempted when
+	// its GPU window closes, evicting work already running rather than only
+	// preventing more from being submitted.
+	Preempt bool
+
 	// SchedulerFD is an open connection to a GPU scheduler that decides this
 	// sandbox's share, or -1 if it has none. The Sentry cannot connect to
 	// anything itself, so the connection is made outside and donated.
@@ -122,13 +127,16 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	nvp.maxTimesliceUs = opts.MaxTimesliceUs
 	nvp.minComputePreemption = opts.MinComputePreemption
 	scheduled := opts.SchedulerFD >= 0
-	nvp.computeGate.init(opts.ComputePercent, scheduled)
+	nvp.computeGate.init(opts.ComputePercent, scheduled, opts.Preempt)
 	if scheduled {
 		log.Infof("nvproxy: GPU share for %q decided by the scheduler, weight %d", opts.ContainerID, opts.SchedulerWeight)
 		nvp.computeGate.follow(opts.SchedulerFD, opts.ContainerID, opts.SchedulerWeight, opts.ComputePercent)
 	}
 	if nvp.computeGate.enabled() {
 		log.Infof("nvproxy: GPU compute limited to %d%% of wall-clock time", opts.ComputePercent)
+		if opts.Preempt {
+			log.Infof("nvproxy: GPU channel groups will be preempted when the window closes")
+		}
 		go nvp.computeGate.run()
 	}
 	if opts.MaxTimesliceUs != 0 {

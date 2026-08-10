@@ -84,21 +84,42 @@ type computeGate struct {
 	// the end of each period. It is protected by mu.
 	gated map[*frontendFD]struct{}
 
+	// preempt is true if the sandbox's channel groups should be preempted when
+	// its window closes, rather than only being prevented from submitting more
+	// work. It is immutable after Register().
+	preempt bool
+
+	// tsgs is the set of channel groups (KEPLER_CHANNEL_GROUP_A) the sandbox
+	// has allocated, which are the units the GPU schedules and therefore the
+	// units that can be preempted. It is protected by mu.
+	tsgs map[nvgpu.Handle]channelGroup
+
 	// submissions counts attempts to submit work since the last report to the
 	// scheduler, which uses it to tell a sandbox that is using the GPU from one
 	// that is merely connected.
 	submissions atomicbitops.Uint64
+
+	// warnedPreempt records that a failed preempt has already been reported, so
+	// that a driver which cannot preempt at all does not log once per period
+	// forever.
+	warnedPreempt atomicbitops.Bool
+
+	// notedPreempt records that a successful preempt has already been reported,
+	// for the same reason in the other direction.
+	notedPreempt atomicbitops.Bool
 }
 
 // init prepares g to gate submission, permitting it for the given share of each
 // period until a scheduler supplies a window. If scheduled is true, gating is in
 // effect even when percent is unset, because the scheduler decides the share.
-func (g *computeGate) init(percent uint64, scheduled bool) {
+func (g *computeGate) init(percent uint64, scheduled, preempt bool) {
 	g.percent = percent
 	g.scheduled = scheduled
+	g.preempt = preempt
 	g.cmdBufs = make(map[nvgpu.Handle]struct{})
 	g.byMem = make(map[nvgpu.Handle]*frontendFD)
 	g.gated = make(map[*frontendFD]struct{})
+	g.tsgs = make(map[nvgpu.Handle]channelGroup)
 	// Until a scheduler says otherwise, hold the sandbox to its configured
 	// share, or to all of the period if it has none. Starting at nothing would
 	// stall a sandbox whose scheduler never appears.
@@ -153,6 +174,9 @@ func (g *computeGate) restore() {
 	}
 	if g.gated == nil {
 		g.gated = make(map[*frontendFD]struct{})
+	}
+	if g.tsgs == nil {
+		g.tsgs = make(map[nvgpu.Handle]channelGroup)
 	}
 	if g.grant.Period <= 0 {
 		g.grant = gpusched.Grant{Period: computeGatePeriod, Allowance: computeGatePeriod}
@@ -209,6 +233,39 @@ func (g *computeGate) gateLocked(h nvgpu.Handle, fd *frontendFD) {
 	log.Infof("nvproxy: gating GPU submission through command buffer %v", h)
 }
 
+// channelGroup identifies one of the sandbox's channel groups well enough to
+// issue an RM control against it: the file description the control must be
+// sent through, and the client that owns the object.
+//
+// +stateify savable
+type channelGroup struct {
+	fd      *frontendFD
+	hClient nvgpu.Handle
+}
+
+// addChannelGroup records a channel group allocated by the sandbox, so that it
+// can be preempted when the sandbox's window closes.
+func (g *computeGate) addChannelGroup(fd *frontendFD, hClient, hObject nvgpu.Handle) {
+	if !g.enabled() || !g.preempt {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.tsgs[hObject] = channelGroup{fd: fd, hClient: hClient}
+}
+
+// removeChannelGroup drops a channel group the sandbox has freed. Preempting a
+// freed object would merely fail, but retaining the handle would let a later
+// allocation reuse it and be preempted on the strength of a stale record.
+func (g *computeGate) removeChannelGroup(hObject nvgpu.Handle) {
+	if !g.enabled() || !g.preempt {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.tsgs, hObject)
+}
+
 // forget stops gating fd and drops any record of it, and is called when fd is
 // released so that the gate does not retain it.
 func (g *computeGate) forget(fd *frontendFD) {
@@ -223,6 +280,13 @@ func (g *computeGate) forget(fd *frontendFD) {
 	fd.mappedMemMu.Unlock()
 	if g.byMem[h] == fd {
 		delete(g.byMem, h)
+	}
+	// Channel groups reached through this file description can no longer be
+	// preempted through it, and its host FD is about to become invalid.
+	for hObject, tsg := range g.tsgs {
+		if tsg.fd == fd {
+			delete(g.tsgs, hObject)
+		}
 	}
 }
 
@@ -284,7 +348,60 @@ func (g *computeGate) wait(ctx context.Context) {
 func (g *computeGate) run() {
 	for {
 		time.Sleep(g.untilWindowEnd(time.Now()))
+		// Revoke before preempting, not after. Revoking first shuts the door on
+		// new submissions, so that work evicted by the preempt cannot simply be
+		// replaced in the gap between the two.
 		g.revoke()
+		g.preemptAll()
+	}
+}
+
+// preemptChannelGroupTimeout is how long a preempt may take before nvproxy
+// stops waiting for it.
+//
+// The driver permits up to NVA06C_CTRL_CMD_PREEMPT_MAX_MANUAL_TIMEOUT_US, a
+// full second, which is ten of our periods: a single slow preempt would do more
+// damage to the schedule than the work it was trying to evict. This is chosen
+// instead to be affordable within one window while still being long enough that
+// a preempt which is merely slow is not abandoned.
+const preemptChannelGroupTimeout = 5 * time.Millisecond
+
+// preemptAll asks the GPU to switch each of the sandbox's channel groups off
+// its engine, evicting work that is already running.
+//
+// This is what revoking mappings cannot do. Revocation stops the sandbox
+// submitting anything new, but says nothing about what the GPU is already
+// executing on its behalf; a single long kernel submitted just before the
+// window closed otherwise runs on into other sandboxes' windows.
+//
+// Failures are logged once and otherwise ignored. A driver that does not
+// support the control, or a channel group freed between the snapshot below and
+// the call, must not cost every tenant on the machine access to the GPU --
+// isolation falls back to revocation alone, which is where it was before.
+func (g *computeGate) preemptAll() {
+	if !g.preempt {
+		return
+	}
+	g.mu.Lock()
+	tsgs := make(map[nvgpu.Handle]channelGroup, len(g.tsgs))
+	for hObject, tsg := range g.tsgs {
+		tsgs[hObject] = tsg
+	}
+	g.mu.Unlock()
+	for hObject, tsg := range tsgs {
+		if err := preemptChannelGroup(tsg.fd, tsg.hClient, hObject); err != nil {
+			if !g.warnedPreempt.Swap(true) {
+				log.Warningf("nvproxy: failed to preempt GPU channel group %v: %v; "+
+					"GPU time is bounded by revoking submission alone, so work already running may overrun the sandbox's window", hObject, err)
+			}
+			continue
+		}
+		// Say so once. Without this there is no way to tell a working preempt
+		// from one that never ran because the sandbox had no channel groups to
+		// preempt -- both are silent, and only one of them is enforcement.
+		if !g.notedPreempt.Swap(true) {
+			log.Infof("nvproxy: preempted GPU channel group %v at the end of the sandbox's window", hObject)
+		}
 	}
 }
 

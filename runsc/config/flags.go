@@ -53,6 +53,7 @@ const (
 	flagNVProxyGPUWeight         = "nvproxy-gpu-weight"
 	flagNVProxyGPUMemLimit       = "nvproxy-gpu-memory-limit"
 	flagNVProxyMinComputePreempt = "nvproxy-min-compute-preemption"
+	flagNVProxyGPUPreempt        = "nvproxy-gpu-preempt"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
 	defaultQDiscTBFRate  = uint64(0)
@@ -192,6 +193,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Uint64(flagNVProxyGPUComputePct, 0, "percentage of wall-clock time during which the sandbox may submit work to the GPU. Submission is held in the Sentry outside that share, so the limit cannot be bypassed from within the sandbox. 0 means no limit.")
 	flagSet.Uint64("nvproxy-max-timeslice-us", 0, "longest GPU scheduler timeslice, in microseconds, that a sandbox may request for its channel groups. A longer timeslice increases the sandbox's share of the GPU relative to others sharing it. 0 means no limit.")
 	flagSet.String(flagNVProxyMinComputePreempt, "", "least preemptible GPU compute context-switch mode a sandbox may select: \"wfi\", \"cta\" or \"cilp\". Under wfi the GPU cannot take work away from a sandbox until that work finishes on its own, so a sandbox that selects it resists being descheduled. Empty means no limit.")
+	flagSet.Bool(flagNVProxyGPUPreempt, false, "preempt the sandbox's GPU channel groups when its share of the GPU ends, evicting work that is already running. Without this, the sandbox is only stopped from submitting more work, so a long kernel submitted just before the deadline runs on into other sandboxes' time. Requires --nvproxy-gpu-compute-percent or --nvproxy-gpu-scheduler-socket.")
 	flagSet.Uint64(flagNVProxyGPUMemLimit, 0, "maximum number of bytes of GPU memory that the sandbox may allocate, counting device memory and address space reserved for CUDA unified memory. 0 means no limit.")
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("rdmaproxy", false, "WIP: enable RDMA support for containers with /dev/infiniband/uverbs* devices.")
@@ -235,6 +237,26 @@ var overrideAllowlist = map[string]struct {
 	flagNVProxyGPUComputePct:     {check: checkNVProxyGPUComputePercent},
 	flagNVProxyGPUWeight:         {check: checkNVProxyGPUWeight},
 	flagNVProxyMinComputePreempt: {check: checkNVProxyMinComputePreemption},
+	flagNVProxyGPUPreempt:        {check: checkNVProxyGPUPreempt},
+}
+
+// checkNVProxyGPUPreempt ensures that a container may ask to be preempted when
+// its GPU window closes, but may not annotate away preemption the runtime has
+// turned on.
+//
+// Being preemptible is a restriction a container places on itself and costs
+// nobody else anything, so enabling it is always allowed. Disabling it would
+// let a workload keep running past its share, which is the behaviour the flag
+// exists to prevent.
+func checkNVProxyGPUPreempt(c *Config, name string, value string) error {
+	want, err := strconv.ParseBool(value)
+	if err != nil {
+		return fmt.Errorf("invalid %s annotation %q: %w", name, value, err)
+	}
+	if c.NVProxyGPUPreempt && !want {
+		return fmt.Errorf("%s=%q cannot disable the GPU preemption required by the runtime", name, value)
+	}
+	return nil
 }
 
 // checkNVProxyMinComputePreemption ensures that a container may make itself

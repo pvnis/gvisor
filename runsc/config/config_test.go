@@ -1060,6 +1060,30 @@ func TestNVProxyMinComputePreemptionOverride(t *testing.T) {
 	}
 }
 
+// TestNVProxyGPUPreemptOverride tests that a container may opt into GPU
+// preemption but cannot annotate away preemption the runtime has enabled.
+func TestNVProxyGPUPreemptOverride(t *testing.T) {
+	off := &Config{NVProxyGPUPreempt: false}
+	for _, value := range []string{"true", "false"} {
+		if err := checkNVProxyGPUPreempt(off, flagNVProxyGPUPreempt, value); err != nil {
+			t.Errorf("checkNVProxyGPUPreempt(runtime off, %q) = %v, want nil", value, err)
+		}
+	}
+
+	on := &Config{NVProxyGPUPreempt: true}
+	if err := checkNVProxyGPUPreempt(on, flagNVProxyGPUPreempt, "true"); err != nil {
+		t.Errorf("checkNVProxyGPUPreempt(runtime on, %q) = %v, want nil", "true", err)
+	}
+	// The case that matters: a workload must not be able to keep running past
+	// its share by annotating preemption off.
+	if err := checkNVProxyGPUPreempt(on, flagNVProxyGPUPreempt, "false"); err == nil {
+		t.Errorf("checkNVProxyGPUPreempt(runtime on, %q) = nil, want an error", "false")
+	}
+	if err := checkNVProxyGPUPreempt(on, flagNVProxyGPUPreempt, "bogus"); err == nil {
+		t.Errorf("checkNVProxyGPUPreempt(runtime on, %q) = nil, want an error", "bogus")
+	}
+}
+
 // TestNVProxyGPUComputePercentOverride tests that the GPU compute annotation
 // may lower the runtime's share but not raise it.
 func TestNVProxyGPUComputePercentOverride(t *testing.T) {

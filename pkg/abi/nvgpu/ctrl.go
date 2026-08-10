@@ -925,6 +925,28 @@ type NVA06C_CTRL_SET_TIMESLICE_PARAMS struct {
 	TimesliceUs uint64
 }
 
+// NVA06C_CTRL_CMD_PREEMPT_MAX_MANUAL_TIMEOUT_US is the largest timeout the
+// driver accepts in NVA06C_CTRL_PREEMPT_PARAMS.TimeoutUs, from
+// src/common/sdk/nvidia/inc/ctrl/ctrla06c.h.
+const NVA06C_CTRL_CMD_PREEMPT_MAX_MANUAL_TIMEOUT_US = 1000000
+
+// NVA06C_CTRL_PREEMPT_PARAMS is the parameter type for
+// NVA06C_CTRL_CMD_PREEMPT, from
+// src/common/sdk/nvidia/inc/ctrl/ctrla06c.h.
+//
+// The driver documents that calling this repeatedly with BWait false, without
+// waiting for the preempt to complete by some other means, "can lead to
+// undefined results".
+//
+// +marshal
+type NVA06C_CTRL_PREEMPT_PARAMS struct {
+	_              structs.HostLayout
+	BWait          uint8
+	BManualTimeout uint8
+	Pad            [2]byte
+	TimeoutUs      uint32
+}
+
 // From src/common/sdk/nvidia/inc/ctrl/ctrla06f/ctrla06fgpfifo.h:
 const (
 	NVA06F_CTRL_CMD_GPFIFO_SCHEDULE = 0xa06f0103
