@@ -282,6 +282,20 @@ func TestValidationFail(t *testing.T) {
 			error: "num_network_channels must be > 0",
 		},
 		{
+			name: "amdproxy-cu-mask-not-hex",
+			flags: map[string]string{
+				"amdproxy-cu-mask": "all",
+			},
+			error: "amdproxy-cu-mask",
+		},
+		{
+			name: "amdproxy-cu-mask-selects-nothing",
+			flags: map[string]string{
+				"amdproxy-cu-mask": "0x0",
+			},
+			error: "selects no compute units",
+		},
+		{
 			name: "qdisc-tbf-burst-overflow",
 			flags: map[string]string{
 				"qdisc-tbf-burst": "4294967296",
@@ -1135,6 +1149,69 @@ func TestNVProxyGPUWeightOverride(t *testing.T) {
 			err := checkNVProxyGPUWeight(c, flagNVProxyGPUWeight, tc.annotation)
 			if gotAllowed := err == nil; gotAllowed != tc.wantAllowed {
 				t.Errorf("checkNVProxyGPUWeight(runtime=%d, annotation=%q) error = %v, want allowed = %v",
+					tc.runtime, tc.annotation, err, tc.wantAllowed)
+			}
+		})
+	}
+}
+
+// TestAMDProxyGPUMemoryLimitOverride tests that the AMD GPU memory annotation
+// may lower the runtime's limit but not raise it.
+func TestAMDProxyGPUMemoryLimitOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		runtime     uint64
+		annotation  string
+		wantAllowed bool
+	}{
+		{name: "lower than runtime limit", runtime: 1024, annotation: "512", wantAllowed: true},
+		{name: "equal to runtime limit", runtime: 1024, annotation: "1024", wantAllowed: true},
+		{name: "higher than runtime limit", runtime: 1024, annotation: "2048", wantAllowed: false},
+		{name: "unlimited when runtime limits", runtime: 1024, annotation: "0", wantAllowed: false},
+		{name: "any limit when runtime unlimited", runtime: 0, annotation: "2048", wantAllowed: true},
+		{name: "not a number", runtime: 1024, annotation: "lots", wantAllowed: false},
+		{name: "negative", runtime: 1024, annotation: "-1", wantAllowed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{AMDProxyGPUMemoryLimit: tc.runtime}
+			err := checkAMDProxyGPUMemoryLimit(c, flagAMDProxyGPUMemLimit, tc.annotation)
+			if gotAllowed := err == nil; gotAllowed != tc.wantAllowed {
+				t.Errorf("checkAMDProxyGPUMemoryLimit(runtime=%d, annotation=%q) error = %v, want allowed = %v",
+					tc.runtime, tc.annotation, err, tc.wantAllowed)
+			}
+		})
+	}
+}
+
+// TestAMDProxyCUMaskOverride tests that the CU mask annotation may narrow the
+// runtime's mask but never widen it. Widening is the case that matters: the
+// spec is frequently written by the workload being limited, so a mask that
+// could grow would be no partition at all.
+func TestAMDProxyCUMaskOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		runtime     string
+		annotation  string
+		wantAllowed bool
+	}{
+		{name: "subset of runtime mask", runtime: "0xff", annotation: "0x0f", wantAllowed: true},
+		{name: "equal to runtime mask", runtime: "0xff", annotation: "0xff", wantAllowed: true},
+		{name: "superset of runtime mask", runtime: "0x0f", annotation: "0xff", wantAllowed: false},
+		{name: "disjoint from runtime mask", runtime: "0x0f", annotation: "0xf0", wantAllowed: false},
+		{name: "overlapping but not contained", runtime: "0x3f", annotation: "0xfc", wantAllowed: false},
+		{name: "any mask when runtime unset", runtime: "", annotation: "0xffff", wantAllowed: true},
+		{name: "empty mask", runtime: "0xff", annotation: "0x0", wantAllowed: false},
+		{name: "empty mask when runtime unset", runtime: "", annotation: "0x0", wantAllowed: false},
+		{name: "not a mask", runtime: "0xff", annotation: "all", wantAllowed: false},
+		// A mask wider than the runtime's in a high word the runtime does not
+		// reach at all: the comparison must not stop at the runtime's length.
+		{name: "beyond the runtime mask's length", runtime: "0xff", annotation: "0xff00000000000000ff", wantAllowed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{AMDProxyCUMask: tc.runtime}
+			err := checkAMDProxyCUMask(c, flagAMDProxyCUMask, tc.annotation)
+			if gotAllowed := err == nil; gotAllowed != tc.wantAllowed {
+				t.Errorf("checkAMDProxyCUMask(runtime=%q, annotation=%q) error = %v, want allowed = %v",
 					tc.runtime, tc.annotation, err, tc.wantAllowed)
 			}
 		})

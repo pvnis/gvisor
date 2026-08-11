@@ -15,6 +15,7 @@
 package kernel
 
 import (
+	stderrors "errors"
 	"fmt"
 	"os"
 	"runtime/trace"
@@ -493,6 +494,15 @@ func ExtractErrno(err error, sysno int) int {
 	default:
 		if errno, ok := linuxerr.TranslateError(err); ok {
 			return int(linuxerr.ToUnix(errno))
+		}
+		// A host operation performed on the application's behalf may have
+		// failed, with its errno wrapped for context. This is reachable for
+		// device files proxied to the host, whose mmap() can fail in ways the
+		// Sentry cannot anticipate and is expected to report rather than
+		// treat as an internal inconsistency.
+		var errno unix.Errno
+		if stderrors.As(err, &errno) {
+			return int(errno)
 		}
 	}
 	panic(fmt.Sprintf("Unknown syscall %d error: %v", sysno, err))

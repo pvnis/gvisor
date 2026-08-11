@@ -28,6 +28,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/amdsysfs"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/coverage"
@@ -41,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
@@ -159,6 +161,9 @@ type containerInfo struct {
 	// nvproxyDevInfo holds information on nvproxy devices.
 	nvproxyDevInfo *nvproxy.DeviceInfo
 
+	// amdproxyDevInfo holds information on amdproxy devices.
+	amdproxyDevInfo *amdproxy.DeviceInfo
+
 	// applicationCores is the number of CPU cores gVisor reports to user
 	// applications.
 	applicationCores int
@@ -250,6 +255,9 @@ type Loader struct {
 	// productName is the value to show in
 	// /sys/devices/virtual/dmi/id/product_name.
 	productName string
+
+	// amdGPUSysfs is the host sysfs snapshot for AMD GPU topology, or nil.
+	amdGPUSysfs *amdsysfs.Snapshot
 
 	// rdmaSysfs is the host sysfs snapshot for RDMA device topology, or
 	// nil when disabled.
@@ -435,6 +443,9 @@ type Args struct {
 	// /sys/devices/virtual/dmi/id/product_name.
 	ProductName string
 
+	// AMDGPUSysfs is the host sysfs snapshot for AMD GPU topology, or nil.
+	AMDGPUSysfs *amdsysfs.Snapshot
+
 	// RDMASysfs is the host sysfs snapshot for RDMA device topology, or
 	// nil when disabled.
 	RDMASysfs *rdma.Snapshot
@@ -555,6 +566,7 @@ func New(args Args) (*Loader, error) {
 		stopProfiling:         stopProfiling,
 		productName:           args.ProductName,
 		rdmaSysfs:             args.RDMASysfs,
+		amdGPUSysfs:           args.AMDGPUSysfs,
 		cpuQuota:              args.CPUQuota,
 		cpuPeriod:             args.CPUPeriod,
 		hostTHP:               args.HostTHP,
@@ -768,7 +780,7 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("initializing kernel: %w", err)
 	}
 
-	if err := registerFilesystems(l.k, &l.root); err != nil {
+	if err := registerFilesystems(l.k, &l.root, l.amdGPUSysfs); err != nil {
 		return nil, fmt.Errorf("registering filesystems: %w", err)
 	}
 
@@ -1106,6 +1118,7 @@ func (l *Loader) installSeccompFilters() error {
 			NVProxy:               nvproxyEnabled,
 			NVProxyCaps:           nvproxyCaps,
 			TPUProxy:              specutils.TPUProxyEnabled(l.root.spec, l.root.conf),
+			AMDProxy:              specutils.AMDProxyEnabled(l.root.spec, l.root.conf),
 			ControllerFD:          uint32(l.ctrl.srv.FD()),
 			CgoEnabled:            config.CgoEnabled,
 			PluginNetwork:         l.root.conf.Network == config.NetworkPlugin,
@@ -1320,6 +1333,7 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 		goferMountConfs:    goferMountConfs,
 		nvidiaHostSettings: l.root.nvidiaHostSettings,
 		nvproxyDevInfo:     l.root.nvproxyDevInfo,
+		amdproxyDevInfo:    l.root.amdproxyDevInfo,
 		rootfsUpperTarFD:   rootfsUpperTarFD,
 	}
 	var err error

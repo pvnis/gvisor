@@ -1,0 +1,414 @@
+# GPU slicing in gVisor
+
+Dividing one GPU between mutually untrusting containers, for both vendors:
+`nvproxy` for NVIDIA and `amdproxy` for AMD, alongside `tpuproxy`.
+
+**The governing constraint, and the reason this work exists:** *nothing may
+depend on changes inside the container.* Every limit is enforced in the Sentry,
+where ioctls are interpreted, and a hostile container cannot lift it. The
+in-container shim that HAMi's vGPU design relies on was a reference for *what*
+to enforce, never for *how* — a limiter living in the address space of the
+process it limits is reachable by that process, and HAMi's switches off from
+inside with a documented environment variable. Measured: a pod requesting
+512 MiB was refused at 512 MiB with the library enforcing, and allocated
+768 MiB against the whole 12 GiB device with `CUDA_DISABLE_CONTROL=true` set.
+
+Work happens directly in the working directory, not a worktree.
+
+## The two mechanisms are not the same shape
+
+This is the thing to understand before reading anything else. Both proxies
+enforce in the Sentry, but they partition different resources, and almost every
+difference in their behaviour follows from that.
+
+| | AMD (`amdproxy`) | NVIDIA (`nvproxy`) |
+| --- | --- | --- |
+| compute is divided in | **space** — CU masks | **time** — submission windows |
+| enforced by | the GPU's command processor | the Sentry, gating submission |
+| set at | queue creation, per ioctl | continuously, per period |
+| unused share goes to | nobody; it idles | whoever is asking (with the scheduler) |
+| granularity | 2 CUs on RDNA, fixed at start | a weight, re-divided every period |
+| memory quota | admit-before-forward on `ALLOC_MEMORY_OF_GPU` | admit-before-forward on the RM/VMM paths |
+
+**Why AMD gets a spatial partition and NVIDIA cannot.** Once an NVIDIA channel
+is set up, work is submitted by writing to a pushbuffer in mapped memory and
+ringing a doorbell through a mapped register. That never enters the kernel — a
+sustained run of 13,000 kernel launches produced *no ioctls at all* between
+context creation and teardown. So there is no point at which nvproxy could meter
+the work itself; it can only decide whether the sandbox is allowed to submit
+right now. AMD's CU mask, by contrast, is an argument to an ioctl the Sentry
+already interprets, and the hardware honours it thereafter.
+
+**What each is consequently good at.** The CU mask is a hard partition that
+holds without any ongoing decision, and it isolates beautifully — but it cannot
+give an idle tenant's share to a busy one, and it cannot be changed once queues
+exist. The NVIDIA scheduler *can* reassign unused time and adjusts as tenants
+come and go, but it is a policy running every period, and it costs more to be
+right.
+
+## Where the work runs
+
+The AMD half runs here. The NVIDIA half was measured on a host with an
+**RTX 5070, driver 610.43.02** (open kernel modules), K3s v1.36.2+k3s1 and
+HAMi; that card is **not in either machine below today** (`lspci` here shows
+only the Navi 32), so re-running any nvproxy measurement needs that host back.
+`~/nvproxy-quota-test/` holds its harness, pod specs and results.
+
+| | sens1 | sensnucbox2 |
+| --- | --- | --- |
+| OS / kernel | Ubuntu 24.04.4, **7.0.0-28-generic** | Ubuntu 26.04, 7.0.0-generic |
+| GPU | **Navi 32 discrete, gfx1101, 54 CUs, 12272 MiB** | **Phoenix1 APU**, gfx1103, 12 CUs, ~14170 MiB |
+| ROCm | **7.2** | 7.1 |
+| `gpu_id` | **63860** (changes on reboot) | 40786 |
+| `/dev/kfd` major | **234** (dynamic) | **511** (dynamic) |
+| docker | yes | yes |
+| kubernetes | **k3s + vCluster + AMD device plugin** | **yes, with the AMD device plugin** |
+| `sudo` | passwordless | **passwordless (`(ALL) NOPASSWD: ALL`)** |
+
+sens1 was rebooted into kernel **7.0.0-28** on 2026-08-10, so the KVM bug below
+no longer applies on either host.
+
+Nothing should hardcode a `gpu_id` or a KFD major: the major is dynamically
+allocated and genuinely differs. `~/amdtest/gputest.sh` reads both from the host.
+
+`~/amdtest/` holds every AMD reproducer, a `Makefile`, `gputest.sh`, and the
+baselines measured on sens1. Read `~/amdtest/README.md` first. `~/amdtest/k8s/`
+holds the Kubernetes pod specs and shim config — read its README before touching
+anything Kubernetes-side.
+
+### Building
+
+**Check the hash, not bazel's summary.** Bazel reports "0 processes, 0 total
+actions" for a build whose output did change, and its `bazel-bin` symlink can
+point at a stale tree; `bazel clean` did *not* force a rebuild here. Confirm
+with `sha256sum` against the deployed binary, and confirm a specific change
+landed with `strings runsc | grep <a string you just added>`.
+
+On **sens1**, `dmd` is not in the `docker` group, but `sudo docker` works, so
+put a shim first on `PATH` — `~/amdtest/bin/docker`, which is
+`exec sudo /usr/bin/docker "$@"`. It covers both the bare `docker` calls in
+`images.mk` and `$(DOCKER_CLI_PATH)` in `bazel.mk`:
+
+```
+PATH=/home/dmd/amdtest/bin:$PATH make build TARGETS=//runsc:runsc \
+    DOCKER_CLI_PATH=/home/dmd/amdtest/bin/docker
+```
+
+On **sensnucbox2**, `dmd` *is* in the `docker` group (added 2026-08-07), so the
+group can be named directly:
+
+```
+sudo -u dmd -g docker make build TARGETS=//runsc:runsc \
+    DOCKER_CLI_PATH=/home/dmd/amdtest/sudodocker
+```
+
+If a new shell already has the docker group active (`id` shows `docker`), plain
+`make build` works. After building, copy `bazel-bin/runsc/runsc_/runsc` to both
+`~/amdtest/runsc` and `/usr/local/bin/runsc` — Docker and Kubernetes both run
+the latter.
+
+## AMD: done, and verified against hardware
+
+- `pkg/abi/amdgpu/{kfd,drm}.go` — KFD and DRM ABI. Every struct size and ioctl
+  number was ground-truthed by compiling C against the real
+  `linux/kfd_ioctl.h`, not read off documentation.
+- `pkg/sentry/devices/amdproxy/` — the proxy. `/dev/kfd` plus amdgpu render
+  nodes; a per-ioctl allowlist, with everything unhandled denied rather than
+  passed through.
+- **CU-mask enforcement.** `--amdproxy-cu-mask=0x3f`: a request for all CUs is
+  silently narrowed to the mask, and a disjoint request gets `EINVAL`.
+- **GPU memory quota.** `--amdproxy-gpu-memory-limit`: admit-before-forward
+  accounting on `ALLOC_MEMORY_OF_GPU`. 2 GiB reports 2048 MiB, cuts off at
+  exactly 2048 MiB, 0 after, 1024 MiB after freeing half.
+- `pkg/sentry/devices/amdproxy/amdconf` — leaf package for the `CUMask` type, so
+  `runsc/config` does not import sentry code. Mirrors `nvconf`.
+- `pkg/amdsysfs` + `pkg/sentry/fsimpl/sys/amdgpu.go` — bounded host sysfs
+  snapshot and the synthetic KFD topology / PCI / DRM tree. The topology reports
+  the *sandbox's quota* as the VRAM size, not the device's: a pod holding 2 GiB
+  reads 2147483648 where the host reads 14859169792. It also synthesises
+  `/sys/devices/system/node/node0/{cpumap,cpulist,distance}` so ROCr can resolve
+  the nearest CPU agent without a host bind mount; without this, NEAREST_CPU,
+  MEMORY_PROPERTIES, SCRATCH_LIMIT_MAX, SCRATCH_LIMIT_CURRENT and CLOCK_COUNTERS
+  all return `HSA_STATUS_ERROR_INVALID_ARGUMENT` (`14e55b2dc`).
+- runsc plumbing, including annotation overrides with narrow-only / lower-only
+  validators, so a container cannot widen its own mask or raise its own limit.
+- **`vecadd` runs end to end** — a real HIP kernel, correct results, on all
+  three paths: `hiptest.sh`'s OCI bundle, Docker, and Kubernetes. Under
+  Kubernetes the AMD device plugin supplies the per-pod quota and the Sentry
+  enforces it: a pod asking for 4 × 512 MiB with `amd.com/cu-mask: "0x3f"` gets
+  exactly 2 GiB and 6 CUs, narrowed from the node's 0xfff ceiling.
+- **Two containers sharing the GPU simultaneously, verified end to end.**
+  `vecadd-a` (cu-mask `0x03f`, CUs 0–5, 2 GiB) and `vecadd-b` (cu-mask `0xfc0`,
+  CUs 6–11, 2 GiB) ran at the same time under both Docker (`hiptest.sh -f`) and
+  Kubernetes (`~/amdtest/k8s/vecadd-{a,b}.yaml`); both produced `RESULT CORRECT`.
+  Concurrent `memprobe` confirmed each sandbox sees exactly its own 2048 MiB
+  ceiling regardless of what the other allocates.
+
+### A CU mask must select whole workgroup processors
+
+RDNA pairs compute units, and KFD returns `EINVAL` for a queue mask that enables
+half a pair. amdproxy applies the sandbox's mask to every queue at creation, so
+a mask like `0x7` made every queue creation fail; the proxy destroyed the queue
+as designed, ROCr did not handle that and died on a null dereference, and what
+the operator saw was **a container that hung**. `034d71a64` rejects such a mask
+at startup, naming the offending compute unit and suggesting a valid mask. The
+rule is driven by `gfx_target_version` from the host topology, so GCN and CDNA —
+which do not pair — are unaffected.
+
+Measured: `0x3`, `0xc`, `0xf`, `0x33`, `0x3ffffff` run; `0x1`, `0x5`, `0x7`,
+`0xaa`, `0x1fff`, `0x7ffffff` all hung before and are now refused in about a
+second. **The slicing granularity on RDNA is 2 CUs, not 1** — "half of 54" is 26
+or 28, never 27. Native ROCr does the opposite with such a mask: it silently
+ignores it and runs on the whole device, which matters when comparing against
+native.
+
+## AMD: what concurrent sharing actually delivers
+
+Measured on sens1's Navi 32 with `gpuburn` (ALU-bound) and the harnesses in
+`~/amdtest/`: `fairness.sh`, `fairness2.sh`, `tenants.sh`, `nativevs.sh`.
+`~/amdtest/README.md` has the method and the traps.
+
+- **The proxy costs nothing measurable.** Solo full device: native 11833–11924
+  vs sandbox 11945–11987 iters/s. Solo 8 CUs: native 1586.5 vs sandbox 1591.0.
+- **Throughput tracks the mask.** 54 CUs 11987, 26 CUs 5849, 12 CUs 3154, 6 CUs
+  1609, 2 CUs 544. Per-CU rises as the slice shrinks (222/CU at 54, 272/CU at 2)
+  because a smaller slice clocks higher.
+- **Isolation is the strongest result.** A on a disjoint half saw its rate move
+  **−0.61%** when B started underneath it and **+0.39%** when B left.
+- **Equal disjoint shares are exactly fair up to 3 tenants.** Two halves: Jain
+  1.0000. Three thirds: 4424.2 / 4423.2 / 4425.7, Jain 1.0000. Two sandboxes
+  deliberately oversubscribed onto the *same* 26 CUs split 3349/3352, Jain
+  1.0000 — neither starved.
+- **Memory quotas hold under concurrency.** Three sandboxes allocating at once
+  under 2 GiB / 1 GiB / 512 MiB each stopped at exactly its own ceiling and each
+  got exactly half back after freeing half. No cross-talk, and none saw the
+  device's 12272 MiB.
+- **Proportionality is approximate, not exact.** 2:1 in CUs gave 1.84:1 in
+  throughput (−8%), 3:1 gave 2.67:1 (−6.6%), 5:1 gave 5.75:1 (+31%). Fine for
+  capacity planning, not a precise dial.
+- **Past 3 tenants the GPU throttles, and that is not gVisor's doing.** With
+  8 CUs each, 2 and 3 tenants get 100% of solo; from 4 on, service goes bimodal
+  — some tenants at ~100%, the rest at ~58%. **Native processes using
+  `HSA_CU_MASK` behave identically**: at 6 tenants native scored Jain 0.9385
+  with aggregate 6805 and gVisor Jain 0.9387 with 6790, a 0.2% difference. So
+  this is the GPU and its driver, faithfully reproduced. Placement is not the
+  cause — 8 CUs at six different offsets all measure 1580–1588 solo, a 0.5%
+  spread. A plausible cause not yet confirmed is hardware queue slots
+  (`num_cp_queues 8`) being oversubscribed once each tenant's runtime brings its
+  own queues; that is a hypothesis, not a measurement.
+
+The practical reading: **this GPU slices cleanly for two or three tenants and
+degrades unevenly beyond that**, and the degradation is the hardware's, so a
+scheduler should cap concurrent GPU tenants rather than expect the CU mask to
+hold service flat.
+
+## NVIDIA: done, and verified against hardware
+
+- **GPU memory quota.** `--nvproxy-gpu-memory-limit`, admit-before-forward.
+  Device memory and UVM address space are counted together, since unified memory
+  commits into device memory and counting them apart would yield twice the
+  limit. Over-limit allocations fail with `NV_ERR_NO_MEMORY`, which CUDA reports
+  as `CUDA_ERROR_OUT_OF_MEMORY` — the same thing a genuinely full GPU gives.
+  `cuMemGetInfo()` is rewritten to report the limit and its headroom, so PyTorch
+  and TensorFlow size themselves to what they can actually get, and a sandbox
+  cannot observe its neighbours' usage.
+- **Compute gating.** `--nvproxy-gpu-compute-percent` holds a sandbox to a
+  fraction of wall-clock submission time. Since submission never enters the
+  kernel, the gate works by revoking the mappings through which work is
+  submitted, outside the window.
+- **`pkg/gpusched`** — the scheduler, kept free of I/O so it is testable without
+  a GPU. Clients carry a **weight**, not a percentage: weight is meaningful
+  without naming a particular GPU, and says something sensible when the shares
+  do not sum to 100. Active clients divide each period in proportion to their
+  weights; windows are placed **end to end by phase** so tenants take turns
+  rather than all contending at the start of every period. An idle-but-
+  registered client keeps a 5 ms floor, or it could never resume. Overrun is
+  charged back against later windows, bounded so one long kernel cannot starve
+  its author for many periods.
+- **`runsc gpu-scheduler`** — one instance per node, serving windows over a
+  socket. The Sentry's syscall filter forbids it to connect to anything, so
+  runsc connects on its way to starting the sandbox and donates the open fd, as
+  it already does for the control server; inside, it is read and written as a
+  plain fd.
+- **Per-device scheduling.** One `Scheduler` per GPU: sandboxes on different
+  devices do not contend, and holding them to shares of each other left both
+  GPUs idle most of every period. `DeviceTable` resolves the many names a GPU
+  arrives under (device-plugin UUID, `docker --gpus` index, CRI device node)
+  onto the index `nvidia-smi` reports. A sandbox on several GPUs registers with
+  each and is held to the smallest window any granted.
+- **The webhook reads the pod and leaves the injection behind.** HAMi's webhook,
+  scheduler and device plugin are used unchanged; only the `libvgpu.so` preload
+  is dropped. `nvidia.com/gpumem` becomes a memory limit and `nvidia.com/gpucores`
+  becomes a *weight*, restated where the container cannot reach it, and
+  `CUDA_DISABLE_CONTROL` stands the redundant in-container copy down. Nothing a
+  pod requests is changed, so HAMi places pods exactly as before and gVisor
+  needs no device plugin of its own.
+- **Measured on hardware.** Two pods at weights 300 and 100 received 486 and 162
+  kernel launches/s — **3.00:1 against the 3:1 requested** — and together kept
+  99% of the throughput one pod gets alone. Two pods contending *without* the
+  scheduler get 324 each against 654 solo, so the division is the scheduler's
+  doing and not the hardware's. A sandbox that stops submitting drops to the
+  5 ms floor and its neighbour expands to the whole period; one that disconnects
+  releases its share entirely.
+
+### Three NVIDIA-side caveats that matter
+
+- **`--measure-usage` is on by default and is defective.** It reads per-process
+  use from `nvidia-smi pmon` to charge sandboxes for what they took rather than
+  what they asked for, which is the right idea — but on an *ordinary* workload
+  it divides badly. Two pods running an identical kernel loop at equal weights
+  get 324/324 with it off and **31/618 with it on**, because `pmon` credits most
+  of the device to whichever pod is being throttled and the repayment throttles
+  it further. Reproduced on the previous binary, so it is not a consequence of
+  per-device scheduling. **The documented setup turns it off.** Where it does
+  help — one pod submitting kernels ~100× longer than the other — it cuts the
+  imbalance from 2.08:1 to 1.37:1, not to nothing: a 150 ms kernel cannot be
+  preempted inside a 100 ms period, and `pmon` samples once a second.
+- **The gate is a cap, not a share, without the scheduler.** Time one sandbox
+  leaves unused is not given to another, because a Sentry sees only its own
+  sandbox. Useful for holding a tenant to an agreed fraction; not for dividing a
+  GPU efficiently. The scheduler exists precisely to fix this.
+- **Gating costs more than the submitting thread.** While a sandbox is held, the
+  task waiting to submit holds its address space's lock, so other threads in
+  that sandbox stall on anything needing it. A thread doing continuous
+  mmap/fault/munmap fell to ~20% of its unlimited rate under a 25% limit, while
+  a thread computing over resident memory was unaffected. This is the price of
+  handling the fault in the Sentry rather than in an in-container handler — that
+  is, the price of the governing constraint.
+
+### Checkpointing a GPU sandbox does not work
+
+`ffffc6e3d` removed the first obstacle: mappings of `/dev/nvidia#` and
+`/dev/nvidia-uvm` are backed by host device memory and cannot be serialized, and
+both inherited a no-op `InvalidateUnsavable`, so any sandbox that had touched a
+GPU failed to save. Dropping them costs nothing — the application faults on next
+access after restore, which already happens whenever the compute gate revokes
+them.
+
+It is still blocked. Only `rmAllocObject` and `rootClient` implement `Restore`;
+objects recorded as `miscObject` or `osDescMem` do not, and those cover the OS
+events every CUDA context creates. Both obstacles predate this branch.
+
+## Two fixes that belong upstream, not here
+
+Both are gVisor bugs with nothing vendor-specific about them; they affect any
+proxied device. See `UPSTREAM-NOTES.md`. **Not yet sent.**
+
+- `797e29b80` — `GenericConfigureMMap` rejected any mmap with offset+length >
+  `MaxInt64`. Correct for a file, wrong for a device, where the offset is an
+  opaque token with type bits in the high bits. Every KFD doorbell mapping was
+  refused with `EOVERFLOW`.
+- `6bfb3c267` — a container could panic the Sentry by mmaping a proxied device
+  whose host mmap fails: the wrapped error reached `ExtractErrno`, matched no
+  case, and hit the panic. A denial of service from inside the sandbox.
+
+## Kubernetes traps, both vendors
+
+**containerd does not pass pod annotations to the sandbox spec.** The CRI plugin
+copies only its own `io.kubernetes.cri.*` annotations. Without
+`pod_annotations = ["dev.gvisor.*"]` on the runtime handler, every
+`dev.gvisor.flag.*` annotation is dropped and each pod silently runs with the
+**node-wide ceiling** from the runtime config rather than its own quota.
+Measured on AMD: a pod asking for 4 × 512 MiB allocated 12032 MiB. It is silent
+— the flags simply arrive at their configured defaults. **This bites both
+proxies identically**; it was hit first on the NVIDIA side and then again on
+AMD, so check it before believing any per-pod limit.
+
+**The Kubernetes config file is not runsc's config file.** `/etc/runsc/config.toml`
+— what containerd's `ConfigPath` points at — is decoded into
+`pkg/shim/v1/runsc.Options`. runsc flags belong under a `[runsc_config]` table;
+unknown top-level keys are dropped without a word. It had been written in
+runsc's own flat format, where only `root` happened to match a field, so every
+pod silently ran with no `--amdproxy`, no `--platform=kvm`, and no debug log.
+
+That failure mode is worth recognising by shape: `open("/dev/kfd")` returned
+**ENXIO**, and amdproxy logged *nothing*, because the workload's spec still
+lists `/dev/kfd` so gVisor still creates the node — with the host's major number
+and nothing registered behind it. The `open` dies in VFS dispatch, before any
+driver code runs. **Absence of a log line from the subsystem you suspect is
+evidence the subsystem was never reached, not evidence it is quiet.**
+`createDeviceFile` now warns in exactly this case.
+
+**A device plugin may not survive a kubelet restart.** The AMD one registers
+once and has no re-register loop, so after `systemctl restart k3s` the pod stays
+`Running` while the node advertises `amd.com/gpu-vram-mib: 0` and every GPU pod
+sits `Pending` with `Insufficient amd.com/gpu-vram-mib`. Delete the plugin pod to
+re-register.
+
+Two smaller ones, both of which cost real time:
+- `/var/log/pods/<pod>/gvisor.log` is the **user** log — compat events only.
+  Sentry warnings go to `/var/log/runsc/`, and if that directory has no recent
+  `*.boot.txt`, debug logging never reached runsc at all.
+- containerd's `k8s.io` image store is **separate from docker's**. A stale
+  `vecadd` there, invisible to `docker images`, was missing `libamd_comgr.so.3`
+  and reported "no ROCm-capable device is detected" — which reads like a proxy
+  failure but arrives *after* the sandbox has already enumerated the GPU.
+  `AMD_LOG_LEVEL=4` plus `LD_DEBUG=libs` in the pod env named it in one run.
+  Compare both stores before believing any K8s-only bug.
+
+## Context worth having
+
+**The KVM device-memory bug is not a gVisor bug.** Under `--platform=kvm` on a
+kernel < 6.13, only the head page of each compound allocation behind an amdgpu
+mapping is usable; every tail page gets `SIGBUS`. `hva_to_pfn_remapped()` calls
+`kvm_try_get_pfn()` => `get_page_unless_zero()`, a tail page's refcount lives on
+its head, so it returns `-EFAULT`, and gVisor turns the unservicable fault into
+`SIGBUS`. TTM allocates GTT in high orders, so 511 of every 512 pages are tail
+pages. Fixed upstream for 6.13 by "KVM: Stop grabbing references to PFNMAP'd
+pages" — a series whose own motivation cites exposing GPU TTM buffers to KVM
+guests. `UPSTREAM-NOTES.md` has the full trace, the ruled-out hypotheses, and
+the affected-kernel table. **6.12 is the LTS and is one release short.**
+
+**nvproxy escapes that by luck, not design.** Identical gVisor code path; the
+difference is that Nvidia's driver maps BAR pfns (no `struct page`) and order-0
+system pages, both of which KVM accepts. This is the clearest example of a
+general lesson on this branch: the two proxies share almost all of the gVisor
+machinery, and where they behave differently it is usually the *driver* that
+differs, not gVisor.
+
+**Measure, do not infer.** The KVM bug got attributed wrongly twice — first to a
+KVM limitation, then over-corrected to purely gVisor's fault — both times from
+plausible reasoning about code that was never run. What settled it was a
+tracepoint and a probe that printed *which* pages worked. The same thing nearly
+happened with the AMD 4-tenant degradation, which looked like a gVisor fairness
+failure until native `HSA_CU_MASK` processes were measured doing the identical
+thing. **If a claim about this codebase matters, there is almost always a
+reproducer that can decide it**, and `~/amdtest/` and `~/nvproxy-quota-test/`
+are where they live.
+
+**Conventions.** Hand-written Go needs gofmt's alignment; use bazel's gofmt
+binary rather than eyeballing struct tags. New ABI structs need `+marshal` and
+the matching BUILD deps; BUILD deps are sorted. On sens1 git has no configured
+identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
+
+## Next
+
+1. **Document the AMD half in `g3doc/user_guide/gpu.md`.** That file is
+   1054 lines and entirely NVIDIA; amdproxy has no user-facing documentation at
+   all. This is the largest remaining gap in making the branch genuinely
+   two-vendor.
+2. **Fix or default off `--measure-usage`.** It is on by default and makes an
+   ordinary two-pod split *worse* than no scheduler at all (31/618 against
+   324/324). The documented setup works around it; the code should not need the
+   workaround.
+3. **Send the two upstream fixes** (`797e29b80`, `6bfb3c267`) and file the KVM
+   issue.
+4. **SVM (`AMDKFD_IOC_SVM`) is forwarded but architecturally limited.** The
+   handler is implemented (`ae2b9b4ab`) and the ioctl reaches the driver, which
+   returns EFAULT when it validates the VA range. SVM operates on the *calling
+   process's* VA space, but under KVM the Sentry is the calling process and
+   guest VAs are not in its address space — the same root as the KFD-mmap
+   process-binding limit. `hipMallocManaged` will not work; hipMalloc workloads
+   (vecadd) are unaffected.
+5. **`/dev/kfd` mappings are impossible on systrap** (task #18). Not a bug: KFD
+   binds each mapping to the process holding the KFD context, and systrap maps
+   from a stub process, so `mmap` returns `EINVAL`. Only the KFD mapping is
+   process-bound; the render node's is not. KVM is the platform to use.
+6. **Registration keys off the root container's spec.** `registerFilesystems`
+   takes `&l.root`, so under Kubernetes — where the root is the pause container
+   and carries no devices — spec-based detection never fires and a pod depends
+   on `--amdproxy` being set for the whole sandbox. nvproxy has the same shape,
+   so this is upstream's design rather than a local bug, but it means the flag
+   is mandatory in Kubernetes. The GPU scheduler works around the same problem
+   on the NVIDIA side by re-announcing devices from `StartSubcontainer`; the
+   same trick may apply here.

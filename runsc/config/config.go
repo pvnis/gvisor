@@ -29,6 +29,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy/amdconf"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/version"
@@ -405,6 +406,18 @@ type Config struct {
 	// scheduled alongside it. Zero is treated as one.
 	NVProxyGPUWeight uint64 `flag:"nvproxy-gpu-weight"`
 
+	// AMDProxy enables support for AMD GPUs.
+	AMDProxy bool `flag:"amdproxy"`
+
+	// AMDProxyCUMask is the set of GPU compute units the sandbox may run
+	// on, as a hexadecimal bitmask with one bit per unit. Empty means every
+	// compute unit.
+	AMDProxyCUMask string `flag:"amdproxy-cu-mask"`
+
+	// AMDProxyGPUMemoryLimit is the maximum number of bytes of device memory
+	// that the sandbox may allocate. Zero means no limit.
+	AMDProxyGPUMemoryLimit uint64 `flag:"amdproxy-gpu-memory-limit"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 
@@ -522,6 +535,16 @@ func (c *Config) Validate() error {
 	}
 	if _, err := nvconf.ParseComputePreemption(c.NVProxyMinComputePreemption); err != nil {
 		return fmt.Errorf("nvproxy-min-compute-preemption: %w", err)
+	}
+	// Check the mask's syntax here rather than only where amdproxy applies it,
+	// so that a mistyped mask is refused on any host instead of surviving as
+	// far as a machine that has an AMD GPU. Whether the mask selects whole
+	// workgroup processors depends on the GPU's topology and is checked when
+	// amdproxy initializes.
+	if mask, err := amdconf.ParseCUMask(c.AMDProxyCUMask); err != nil {
+		return fmt.Errorf("amdproxy-cu-mask: %w", err)
+	} else if c.AMDProxyCUMask != "" && mask.Empty() {
+		return fmt.Errorf("amdproxy-cu-mask=%q selects no compute units", c.AMDProxyCUMask)
 	}
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")

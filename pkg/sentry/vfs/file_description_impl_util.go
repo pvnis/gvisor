@@ -503,7 +503,17 @@ func GenericProxyDeviceConfigureMMap(fd *FileDescription, m memmap.Mappable, opt
 		opts.PlatformEffect = memmap.PlatformEffectPopulate
 	}
 	opts.RequirePlatformEffect = true
-	return GenericConfigureMMap(fd, m, opts)
+	// Unlike GenericConfigureMMap, the offset is not bounded by the maximum
+	// size of a file. A device driver's mmap offset is an opaque token rather
+	// than a position in a file, and drivers encode what is being mapped in
+	// its high bits: AMD's KFD names doorbell pages with the top two bits
+	// set, so every doorbell mapping exceeds that bound. The overflow that
+	// does matter, of offset plus length past the end of the address space,
+	// is checked by MemoryManager.MMap.
+	opts.Mappable = m
+	opts.MappingIdentity = fd
+	fd.IncRef()
+	return nil
 }
 
 // Offset returns the current offset of the file description.

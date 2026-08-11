@@ -28,6 +28,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
+	"gvisor.dev/gvisor/pkg/amdsysfs"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
@@ -38,6 +39,8 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rdma"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy/amdconf"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
@@ -118,7 +121,7 @@ func cgroupfsMemoryDefaults(memoryLimit uint64) map[string]int64 {
 	}
 }
 
-func registerFilesystems(k *kernel.Kernel, info *containerInfo) error {
+func registerFilesystems(k *kernel.Kernel, info *containerInfo, amdGPUSysfs *amdsysfs.Snapshot) error {
 	ctx := k.SupervisorContext()
 	vfsObj := k.VFS()
 
@@ -190,6 +193,10 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo) error {
 	}
 
 	if err := nvproxyRegisterDevices(info, vfsObj, k.NvidiaDriverVersion); err != nil {
+		return err
+	}
+
+	if err := amdproxyRegisterDevices(info, vfsObj, amdGPUSysfs); err != nil {
 		return err
 	}
 
@@ -922,7 +929,7 @@ func (c *containerMounter) getPathMode(ctx context.Context, creds *auth.Credenti
 }
 
 func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, conf *config.Config, mns *vfs.MountNamespace, creds *auth.Credentials, submount *mountInfo) (*vfs.Mount, error) {
-	fsName, opts, err := getMountNameAndOptions(spec, conf, submount, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs)
+	fsName, opts, err := getMountNameAndOptions(spec, conf, submount, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs, c.l.amdGPUSysfs)
 	if err != nil {
 		return nil, fmt.Errorf("mountOptions failed: %w", err)
 	}
@@ -985,7 +992,7 @@ func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, 
 
 // getMountNameAndOptions retrieves the fsName, opts, and useOverlay values
 // used for mounts.
-func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo, productName, containerName, containerID string, fsr *fsRestore, rdmaSysfs *rdma.Snapshot) (string, *vfs.MountOptions, error) {
+func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo, productName, containerName, containerID string, fsr *fsRestore, rdmaSysfs *rdma.Snapshot, amdGPUSysfs *amdsysfs.Snapshot) (string, *vfs.MountOptions, error) {
 	fsName := m.mount.Type
 	var (
 		mopts        = m.mount.Options
@@ -1008,6 +1015,8 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 		sysData := &sys.InternalData{
 			EnableTPUProxyPaths: specutils.TPUProxyEnabled(spec, conf),
 			RDMASysfs:           rdmaSysfs,
+			AMDGPUSysfs:         amdGPUSysfs,
+			AMDGPUMemoryLimit:   conf.AMDProxyGPUMemoryLimit,
 		}
 		if len(productName) > 0 {
 			sysData.ProductName = productName
@@ -1389,7 +1398,7 @@ func (c *containerMounter) mountSharedMaster(ctx context.Context, spec *specs.Sp
 	// Mount the master using the options from the hint (mount annotations).
 	origOpts := mntInfo.mount.Options
 	mntInfo.mount.Options = mntInfo.hint.Mount.Options
-	fsName, opts, err := getMountNameAndOptions(spec, conf, mntInfo, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs)
+	fsName, opts, err := getMountNameAndOptions(spec, conf, mntInfo, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs, c.l.amdGPUSysfs)
 	mntInfo.mount.Options = origOpts
 	if err != nil {
 		return nil, err
@@ -1682,6 +1691,22 @@ func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *contai
 			major = info.nvproxyDevInfo.CapsDevMajor
 			log.Infof("Switching %s device major number from %d to %d", devSpec.Path, devSpec.Major, major)
 		}
+	} else if devSpec.Path == specutils.KFDDevicePath {
+		// KFD's device major number is allocated dynamically, so the Sentry's
+		// does not match the host's. DRM render nodes need no such treatment:
+		// their major number is statically assigned and identical in both.
+		if info.amdproxyDevInfo == nil {
+			// amdproxy never registered, so nothing serves the major number
+			// this node is about to be created with and every open() of it
+			// will fail with ENXIO. Registration keys off the *root*
+			// container's spec, which under Kubernetes is the pause
+			// container and carries no devices, so a pod only gets here
+			// when --amdproxy was not passed to the sandbox.
+			log.Warningf("amdproxy: creating /dev/kfd with host major %d but amdproxy is not registered; opening it will fail with ENXIO. Is --amdproxy set for this sandbox?", major)
+		} else if major != info.amdproxyDevInfo.KFDDevMajor {
+			major = info.amdproxyDevInfo.KFDDevMajor
+			log.Infof("Switching /dev/kfd device major number from %d to %d", devSpec.Major, major)
+		}
 	} else if strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps-imex-channels/") {
 		if info.nvproxyDevInfo.CapsIMEXChannelsDevMajor != 0 && major != info.nvproxyDevInfo.CapsIMEXChannelsDevMajor {
 			major = info.nvproxyDevInfo.CapsIMEXChannelsDevMajor
@@ -1722,5 +1747,28 @@ func nvproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem, 
 		return fmt.Errorf("registering nvproxy driver: %w", err)
 	}
 	info.nvproxyDevInfo = devInfo
+	return nil
+}
+
+func amdproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem, amdGPUSysfs *amdsysfs.Snapshot) error {
+	if !specutils.AMDProxyEnabled(info.spec, info.conf) {
+		return nil
+	}
+	cuMask, err := amdconf.ParseCUMask(info.conf.AMDProxyCUMask)
+	if err != nil {
+		return fmt.Errorf("invalid --amdproxy-cu-mask: %w", err)
+	}
+	// The host topology says whether this GPU schedules compute units in
+	// pairs, which decides whether a given mask is one the driver will accept.
+	devInfo, err := amdproxy.Register(vfsObj, &amdproxy.Options{
+		UseDevGofer:        true,
+		CUMask:             cuMask,
+		GPUMemoryLimit:     info.conf.AMDProxyGPUMemoryLimit,
+		CUsPerComputeGroup: amdGPUSysfs.CUsPerComputeGroup(),
+	})
+	if err != nil {
+		return fmt.Errorf("registering amdproxy driver: %w", err)
+	}
+	info.amdproxyDevInfo = devInfo
 	return nil
 }

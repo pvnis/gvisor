@@ -110,6 +110,7 @@ func TestOptionsConfigKey(t *testing.T) {
 		"ProfileEnable":         func(opt *Options) { opt.ProfileEnable = !opt.ProfileEnable },
 		"NVProxy":               func(opt *Options) { opt.NVProxy = !opt.NVProxy },
 		"NVProxyCaps":           func(opt *Options) { opt.NVProxyCaps = ^opt.NVProxyCaps },
+		"AMDProxy":              func(opt *Options) { opt.AMDProxy = !opt.AMDProxy },
 		"TPUProxy":              func(opt *Options) { opt.TPUProxy = !opt.TPUProxy },
 		"CgoEnabled":            func(opt *Options) { opt.CgoEnabled = !opt.CgoEnabled },
 		"PluginNetwork":         func(opt *Options) { opt.PluginNetwork = !opt.PluginNetwork },
