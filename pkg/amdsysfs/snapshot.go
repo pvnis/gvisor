@@ -132,6 +132,10 @@ type PCIDir struct {
 	Path string `json:"path"`
 	// Files maps an attribute's name to its contents.
 	Files map[string]string `json:"files,omitempty"`
+	// Hwmon maps a hwmon instance name to its attributes. The AMD SMI
+	// library reads the sensor names and labels here while probing a card,
+	// and crashes rather than degrading if the directory is absent.
+	Hwmon map[string]map[string]string `json:"hwmon,omitempty"`
 }
 
 // DRMNode describes a DRM render node and where it sits in the PCI
@@ -259,9 +263,11 @@ func (s *Snapshot) collectDRM(sysRoot string) error {
 		}
 	}
 	for p := range pciPaths {
+		dir := filepath.Join(sysRoot, "devices", filepath.FromSlash(p))
 		s.PCI = append(s.PCI, PCIDir{
 			Path:  p,
-			Files: collectAttrs(filepath.Join(sysRoot, "devices", filepath.FromSlash(p)), pciAttrs),
+			Files: collectAttrs(dir, pciAttrs),
+			Hwmon: collectHwmon(dir),
 		})
 	}
 	// Sorting by path places parents before children, so construction can
@@ -269,6 +275,50 @@ func (s *Snapshot) collectDRM(sysRoot string) error {
 	sort.Slice(s.PCI, func(i, j int) bool { return s.PCI[i].Path < s.PCI[j].Path })
 	sort.Slice(s.DRM, func(i, j int) bool { return s.DRM[i].Name < s.DRM[j].Name })
 	return nil
+}
+
+// hwmonAttrRE matches the hwmon attributes worth reproducing: the instance's
+// name and its sensor labels and readings. Everything else in a hwmon
+// directory is a limit or a threshold, some of which are writable, and none of
+// which is needed to identify a card.
+var hwmonAttrRE = regexp.MustCompile(`^(name|[a-z]+[0-9]+_(label|input))$`)
+
+// collectHwmon snapshots the hwmon instances hanging off a PCI function.
+func collectHwmon(pciDir string) map[string]map[string]string {
+	ents, err := os.ReadDir(filepath.Join(pciDir, "hwmon"))
+	if err != nil {
+		return nil
+	}
+	out := map[string]map[string]string{}
+	for _, ent := range ents {
+		name := ent.Name()
+		if !SafeName(name) {
+			continue
+		}
+		files := map[string]string{}
+		sub, err := os.ReadDir(filepath.Join(pciDir, "hwmon", name))
+		if err != nil {
+			continue
+		}
+		for _, f := range sub {
+			fn := f.Name()
+			if !hwmonAttrRE.MatchString(fn) || !SafeName(fn) {
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(pciDir, "hwmon", name, fn))
+			if err != nil || len(b) > maxFileSize {
+				continue
+			}
+			files[fn] = string(b)
+		}
+		if len(files) > 0 {
+			out[name] = files
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // safePath reports whether every component of a "/"-separated sysfs path is

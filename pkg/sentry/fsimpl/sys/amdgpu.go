@@ -135,6 +135,7 @@ func (fs *filesystem) newAMDGPUPCI(ctx context.Context, creds *auth.Credentials,
 		children map[string]*node
 		files    map[string]string
 		drm      []amdsysfs.DRMNode
+		hwmon    map[string]map[string]string
 	}
 	roots := make(map[string]*node)
 	getNode := func(p string) *node {
@@ -156,7 +157,9 @@ func (fs *filesystem) newAMDGPUPCI(ctx context.Context, creds *auth.Credentials,
 		return cur
 	}
 	for _, d := range snap.PCI {
-		getNode(d.Path).files = attrs[d.Path]
+		n := getNode(d.Path)
+		n.files = attrs[d.Path]
+		n.hwmon = d.Hwmon
 	}
 	for pciPath, nodes := range nodesByPCI {
 		getNode(pciPath).drm = nodes
@@ -174,6 +177,25 @@ func (fs *filesystem) newAMDGPUPCI(ctx context.Context, creds *auth.Credentials,
 			if amdsysfs.SafeName(name) {
 				contents[name] = build(child, name)
 			}
+		}
+		if len(n.hwmon) > 0 {
+			// The AMD SMI library reads the card's sensor names and labels
+			// while probing it, and crashes rather than degrading when the
+			// directory is missing - a segfault, not a clean failure.
+			hwmonContents := make(map[string]kernfs.Inode, len(n.hwmon))
+			for inst, files := range n.hwmon {
+				if !amdsysfs.SafeName(inst) {
+					continue
+				}
+				instContents := make(map[string]kernfs.Inode, len(files))
+				for name, data := range files {
+					if amdsysfs.SafeName(name) {
+						instContents[name] = fs.newStaticFile(ctx, creds, defaultSysMode, data)
+					}
+				}
+				hwmonContents[inst] = fs.newDir(ctx, creds, defaultSysDirMode, instContents)
+			}
+			contents["hwmon"] = fs.newDir(ctx, creds, defaultSysDirMode, hwmonContents)
 		}
 		if len(n.drm) > 0 {
 			drmContents := make(map[string]kernfs.Inode, len(n.drm))
