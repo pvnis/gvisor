@@ -19,6 +19,7 @@ go_library(
     deps = [
         "//pkg/log",
         "//pkg/refs",
+        "//pkg/sentry/devices/amdproxy/amdconf",
         "//pkg/sentry/devices/nvproxy/nvconf",
         "//pkg/sync",
         "//runsc/flag",

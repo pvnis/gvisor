@@ -395,6 +395,18 @@ type Config struct {
 	// scheduled alongside it. Zero is treated as one.
 	NVProxyGPUWeight uint64 `flag:"nvproxy-gpu-weight"`
 
+	// AMDProxy enables support for AMD GPUs.
+	AMDProxy bool `flag:"amdproxy"`
+
+	// AMDProxyCUMask is the set of GPU compute units the sandbox may run
+	// on, as a hexadecimal bitmask with one bit per unit. Empty means every
+	// compute unit.
+	AMDProxyCUMask string `flag:"amdproxy-cu-mask"`
+
+	// AMDProxyGPUMemoryLimit is the maximum number of bytes of device memory
+	// that the sandbox may allocate. Zero means no limit.
+	AMDProxyGPUMemoryLimit uint64 `flag:"amdproxy-gpu-memory-limit"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

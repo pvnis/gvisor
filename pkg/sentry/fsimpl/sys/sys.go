@@ -25,6 +25,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/amdsysfs"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -60,6 +61,15 @@ type InternalData struct {
 	// EnableTPUProxyPaths is whether to populate sysfs paths used by hardware
 	// accelerators.
 	EnableTPUProxyPaths bool
+	// AMDGPUSysfs, when non-nil, is the host sysfs snapshot from which the
+	// AMD GPU topology (/sys/devices/virtual/kfd, /sys/class/kfd) is
+	// constructed.
+	AMDGPUSysfs *amdsysfs.Snapshot
+	// AMDGPUMemoryLimit, when non-zero, is the container's GPU memory quota
+	// in bytes. The topology's per-node memory-bank sizes are rewritten to
+	// this value so that runtimes which size their pools from sysfs do not
+	// over-commit.
+	AMDGPUMemoryLimit uint64
 	// RDMASysfs, when non-nil, is the host sysfs snapshot from which the
 	// RDMA device topology (/sys/devices/pci..., /sys/class/infiniband*,
 	// /sys/class/net, /sys/class/pci_bus, /sys/bus/pci/devices,
@@ -130,6 +140,9 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		"power_supply": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 	}
 	devicesSub := map[string]kernfs.Inode{} // /sys/devices
+	virtualSub := map[string]kernfs.Inode{} // /sys/devices/virtual
+	moduleSub := map[string]kernfs.Inode{}  // /sys/module
+	devCharSub := map[string]kernfs.Inode{} // /sys/dev/char
 	systemSub := map[string]kernfs.Inode{   // /sys/devices/system
 		"cpu": cpuDir(ctx, fs, creds),
 	}
@@ -182,6 +195,31 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			}
 			kernelSub["iommu_groups"] = fs.newDir(ctx, creds, defaultSysDirMode, iommuGroups)
 		}
+		var amdNUMANode kernfs.Inode
+		if amdDirs := fs.newAMDGPUSysfs(ctx, creds, idata.AMDGPUSysfs, idata.AMDGPUMemoryLimit); amdDirs != nil {
+			virtualSub["kfd"] = amdDirs.kfd
+			classSub["kfd"] = amdDirs.class
+			if amdDirs.module != nil {
+				moduleSub["amdgpu"] = amdDirs.module
+			}
+			for name, sub := range amdDirs.devices {
+				// The TPU proxy, RDMA and AMD GPU stacks each populate
+				// /sys/devices from their own view of the PCI hierarchy, and
+				// deep-merging two sealed kernfs subtrees is not supported,
+				// so reject an overlap rather than silently dropping one.
+				if _, ok := devicesSub[name]; ok {
+					return nil, nil, fmt.Errorf("AMD GPU sysfs and another accelerator both populate /sys/devices/%s", name)
+				}
+				devicesSub[name] = sub
+			}
+			if amdDirs.classDRM != nil {
+				classSub["drm"] = amdDirs.classDRM
+			}
+			for name, sub := range amdDirs.devChar {
+				devCharSub[name] = sub
+			}
+			amdNUMANode = amdDirs.node
+		}
 		if idata.RDMASysfs != nil {
 			rdmaDirs, err := fs.newRDMASysfs(ctx, creds, idata.RDMASysfs)
 			if err != nil {
@@ -191,7 +229,6 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 				// The TPU-proxy devices and the RDMA ConnectX devices come from
 				// two different accelerator stacks and aren't exposed to the
 				// same sandbox today, so a shared /sys/devices root complex
-				// shouldn't occur. Deep-merging two sealed kernfs subtrees
 				// isn't supported, so reject an overlap.
 				if _, ok := devicesSub[name]; ok {
 					return nil, nil, fmt.Errorf("TPU proxy and RDMA sysfs both populate /sys/devices/%s", name)
@@ -208,6 +245,11 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 				systemSub["node"] = rdmaDirs.node
 			}
 		}
+		// If RDMA didn't supply a NUMA node subtree but AMD GPU did, use the
+		// AMD one. RDMA takes priority because it may have richer NUMA data.
+		if _, hasNode := systemSub["node"]; !hasNode && amdNUMANode != nil {
+			systemSub["node"] = amdNUMANode
+		}
 	}
 	if len(pciDevices) > 0 {
 		busSub["pci"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
@@ -221,13 +263,14 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		classSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 			"id": kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "../../devices/virtual/dmi/id"),
 		})
-		devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-			"dmi": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-					"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, productName+"\n"),
-				}),
+		virtualSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"id": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+				"product_name": fs.newStaticFile(ctx, creds, defaultSysMode, productName+"\n"),
 			}),
 		})
+	}
+	if len(virtualSub) > 0 {
+		devicesSub["virtual"] = fs.newDir(ctx, creds, defaultSysDirMode, virtualSub)
 	}
 	root := fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"block": fs.newDir(ctx, creds, defaultSysDirMode, nil),
@@ -235,13 +278,13 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		"class": fs.newDir(ctx, creds, defaultSysDirMode, classSub),
 		"dev": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 			"block": fs.newDir(ctx, creds, defaultSysDirMode, nil),
-			"char":  fs.newDir(ctx, creds, defaultSysDirMode, nil),
+			"char":  fs.newDir(ctx, creds, defaultSysDirMode, devCharSub),
 		}),
 		"devices":  fs.newDir(ctx, creds, defaultSysDirMode, devicesSub),
 		"firmware": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 		"fs":       fs.newDir(ctx, creds, defaultSysDirMode, fsDirChildren),
 		"kernel":   fs.newDir(ctx, creds, defaultSysDirMode, kernelSub),
-		"module":   fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"module":   fs.newDir(ctx, creds, defaultSysDirMode, moduleSub),
 		"power":    fs.newDir(ctx, creds, defaultSysDirMode, nil),
 	})
 	fs.root = root.(*dir)
