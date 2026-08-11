@@ -58,8 +58,21 @@ const ClassDRMPath = "class/drm"
 // path relative to /sys/devices.
 const devicesPrefix = "../../devices/"
 
-// renderNodeRE matches a DRM render node name.
-var renderNodeRE = regexp.MustCompile(`^renderD([0-9]+)$`)
+// drmNodeRE matches a DRM node name: a render node, or the primary "card"
+// node beside it.
+//
+// The card node is snapshotted for *enumeration* only. ROCr finds the GPU
+// through KFD and needs nothing but the render node, which is why this used to
+// match renderD<N> alone — but the AMD SMI library, and so every framework
+// that uses it to detect a ROCm platform, globs /sys/class/drm for card<N>
+// instead. Without one it reports AMDSMI_STATUS_NOT_INIT and vLLM concludes
+// there is no GPU, on a sandbox where HIP kernels run perfectly well.
+//
+// Nothing needs /dev/dri/card<N> to be present in the container; only the
+// sysfs entry is required. The anchors matter: connector directories such as
+// "card1-DP-1" must not match, since they live under the card node rather
+// than under devices/<pci path>/drm.
+var drmNodeRE = regexp.MustCompile(`^(renderD|card)([0-9]+)$`)
 
 // pciAttrs are the PCI attributes reproduced for a device and its ancestor
 // bridges. This is an allowlist rather than everything in the directory:
@@ -193,7 +206,7 @@ func Collect(sysRoot string) (*Snapshot, error) {
 	return snap, nil
 }
 
-// collectDRM discovers the render nodes and the PCI directories leading to
+// collectDRM discovers the DRM nodes and the PCI directories leading to
 // them. libdrm identifies a render node by resolving
 // /sys/dev/char/<major>:<minor>/device/drm, so the node's position in the
 // PCI hierarchy has to be reproduced, not just the node itself.
@@ -209,7 +222,7 @@ func (s *Snapshot) collectDRM(sysRoot string) error {
 	pciPaths := make(map[string]bool)
 	for _, ent := range ents {
 		name := ent.Name()
-		if !renderNodeRE.MatchString(name) || !SafeName(name) {
+		if !drmNodeRE.MatchString(name) || !SafeName(name) {
 			continue
 		}
 		// The symlink target is the node's path relative to /sys/class, of
