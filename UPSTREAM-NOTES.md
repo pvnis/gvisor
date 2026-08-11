@@ -1,13 +1,20 @@
-# Upstream notes for the amdgpuslicing branch
+# Upstream notes for the gpuslicing branch
 
-Two commits on this branch fix gVisor bugs that have nothing to do with AMD
-GPUs specifically. They affect any proxied device, so they should be sent
-upstream separately from the amdproxy work rather than carried here
-indefinitely.
+Two commits on this branch fix gVisor bugs that have nothing to do with GPU
+slicing, or with either vendor, specifically. They affect any proxied device,
+so they should be sent upstream separately from the proxy work rather than
+carried here indefinitely.
 
-A third problem is diagnosed but **not** fixed, and is the reason no ROCm or
-HIP application runs under gVisor yet. It is described below with a minimal
-reproducer, ready to file.
+Both were found through amdproxy, which is incidental: AMD's KFD simply
+exercises paths that nvproxy happens not to. That pattern recurs — see "Why
+nvproxy does not hit this" below, where the same gVisor code behaves
+differently for the two vendors purely because of what their drivers put
+behind a VMA.
+
+A third problem is diagnosed but **not** fixed here, because it is the host
+kernel's and is already fixed upstream. It is described below with a minimal
+reproducer, ready to file against gVisor so the host requirement is at least
+documented.
 
 ## Send upstream
 
@@ -30,8 +37,9 @@ that such a failure reaches the application, but the error arrives at
 `ExtractErrno` wrapped for context, matches no case, and reaches the panic at
 the end of that function.
 
-This is reachable today by any AMD GPU workload on the systrap platform, and
-is a denial of service on the sandbox from inside it, so it is worth
+This is reachable by any workload that can mmap a proxied device whose host
+mmap fails — an AMD GPU workload on the systrap platform reaches it directly —
+and is a denial of service on the sandbox from inside it, so it is worth
 upstreaming on its own.
 
 ## File as a bug, not fixed here
@@ -218,6 +226,12 @@ This was measured on 6.8.0-134-lowlatency (Ubuntu 24.04.4). On that machine the
 `linux-image-lowlatency-hwe-24.04` metapackage is still 6.11 and would not help;
 `linux-lowlatency-hwe-24.04` is 7.0.0-28 and would.
 
+**Since confirmed.** That host was rebooted into 7.0.0-28 on 2026-08-10 and the
+bug is gone: real HIP workloads now run to completion under `--platform=kvm`,
+and multiple sandboxes share the GPU concurrently. The prediction above held
+exactly, which is also what retires the "consequence" section this document
+originally ended with.
+
 The kernel-version mapping is inferred from upstream history plus a signature
 match, not from reading 6.8's `kvm_main.c`. To confirm, run `pagewalk3` at
 16 MiB under `--platform=kvm`: it prints `OK pages: 0 1024 2048 2560 3072 3584`
@@ -238,9 +252,9 @@ In rough order of preference:
    the ioctl the sandbox issues, and forcing order-0 would be both a
    host-configuration change and a performance regression.
 
-Until the host is upgraded, systrap is the platform to target for AMD, which
-leaves the `/dev/kfd` problem below as the blocker. Note that a kernel upgrade
-does not help that one.
+Option 1 is what was done. Note that a kernel upgrade does not help the
+`/dev/kfd` problem below, which is why KVM rather than systrap is the platform
+for AMD.
 
 ### KFD mappings are impossible on the systrap platform
 
@@ -257,19 +271,27 @@ stub process, so `mmap` of `/dev/kfd` returns `EINVAL` there.
 
 Only the KFD mapping is process-bound; the render node's is not.
 
-## Consequence
+## Consequence: which platform to use for AMD
 
-Neither platform supports both mapping types, for different reasons, so no
-ROCm or HIP application runs yet:
+The two mapping types a ROCm application needs fail on different platforms for
+unrelated reasons, and only one combination works:
 
 | | `/dev/kfd` doorbell and MMIO | GPU memory via render node |
 | --- | --- | --- |
 | systrap | impossible, process-bound | works, all pages |
-| kvm | works | one page per TTM allocation |
+| kvm, host < 6.13 | works | one page per TTM allocation |
+| **kvm, host >= 6.13** | **works** | **works** |
 
-A minimal HIP program (`hipMalloc`, `hipMemcpy`, one kernel launch) that
-passes on the host dies in its first HIP call under both: `SIGSEGV` on
-systrap, `SIGBUS` on kvm.
+So **KVM on a host kernel >= 6.13 is the only supported configuration for AMD**,
+and it is a real one: HIP kernels run to completion and several sandboxes share
+the GPU at once. The systrap row is not fixable from gVisor — KFD binds the
+mapping to the process holding its context, and systrap maps from a stub
+process.
 
-The compute-unit and GPU-memory limits are unaffected by any of this. They
+This document originally ended by recording that no ROCm or HIP application ran
+under gVisor at all, on either platform. That is no longer true, and the reason
+it stopped being true was a host kernel upgrade rather than any change to
+gVisor.
+
+The compute-unit and GPU-memory limits were never affected by any of this. They
 are enforced where ioctls are interpreted, and are verified against hardware.
