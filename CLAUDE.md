@@ -46,6 +46,16 @@ active (`id` shows `docker`), plain `make build` works too.
 After building, copy `bazel-bin/runsc/runsc_/runsc` to both `~/amdtest/runsc`
 and `/usr/local/bin/runsc` — Docker and Kubernetes both run the latter.
 
+**Building on sens1:** `dmd` is *not* in the `docker` group here, unlike
+sensnucbox2, so the `-g docker` recipe above does not apply. `sudo docker`
+works, so put a shim first on `PATH` — `~/amdtest/bin/docker`, which is
+`exec sudo /usr/bin/docker "$@"` — and it covers both the bare `docker` calls
+in `images.mk` and `$(DOCKER_CLI_PATH)` in `bazel.mk`:
+```
+PATH=/home/dmd/amdtest/bin:$PATH make build TARGETS=//runsc:runsc \
+    DOCKER_CLI_PATH=/home/dmd/amdtest/bin/docker
+```
+
 **Check the hash, not bazel's summary.** Bazel reports "0 processes, 0 total
 actions" for a build whose output did change, and its `bazel-bin` symlink can
 point at a stale tree; `bazel clean` did *not* force a rebuild here. Confirm
@@ -96,6 +106,61 @@ anything Kubernetes-side.
   exactly its own 2048 MiB ceiling regardless of what the other allocates.
   The boot log shows each Sentry received its own disjoint flags from the
   device plugin's per-pod annotations.
+
+- **A CU mask must select whole workgroup processors.** RDNA pairs compute
+  units, and KFD returns EINVAL for a queue mask that enables half a pair.
+  amdproxy applies the sandbox's mask to every queue at creation, so a mask
+  like `0x7` made every queue creation fail; the proxy destroyed the queue as
+  designed, ROCr did not handle that and died on a null dereference, and what
+  the operator saw was a container that hung. `034d71a64` rejects such a mask
+  at startup, naming the offending compute unit and suggesting a valid mask.
+  The rule is driven by `gfx_target_version` from the host topology, so GCN and
+  CDNA — which do not pair — are unaffected. Measured: `0x3`, `0xc`, `0xf`,
+  `0x33`, `0x3ffffff` run; `0x1`, `0x5`, `0x7`, `0xaa`, `0x1fff`, `0x7ffffff`
+  all hung before and are now refused in about a second. **The slicing
+  granularity on RDNA is 2 CUs, not 1** — "half of 54" is 26 or 28, never 27.
+  Native ROCr does the opposite with such a mask: it silently ignores it and
+  runs on the whole device, which matters when comparing against native.
+
+## What concurrent sharing actually delivers
+
+Measured on sens1's Navi 32 with `gpuburn` (ALU-bound) and the harnesses in
+`~/amdtest/`: `fairness.sh`, `fairness2.sh`, `tenants.sh`, `nativevs.sh`.
+`~/amdtest/README.md` has the method and the traps.
+
+- **The proxy costs nothing measurable.** Solo full device: native 11833–11924
+  vs sandbox 11945–11987 iters/s. Solo 8 CUs: native 1586.5 vs sandbox 1591.0.
+- **Throughput tracks the mask.** 54 CUs 11987, 26 CUs 5849, 12 CUs 3154,
+  6 CUs 1609, 2 CUs 544. Per-CU rises as the slice shrinks (222/CU at 54,
+  272/CU at 2) because a smaller slice clocks higher.
+- **Isolation is the strongest result.** A on a disjoint half saw its rate move
+  **−0.61%** when B started underneath it and **+0.39%** when B left.
+- **Equal disjoint shares are exactly fair up to 3 tenants.** Two halves:
+  Jain 1.0000. Three thirds: 4424.2 / 4423.2 / 4425.7, Jain 1.0000. Two
+  sandboxes deliberately oversubscribed onto the *same* 26 CUs split 3349/3352,
+  Jain 1.0000 — neither starved.
+- **Memory quotas hold under concurrency.** Three sandboxes allocating at once
+  under 2 GiB / 1 GiB / 512 MiB each stopped at exactly its own ceiling and
+  each got exactly half back after freeing half. No cross-talk, and none saw
+  the device's 12272 MiB.
+- **Proportionality is approximate, not exact.** 2:1 in CUs gave 1.84:1 in
+  throughput (−8%), 3:1 gave 2.67:1 (−6.6%), 5:1 gave 5.75:1 (+31%). Fine for
+  capacity planning, not a precise dial.
+- **Past 3 tenants the GPU throttles, and that is not gVisor's doing.** With
+  8 CUs each, 2 and 3 tenants get 100% of solo; from 4 on, service goes bimodal
+  — some tenants at ~100%, the rest at ~58%. **Native processes using
+  `HSA_CU_MASK` behave identically**: at 6 tenants native scored Jain 0.9385
+  with aggregate 6805 and gVisor Jain 0.9387 with 6790, a 0.2% difference. So
+  this is the GPU and its driver, faithfully reproduced. Placement is not the
+  cause — 8 CUs at six different offsets all measure 1580–1588 solo, a 0.5%
+  spread. A plausible cause not yet confirmed is hardware queue slots
+  (`num_cp_queues 8`) being oversubscribed once each tenant's runtime brings
+  its own queues; that is a hypothesis, not a measurement.
+
+The practical reading: **this GPU slices cleanly for two or three tenants and
+degrades unevenly beyond that**, and the degradation is the hardware's, so a
+scheduler should cap concurrent GPU tenants rather than expect the CU mask to
+hold service flat.
 
 ## Two fixes that belong upstream, not here
 
