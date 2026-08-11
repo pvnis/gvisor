@@ -64,6 +64,12 @@ type Options struct {
 	// whatever assigns GPUs to sandboxes: masks are only a partition if they
 	// do not overlap, and a Sentry sees nothing but its own sandbox.
 	CUMask amdconf.CUMask
+
+	// CUsPerComputeGroup is the number of compute units the GPU schedules as
+	// an indivisible group: 2 on RDNA, where units are paired into workgroup
+	// processors, and 1 where they are independent. Zero means unknown, and
+	// disables the check that CUMask selects only whole groups.
+	CUsPerComputeGroup int
 }
 
 // DeviceInfo contains information on registered amdproxy devices. Device
@@ -93,6 +99,30 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	if len(opts.CUMask) > 0 {
 		if opts.CUMask.Empty() {
 			return nil, fmt.Errorf("amdproxy: CU mask selects no compute units")
+		}
+		// Refuse a mask the driver will not accept, here, rather than at the
+		// first queue the container creates.
+		//
+		// KFD rejects a mask that enables half of a workgroup processor with
+		// EINVAL. That failure surfaces at CREATE_QUEUE, where this package
+		// applies the mask; it destroys the queue as it should, but ROCr does
+		// not handle a failed queue creation and dies on a null dereference.
+		// What the operator sees is a container that starts, prints its device
+		// name, and then hangs, with the real reason one warning line deep in
+		// the Sentry log. Failing here instead names the problem while there
+		// is still someone to read it.
+		if n := opts.CUsPerComputeGroup; n > 1 {
+			if split := opts.CUMask.FirstSplitGroup(n); split >= 0 {
+				aligned := opts.CUMask.AlignedDownTo(n)
+				suggestion := fmt.Sprintf("%v (%d units)", aligned, aligned.Count())
+				if aligned.Empty() {
+					suggestion = "a mask selecting at least one whole group"
+				}
+				return nil, fmt.Errorf("amdproxy: CU mask %v selects compute unit %d but not the rest of its group of %d; "+
+					"this GPU schedules compute units in groups of %d, and the driver rejects a mask that splits one, "+
+					"so a container given this mask would fail at its first kernel launch. Select whole groups: %s",
+					opts.CUMask, split, n, n, suggestion)
+			}
 		}
 		log.Infof("amdproxy: GPU compute units limited to %v (%d units)", opts.CUMask, opts.CUMask.Count())
 	}

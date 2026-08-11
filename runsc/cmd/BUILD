@@ -73,6 +73,7 @@ go_library(
         "//pkg/metric",
         "//pkg/prometheus",
         "//pkg/amdsysfs",
+        "//pkg/sentry/devices/amdproxy/amdconf",
         "//pkg/rdma",
         "//pkg/ring0",
         "//pkg/sentry/checkpoint",

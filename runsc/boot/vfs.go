@@ -121,7 +121,7 @@ func cgroupfsMemoryDefaults(memoryLimit uint64) map[string]int64 {
 	}
 }
 
-func registerFilesystems(k *kernel.Kernel, info *containerInfo) error {
+func registerFilesystems(k *kernel.Kernel, info *containerInfo, amdGPUSysfs *amdsysfs.Snapshot) error {
 	ctx := k.SupervisorContext()
 	vfsObj := k.VFS()
 
@@ -196,7 +196,7 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo) error {
 		return err
 	}
 
-	if err := amdproxyRegisterDevices(info, vfsObj); err != nil {
+	if err := amdproxyRegisterDevices(info, vfsObj, amdGPUSysfs); err != nil {
 		return err
 	}
 
@@ -1741,7 +1741,7 @@ func nvproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem, 
 	return nil
 }
 
-func amdproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem) error {
+func amdproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem, amdGPUSysfs *amdsysfs.Snapshot) error {
 	if !specutils.AMDProxyEnabled(info.spec, info.conf) {
 		return nil
 	}
@@ -1749,10 +1749,13 @@ func amdproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem)
 	if err != nil {
 		return fmt.Errorf("invalid --amdproxy-cu-mask: %w", err)
 	}
+	// The host topology says whether this GPU schedules compute units in
+	// pairs, which decides whether a given mask is one the driver will accept.
 	devInfo, err := amdproxy.Register(vfsObj, &amdproxy.Options{
-		UseDevGofer:    true,
-		CUMask:         cuMask,
-		GPUMemoryLimit: info.conf.AMDProxyGPUMemoryLimit,
+		UseDevGofer:        true,
+		CUMask:             cuMask,
+		GPUMemoryLimit:     info.conf.AMDProxyGPUMemoryLimit,
+		CUsPerComputeGroup: amdGPUSysfs.CUsPerComputeGroup(),
 	})
 	if err != nil {
 		return fmt.Errorf("registering amdproxy driver: %w", err)

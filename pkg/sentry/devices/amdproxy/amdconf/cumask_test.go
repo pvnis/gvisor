@@ -134,3 +134,83 @@ func TestCUMaskString(t *testing.T) {
 		}
 	}
 }
+
+// The cases here are the masks measured against a Navi 32 (gfx1101): every
+// mask whose groups are whole was accepted by the driver and ran, and every
+// mask that split a pair was rejected with EINVAL and hung the container.
+func TestCUMaskFirstSplitGroup(t *testing.T) {
+	for _, tc := range []struct {
+		m    CUMask
+		n    int
+		want int
+	}{
+		// Whole pairs: no split.
+		{m: CUMask{0x3}, n: 2, want: -1},
+		{m: CUMask{0xc}, n: 2, want: -1},
+		{m: CUMask{0xf}, n: 2, want: -1},
+		{m: CUMask{0x33}, n: 2, want: -1},
+		{m: CUMask{0x3ffffff}, n: 2, want: -1},
+		// Half pairs: the lowest selected unit whose partner is missing.
+		{m: CUMask{0x1}, n: 2, want: 0},
+		{m: CUMask{0x2}, n: 2, want: 1},
+		{m: CUMask{0x5}, n: 2, want: 0},
+		{m: CUMask{0x7}, n: 2, want: 2},
+		{m: CUMask{0xaa}, n: 2, want: 1},
+		{m: CUMask{0x1fff}, n: 2, want: 12},
+		{m: CUMask{0x7ffffff}, n: 2, want: 26},
+		// A split across a word boundary is still a split.
+		{m: CUMask{0x0, 0x1}, n: 2, want: 32},
+		{m: CUMask{0x0, 0x3}, n: 2, want: -1},
+		// Groups of one, or of none, constrain nothing.
+		{m: CUMask{0x5}, n: 1, want: -1},
+		{m: CUMask{0x5}, n: 0, want: -1},
+		// An empty mask selects nothing, so it splits nothing.
+		{m: CUMask{0x0}, n: 2, want: -1},
+	} {
+		if got := tc.m.FirstSplitGroup(tc.n); got != tc.want {
+			t.Errorf("CUMask(%#x).FirstSplitGroup(%d) = %d, want %d", []uint32(tc.m), tc.n, got, tc.want)
+		}
+		if got, want := tc.m.AlignedTo(tc.n), tc.want < 0; got != want {
+			t.Errorf("CUMask(%#x).AlignedTo(%d) = %v, want %v", []uint32(tc.m), tc.n, got, want)
+		}
+	}
+}
+
+func TestCUMaskAlignedDownTo(t *testing.T) {
+	for _, tc := range []struct {
+		m    CUMask
+		n    int
+		want CUMask
+	}{
+		{m: CUMask{0x7}, n: 2, want: CUMask{0x3}},
+		{m: CUMask{0x5}, n: 2, want: CUMask{0x0}},
+		{m: CUMask{0xaa}, n: 2, want: CUMask{0x0}},
+		{m: CUMask{0x1fff}, n: 2, want: CUMask{0xfff}},
+		{m: CUMask{0x7ffffff}, n: 2, want: CUMask{0x3ffffff}},
+		// Already aligned masks are returned unchanged.
+		{m: CUMask{0xf}, n: 2, want: CUMask{0xf}},
+		{m: CUMask{0x33}, n: 2, want: CUMask{0x33}},
+		// Groups of one never clear anything.
+		{m: CUMask{0x5}, n: 1, want: CUMask{0x5}},
+	} {
+		got := tc.m.AlignedDownTo(tc.n)
+		if len(got) != len(tc.want) {
+			t.Errorf("CUMask(%#x).AlignedDownTo(%d) = %#x, want %#x", []uint32(tc.m), tc.n, []uint32(got), []uint32(tc.want))
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("CUMask(%#x).AlignedDownTo(%d) = %#x, want %#x", []uint32(tc.m), tc.n, []uint32(got), []uint32(tc.want))
+				break
+			}
+		}
+		// Aligning down must never widen the share: the result is always a
+		// subset of the original.
+		if !got.IsSubsetOf(tc.m) {
+			t.Errorf("CUMask(%#x).AlignedDownTo(%d) = %#x, which is not a subset", []uint32(tc.m), tc.n, []uint32(got))
+		}
+		if !got.AlignedTo(tc.n) {
+			t.Errorf("CUMask(%#x).AlignedDownTo(%d) = %#x, which is still not aligned", []uint32(tc.m), tc.n, []uint32(got))
+		}
+	}
+}

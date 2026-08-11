@@ -403,3 +403,68 @@ func Load(src string) (*Snapshot, error) {
 	}
 	return &s, nil
 }
+
+// CUsPerComputeGroup returns the number of compute units the GPUs in this
+// snapshot schedule as an indivisible group, or 0 if it cannot be determined.
+//
+// RDNA pairs compute units into workgroup processors, and KFD will not accept
+// a queue CU mask that enables one half of a pair without the other: the
+// SET_CU_MASK ioctl returns EINVAL. GCN and CDNA have no such pairing and take
+// any mask. The distinction is worth making rather than assuming, because the
+// consequence of getting it wrong is a container that appears to hang.
+//
+// gfx_target_version encodes the ISA as major*10000 + minor*100 + step, so
+// gfx1101 reads 110001. Everything from gfx10 on is RDNA.
+//
+// When a node reports no usable version the node is skipped; when the GPUs
+// disagree the largest group wins, since a mask has to satisfy every GPU it
+// might be applied to.
+func (s *Snapshot) CUsPerComputeGroup() int {
+	if s == nil || s.Topology == nil {
+		return 0
+	}
+	nodes := s.Topology.Dirs["nodes"]
+	if nodes == nil {
+		return 0
+	}
+	group := 0
+	for _, node := range nodes.Dirs {
+		if node == nil {
+			return 0
+		}
+		props, ok := node.Files["properties"]
+		if !ok {
+			continue
+		}
+		// simd_count is 0 on CPU nodes, which have no compute units to mask.
+		if propUint64(props, "simd_count") == 0 {
+			continue
+		}
+		ver := propUint64(props, "gfx_target_version")
+		if ver == 0 {
+			continue
+		}
+		n := 1
+		if ver/10000 >= 10 {
+			n = 2
+		}
+		if n > group {
+			group = n
+		}
+	}
+	return group
+}
+
+// propUint64 returns the value of the named key in a sysfs properties string,
+// or 0 if the key is absent or unparsable. Each line has the form "key value".
+func propUint64(data, key string) uint64 {
+	for _, line := range strings.Split(data, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if ok && k == key {
+			if n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}

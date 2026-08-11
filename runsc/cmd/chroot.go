@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/amdsysfs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rdma"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy/amdconf"
 	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
@@ -324,8 +325,42 @@ func amdGPUSysfsUpdateChroot(chroot string, spec *specs.Spec, conf *config.Confi
 	if snap == nil {
 		return nil
 	}
+	// Check the CU mask against the topology here, where the error still has
+	// somewhere useful to go. The Sentry checks it too, and must, since it is
+	// what enforces the mask; but by then the only channel back to the
+	// operator is the sandbox log, and the CLI reports nothing more specific
+	// than the sandbox failing to start.
+	if err := validateAMDCUMask(conf, snap); err != nil {
+		return err
+	}
 	if err := snap.Save(filepath.Join(chroot, amdsysfs.Path)); err != nil {
 		return fmt.Errorf("saving AMD GPU sysfs snapshot: %w", err)
 	}
 	return nil
+}
+
+// validateAMDCUMask rejects a --amdproxy-cu-mask the GPU's driver would not
+// accept, naming the compute unit at fault and a mask that would work.
+func validateAMDCUMask(conf *config.Config, snap *amdsysfs.Snapshot) error {
+	mask, err := amdconf.ParseCUMask(conf.AMDProxyCUMask)
+	if err != nil {
+		return fmt.Errorf("invalid --amdproxy-cu-mask: %w", err)
+	}
+	n := snap.CUsPerComputeGroup()
+	if len(mask) == 0 || n <= 1 {
+		return nil
+	}
+	split := mask.FirstSplitGroup(n)
+	if split < 0 {
+		return nil
+	}
+	aligned := mask.AlignedDownTo(n)
+	suggestion := fmt.Sprintf("%v, which selects %d units", aligned, aligned.Count())
+	if aligned.Empty() {
+		suggestion = "a mask selecting at least one whole group"
+	}
+	return fmt.Errorf("--amdproxy-cu-mask=%v selects compute unit %d but not the rest of its group of %d: "+
+		"this GPU schedules compute units in groups of %d and the driver rejects a mask that splits one, "+
+		"so the container would fail at its first kernel launch. Select whole groups, e.g. %s",
+		mask, split, n, n, suggestion)
 }

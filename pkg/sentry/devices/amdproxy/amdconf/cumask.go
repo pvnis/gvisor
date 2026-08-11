@@ -154,3 +154,67 @@ func ParseCUMask(s string) (CUMask, error) {
 // what any AMD GPU has, so that a mistaken value is rejected rather than
 // turned into a large allocation.
 const maxCUMaskHexDigits = 256
+
+// FirstSplitGroup returns the index of the lowest compute unit that is
+// selected while another unit in its group of size n is not, or -1 if m
+// selects only whole groups. n <= 1 always returns -1.
+//
+// RDNA schedules compute units in pairs (workgroup processors) and KFD refuses
+// a queue mask that enables half a pair, so a mask that splits a group is not
+// a narrower share: it is one the driver will not accept at all. Reporting
+// which unit splits lets the caller say so precisely.
+func (m CUMask) FirstSplitGroup(n int) int {
+	if n <= 1 {
+		return -1
+	}
+	total := len(m) * 32
+	for base := 0; base < total; base += n {
+		set, clear := -1, false
+		for i := base; i < base+n && i < total; i++ {
+			if m[i/32]&(1<<(uint(i)%32)) != 0 {
+				if set < 0 {
+					set = i
+				}
+			} else {
+				clear = true
+			}
+		}
+		if set >= 0 && clear {
+			return set
+		}
+	}
+	return -1
+}
+
+// AlignedTo reports whether m selects only whole groups of n compute units.
+func (m CUMask) AlignedTo(n int) bool {
+	return m.FirstSplitGroup(n) < 0
+}
+
+// AlignedDownTo returns a copy of m with every partially selected group of n
+// compute units cleared, so that the result selects only whole groups. It
+// never selects a unit m did not, so the result is always a share no wider
+// than the original — which is what makes it safe to suggest.
+func (m CUMask) AlignedDownTo(n int) CUMask {
+	out := append(CUMask(nil), m...)
+	if n <= 1 {
+		return out
+	}
+	total := len(out) * 32
+	for base := 0; base < total; base += n {
+		whole := true
+		for i := base; i < base+n; i++ {
+			if i >= total || out[i/32]&(1<<(uint(i)%32)) == 0 {
+				whole = false
+				break
+			}
+		}
+		if whole {
+			continue
+		}
+		for i := base; i < base+n && i < total; i++ {
+			out[i/32] &^= 1 << (uint(i) % 32)
+		}
+	}
+	return out
+}
