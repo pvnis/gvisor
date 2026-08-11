@@ -48,22 +48,33 @@ right.
 
 ## Where the work runs
 
-The AMD half runs here. The NVIDIA half was measured on a host with an
-**RTX 5070, driver 610.43.02** (open kernel modules), K3s v1.36.2+k3s1 and
-HAMi; that card is **not in either machine below today** (`lspci` here shows
-only the Navi 32), so re-running any nvproxy measurement needs that host back.
-`~/nvproxy-quota-test/` holds its harness, pod specs and results.
+**Since 2026-08-11, `sensai` and `sens1` are one k3s cluster serving both
+vendors** — NVIDIA slices on sensai, AMD slices on sens1, a single
+`RuntimeClass gvisor` resolving to each node's own runsc config. sens1's
+standalone k3s and its vCluster were destroyed to join it.
+`/home/dmd/vcluster-multitenant/TWO-VENDOR-CLUSTER.md` is the reference; read
+it before touching either node's Kubernetes setup.
 
-| | sens1 | sensnucbox2 |
-| --- | --- | --- |
-| OS / kernel | Ubuntu 24.04.4, **7.0.0-28-generic** | Ubuntu 26.04, 7.0.0-generic |
-| GPU | **Navi 32 discrete, gfx1101, 54 CUs, 12272 MiB** | **Phoenix1 APU**, gfx1103, 12 CUs, ~14170 MiB |
-| ROCm | **7.2** | 7.1 |
-| `gpu_id` | **63860** (changes on reboot) | 40786 |
-| `/dev/kfd` major | **234** (dynamic) | **511** (dynamic) |
-| docker | yes | yes |
-| kubernetes | **k3s + vCluster + AMD device plugin** | **yes, with the AMD device plugin** |
-| `sudo` | passwordless | **passwordless (`(ALL) NOPASSWD: ALL`)** |
+| | sensai | sens1 | sensnucbox2 |
+| --- | --- | --- | --- |
+| OS / kernel | Ubuntu 22.04.5, 6.8.0-117 | Ubuntu 24.04.4, **7.0.0-28-generic** | Ubuntu 26.04, 7.0.0-generic |
+| GPU | **RTX 5070, driver 610.43.02**, 12227 MiB | **Navi 32 discrete, gfx1101, 54 CUs, 12272 MiB** | **Phoenix1 APU**, gfx1103, 12 CUs, ~14170 MiB |
+| ROCm | — | **7.2** | 7.1 |
+| `gpu_id` | — | **63860** (changes on reboot) | 40786 |
+| `/dev/kfd` major | — | **234** (dynamic) | **511** (dynamic) |
+| docker | **no** (containerd only) | yes | yes |
+| kubernetes | **k3s control-plane**, Cilium, HAMi, vCluster | **k3s agent** + AMD device plugin | **yes, with the AMD device plugin** |
+| `sudo` | passwordless | passwordless | **passwordless (`(ALL) NOPASSWD: ALL`)** |
+
+The RTX 5070 is on sensai, so nvproxy measurements can be re-run there;
+`~/nvproxy-quota-test/` holds that harness. sensai has **no docker** and the
+user is not in the `kvm` group, so `//pkg/sentry/platform/kvm:kvm_cgo_test`
+fails there on `/dev/kvm` permission for reasons that have nothing to do with
+this branch. Build with bazel directly rather than `make build`.
+
+The two nodes reach each other **only over Tailscale** — sensai is NAT'd behind
+192.168.0.0/24 and is unreachable from sens1 — so both use their Tailscale
+address as the k3s `node-ip`. Do not "fix" a node IP back to a LAN address.
 
 sens1 was rebooted into kernel **7.0.0-28** on 2026-08-10, so the KVM bug below
 no longer applies on either host.
