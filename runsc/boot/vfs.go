@@ -1765,6 +1765,7 @@ func amdproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem,
 		CUMask:             cuMask,
 		GPUMemoryLimit:     info.conf.AMDProxyGPUMemoryLimit,
 		CUsPerComputeGroup: amdGPUSysfs.CUsPerComputeGroup(),
+		ShareKFDVM:         info.conf.AMDProxyShareKFDVM,
 	})
 	if err != nil {
 		return fmt.Errorf("registering amdproxy driver: %w", err)

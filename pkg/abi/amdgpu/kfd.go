@@ -659,3 +659,12 @@ type KFDIoctlRuntimeEnableArgs struct {
 	ModeMask         uint32
 	CapabilitiesMask uint32
 }
+
+// Bits of KFDIoctlRuntimeEnableArgs.ModeMask, from the
+// KFD_RUNTIME_ENABLE_MODE_* macros. The enable bit distinguishes a request to
+// bring the debug runtime up from a request to take it down; the same ioctl
+// serves both.
+const (
+	KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK    = 1
+	KFD_RUNTIME_ENABLE_MODE_TTMP_SAVE_MASK = 2
+)

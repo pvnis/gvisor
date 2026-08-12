@@ -400,12 +400,25 @@ func kfdAllocMemoryOfGPU(ki *kfdIoctlState) (uintptr, error) {
 	if !acct.admit(ki.ctx, kind, params.Size) {
 		return 0, linuxerr.ENOMEM
 	}
+	// When the sandbox's processes share one GPU address space, two of them
+	// can pick the same address believing they each have their own. Refusing
+	// is an ordinary allocation failure the runtime handles; aliasing would be
+	// silent data corruption.
+	guard := &ki.fd.dev.amdp.vaGuard
+	tgid := ki.t.ThreadGroup().ID()
+	if kind != memKindNone && !guard.admit(ki.ctx, params.VAAddr, params.Size, tgid) {
+		acct.release(kind, params.Size)
+		return 0, linuxerr.ENOMEM
+	}
 	n, err := kfdIoctlInvoke(ki, &params)
 	if err != nil {
 		acct.release(kind, params.Size)
 		return n, err
 	}
 	acct.record(params.Handle, kind, params.Size)
+	if kind != memKindNone {
+		guard.record(params.Handle, params.VAAddr, params.Size, tgid)
+	}
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err
 	}
@@ -425,6 +438,7 @@ func kfdFreeMemoryOfGPU(ki *kfdIoctlState) (uintptr, error) {
 		return n, err
 	}
 	ki.fd.dev.amdp.memAcct.forget(params.Handle)
+	ki.fd.dev.amdp.vaGuard.forget(params.Handle)
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err
 	}

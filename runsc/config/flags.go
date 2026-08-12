@@ -57,6 +57,7 @@ const (
 	flagNVProxyGPUPreempt        = "nvproxy-gpu-preempt"
 	flagAMDProxyCUMask           = "amdproxy-cu-mask"
 	flagAMDProxyGPUMemLimit      = "amdproxy-gpu-memory-limit"
+	flagAMDProxyShareKFDVM       = "amdproxy-share-kfd-vm"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
 	defaultQDiscTBFRate  = uint64(0)
@@ -201,6 +202,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("amdproxy", false, "WIP: enable support for AMD GPUs. AMD GPU support gets automatically enabled if /dev/kfd is present in the OCI spec.")
 	flagSet.Uint64(flagAMDProxyGPUMemLimit, 0, "maximum number of bytes of AMD GPU device memory that the sandbox may allocate at once. The limit is applied where the application's ioctls are interpreted, so sandboxed code cannot bypass it. 0 means no limit.")
+	flagSet.Bool(flagAMDProxyShareKFDVM, false, "let the processes of one sandbox share a single AMD GPU address space. The driver binds one address space per process and the Sentry is the process it sees, so without this only the first process in a sandbox to initialise the GPU succeeds and the rest fail with EBUSY; multi-process runtimes such as vLLM need it. The trade is that those processes then allocate from one address space, so an allocation that would overlap another process's is refused rather than aliased. Nothing is shared between sandboxes, so this does not weaken isolation between containers.")
 	flagSet.String(flagAMDProxyCUMask, "", "hexadecimal bitmask of the GPU compute units the sandbox may run on, one bit per unit. The mask is applied to every queue the sandbox creates, and is enforced by the GPU rather than by anything the sandbox can reach. Empty means every compute unit. Masks are only a partition if they do not overlap, which whatever assigns GPUs to sandboxes is responsible for.")
 	flagSet.Bool("rdmaproxy", false, "WIP: enable RDMA support for containers with /dev/infiniband/uverbs* devices.")
 	flagSet.Bool("tpuproxy", false, "LEGACY: enable support for TPU devices. TPU support gets automatically enabled if TPU devices are present in the OCI spec.")
@@ -246,6 +248,13 @@ var overrideAllowlist = map[string]struct {
 	flagNVProxyGPUPreempt:        {check: checkNVProxyGPUPreempt},
 	flagAMDProxyCUMask:           {check: checkAMDProxyCUMask},
 	flagAMDProxyGPUMemLimit:      {check: checkAMDProxyGPUMemoryLimit},
+	// Sharing an address space grants a container nothing at anyone else's
+	// expense: it neither widens the compute units nor raises the memory limit
+	// it was given, and no address space crosses a sandbox boundary. What it
+	// trades is the container's own protection against its processes
+	// overlapping each other, which is the container's business, so a workload
+	// that needs it may ask for it and no narrowing validator applies.
+	flagAMDProxyShareKFDVM: {},
 }
 
 // checkNVProxyGPUPreempt ensures that a container may ask to be preempted when

@@ -418,6 +418,10 @@ type Config struct {
 	// that the sandbox may allocate. Zero means no limit.
 	AMDProxyGPUMemoryLimit uint64 `flag:"amdproxy-gpu-memory-limit"`
 
+	// AMDProxyShareKFDVM allows the sandbox's processes to share one GPU
+	// address space, so that more than one of them can use the GPU.
+	AMDProxyShareKFDVM bool `flag:"amdproxy-share-kfd-vm"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

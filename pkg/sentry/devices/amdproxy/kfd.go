@@ -207,7 +207,7 @@ func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 	case amdgpu.AMDKFD_IOC_SET_XNACK_MODE:
 		return kfdIoctlSimple[amdgpu.KFDIoctlSetXNACKModeArgs](ki)
 	case amdgpu.AMDKFD_IOC_RUNTIME_ENABLE:
-		return kfdIoctlSimple[amdgpu.KFDIoctlRuntimeEnableArgs](ki)
+		return kfdRuntimeEnable(ki)
 	case amdgpu.AMDKFD_IOC_GET_TILE_CONFIG:
 		return kfdGetTileConfig(ki)
 	case amdgpu.AMDKFD_IOC_WAIT_EVENTS:

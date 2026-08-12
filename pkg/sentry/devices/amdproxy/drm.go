@@ -46,7 +46,12 @@ type renderDevice struct {
 // Open implements vfs.Device.Open.
 func (dev *renderDevice) Open(ctx context.Context, mnt *vfs.Mount, d *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	relpath := fmt.Sprintf("dri/renderD%d", dev.minor)
-	hostFD, containerName, err := openHostDevFile(ctx, relpath, dev.amdp.useDevGofer, opts.Flags)
+	// With address space sharing on, every process in the sandbox must end up
+	// on the same open file, or it will be refused the buffers the first one
+	// allocated; see renderShare.
+	hostFD, containerName, err := dev.amdp.renderShare.open(dev.minor, func() (int32, string, error) {
+		return openHostDevFile(ctx, relpath, dev.amdp.useDevGofer, opts.Flags)
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -70,6 +70,15 @@ type Options struct {
 	// processors, and 1 where they are independent. Zero means unknown, and
 	// disables the check that CUMask selects only whole groups.
 	CUsPerComputeGroup int
+
+	// ShareKFDVM allows the processes of this sandbox to share one GPU address
+	// space, so that more than one of them can use the GPU. The driver binds a
+	// single address space per process and the Sentry is one process, so
+	// without this only the first process to initialise the GPU succeeds.
+	//
+	// It is a correctness trade, confined to this sandbox; sharedvm.go states
+	// the terms.
+	ShareKFDVM bool
 }
 
 // DeviceInfo contains information on registered amdproxy devices. Device
@@ -93,8 +102,16 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		renderFDs:   make(map[*renderFD]struct{}),
 	}
 	amdp.memAcct.init(opts.GPUMemoryLimit)
+	amdp.vmShare.init(opts.ShareKFDVM)
+	amdp.vaGuard.init(opts.ShareKFDVM)
+	amdp.renderShare.init(opts.ShareKFDVM)
+	amdp.runtimeShare.init(opts.ShareKFDVM)
 	if opts.GPUMemoryLimit != 0 {
 		log.Infof("amdproxy: GPU memory limited to %d bytes", opts.GPUMemoryLimit)
+	}
+	if opts.ShareKFDVM {
+		log.Infof("amdproxy: the processes of this sandbox will share one GPU address space; " +
+			"allocations that would overlap between them are refused rather than aliased")
 	}
 	if len(opts.CUMask) > 0 {
 		if opts.CUMask.Empty() {
@@ -174,6 +191,21 @@ type amdproxy struct {
 	// every device and file description in the sandbox, so it accounts the
 	// sandbox's aggregate usage across all of its processes.
 	memAcct memAccount
+
+	// vmShare lets the sandbox's processes share the one GPU address space
+	// the driver will bind to it, and vaGuard keeps their allocations from
+	// overlapping once they do. Both are inert unless sharing is enabled.
+	vmShare vmShare
+	vaGuard vaGuard
+
+	// renderShare keeps the sandbox's processes on one open render node, so
+	// that the address space vmShare lets them share is one they can all
+	// actually allocate and map through.
+	renderShare renderShare
+
+	// runtimeShare makes the debug runtime, which the driver keeps once per
+	// KFD process, survive being enabled by more than one of them.
+	runtimeShare runtimeShare
 
 	fdsMu     sync.Mutex `state:"nosave"`
 	kfdFDs    map[*kfdFD]struct{}

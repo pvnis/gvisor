@@ -14,9 +14,10 @@ go_library(
         "kfd.go",
         "kfd_handlers.go",
         "kfd_mmap.go",
-        "memquota.go",
         "kfd_unsafe.go",
+        "memquota.go",
         "seccomp_filters.go",
+        "sharedvm.go",
     ],
     visibility = [
         "//pkg/sentry:internal",
