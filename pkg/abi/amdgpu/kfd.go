@@ -137,23 +137,6 @@ const (
 	KFD_IOC_WAIT_RESULT_FAIL     = 2
 )
 
-// kfdIoctlNRSVM is AMDKFD_IOC_SVM's ioctl number.
-//
-// SVM is the one KFD ioctl whose parameter struct is variable-length: a header
-// followed by NAttr attributes. The size the command number encodes therefore
-// grows with the number of attributes, and there is no single constant to
-// compare a command against — AMDKFD_IOC_SVM above is only the shape with no
-// attributes, which no real caller sends. Matching it alone silently denied
-// every SVM call, observed as "unsupported KFD ioctl UNKNOWN KFD COMMAND
-// 0xc0284b20" for a request carrying two attributes.
-const kfdIoctlNRSVM = 0x20
-
-// IsSVM reports whether cmd is an AMDKFD_IOC_SVM command carrying any number
-// of attributes.
-func IsSVM(cmd uint32) bool {
-	return linux.IOC_TYPE(cmd) == KFD_IOCTL_BASE && linux.IOC_NR(cmd) == kfdIoctlNRSVM
-}
-
 // String implements fmt.Stringer.String.
 func (i KFDIoctl) String() string {
 	switch i {

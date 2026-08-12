@@ -71,13 +71,6 @@ func drmVersion(ri *renderIoctlState) (uintptr, error) {
 	if _, err := params.CopyIn(ri.t, ri.argAddr); err != nil {
 		return 0, err
 	}
-	// TEMPORARY instrumentation: libdrm issues this twice, once to learn the
-	// lengths and once to fill the buffers it sized from them. If the second
-	// pass reports a longer length than the first, libdrm's NUL at
-	// name[name_len] lands one byte past its allocation.
-	ri.t.Infof("amdproxy: DRM_VERSION in  name=%#x nameLen=%d date=%#x dateLen=%d desc=%#x descLen=%d",
-		params.Name, params.NameLen, params.Date, params.DateLen, params.Desc, params.DescLen)
-
 	if params.NameLen > maxDRMVersionStrLen || params.DateLen > maxDRMVersionStrLen || params.DescLen > maxDRMVersionStrLen {
 		return 0, linuxerr.EINVAL
 	}
@@ -97,8 +90,6 @@ func drmVersion(ri *renderIoctlState) (uintptr, error) {
 	params.Desc = sliceAddr(descBuf, origDesc)
 	n, err := renderIoctlInvoke(ri, &params)
 	params.Name, params.Date, params.Desc = origName, origDate, origDesc
-	ri.t.Infof("amdproxy: DRM_VERSION out nameLen=%d dateLen=%d descLen=%d err=%v",
-		params.NameLen, params.DateLen, params.DescLen, err)
 	if err != nil {
 		return n, err
 	}
