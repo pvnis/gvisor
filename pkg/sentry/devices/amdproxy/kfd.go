@@ -222,19 +222,14 @@ func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 		return kfdSetCUMask(ki)
 	case amdgpu.AMDKFD_IOC_CREATE_QUEUE:
 		return kfdCreateQueue(ki)
+	case amdgpu.AMDKFD_IOC_SVM:
+		return kfdSVM(ki)
 	case amdgpu.AMDKFD_IOC_ALLOC_MEMORY_OF_GPU:
 		return kfdAllocMemoryOfGPU(ki)
 	case amdgpu.AMDKFD_IOC_FREE_MEMORY_OF_GPU:
 		return kfdFreeMemoryOfGPU(ki)
 	case amdgpu.AMDKFD_IOC_AVAILABLE_MEMORY:
 		return kfdAvailableMemory(ki)
-	}
-	// SVM is dispatched on its ioctl number alone, because it is the one KFD
-	// ioctl whose parameter struct is variable-length and so has no single
-	// command number; see amdgpu.IsSVM. The handler bounds the attribute count
-	// itself.
-	if amdgpu.IsSVM(ki.cmd) {
-		return kfdSVM(ki)
 	}
 	ctx.Warningf("amdproxy: unsupported KFD ioctl %s (%#x)", amdgpu.KFDIoctl(ki.cmd), ki.cmd)
 	return 0, linuxerr.EINVAL
