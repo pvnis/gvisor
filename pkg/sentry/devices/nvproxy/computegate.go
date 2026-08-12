@@ -99,6 +99,18 @@ type computeGate struct {
 	// that is merely connected.
 	submissions atomicbitops.Uint64
 
+	// totalSubmissions and totalRevokes are lifetime counts, never reset,
+	// logged alongside each other in revoke() so that a period during which
+	// the scheduler saw no activity can be checked directly against whether
+	// this sandbox's own fault path was reached at all -- rather than
+	// inferred from throughput and the scheduler's tick log alone. Debug
+	// instrumentation for the graph-replay-evasion hypothesis in
+	// ~/vllm-overhead/PLAN.md; not gated behind a flag because a false
+	// positive here (a rate this cheap, logged at 10Hz) costs nothing a
+	// production sandbox would notice.
+	totalSubmissions atomicbitops.Uint64
+	totalRevokes     atomicbitops.Uint64
+
 	// warnedPreempt records that a failed preempt has already been reported, so
 	// that a driver which cannot preempt at all does not log once per period
 	// forever.
@@ -531,6 +543,7 @@ func (g *computeGate) untilWindowEnd(t time.Time) time.Duration {
 
 // revoke invalidates every mapping of every gated file description.
 func (g *computeGate) revoke() {
+	revokes := g.totalRevokes.Add(1)
 	g.mu.Lock()
 	fds := make([]*frontendFD, 0, len(g.gated))
 	for fd := range g.gated {
@@ -540,6 +553,11 @@ func (g *computeGate) revoke() {
 	for _, fd := range fds {
 		fd.revokeMappings()
 	}
+	// revoke() runs unconditionally once per period regardless of activity,
+	// so this is a steady ~10Hz heartbeat rather than something that could
+	// itself go quiet: a gap here means the sandbox's run() goroutine has
+	// stopped, not that nothing was submitted.
+	log.Infof("nvproxy: computeGate heartbeat: revokes=%d totalSubmissions=%d gatedFDs=%d", revokes, g.totalSubmissions.Load(), len(fds))
 }
 
 // noteSubmission records that the sandbox tried to submit work, which is what
@@ -547,6 +565,7 @@ func (g *computeGate) revoke() {
 // one merely holding a share of it.
 func (g *computeGate) noteSubmission() {
 	g.submissions.Add(1)
+	g.totalSubmissions.Add(1)
 }
 
 // follow takes the sandbox's window from a scheduler reached over fd.
