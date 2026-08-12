@@ -1074,14 +1074,28 @@ func fbInfoApplyQuota(acct *memAccount, ctrlParams nvgpu.HasFBInfoList) {
 	}
 	// The driver reports each size independently, and an application may ask
 	// for either without the other, so find them before rewriting either.
+	//
+	// sizes are the remaining indices describing how much memory the device
+	// has. They are clamped one at a time rather than being paired with a free
+	// value, since they say nothing about what is available; NVML reads them
+	// for the total it reports, so leaving them alone gives nvidia-smi the
+	// device's size beside this sandbox's free.
 	var total, free *nvgpu.NV2080_CTRL_FB_INFO
+	var sizes []*nvgpu.NV2080_CTRL_FB_INFO
 	for i := uint32(0); i < size; i++ {
 		switch e := &entries[i]; e.Index {
 		case nvgpu.NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE:
 			total = e
 		case nvgpu.NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE:
 			free = e
+		case nvgpu.NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE,
+			nvgpu.NV2080_CTRL_FB_INFO_INDEX_TOTAL_RAM_SIZE,
+			nvgpu.NV2080_CTRL_FB_INFO_INDEX_USABLE_RAM_SIZE:
+			sizes = append(sizes, e)
 		}
+	}
+	for _, e := range sizes {
+		e.Data = uint32(acct.virtualFBSize(uint64(e.Data)*fbInfoUnitBytes) / fbInfoUnitBytes)
 	}
 	if total == nil && free == nil {
 		return

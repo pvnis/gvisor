@@ -438,6 +438,22 @@ const (
 	NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE = 0x00000016
 )
 
+// The remaining indices that report a quantity of video memory, from the same
+// header.
+//
+// These describe the memory physically present rather than the part of it
+// available for user allocations, so the CUDA driver does not read them for
+// cuMemGetInfo(). NVML does: measured, a sandbox limited to 2048 MiB saw
+// nvmlDeviceGetMemoryInfo() report the quota as free -- HEAP_FREE above being
+// rewritten -- and the whole 12227 MiB device as total, which does not even
+// add up against the free it was given. Anything reporting a share of a device
+// has to rewrite these too or the view it presents is inconsistent.
+const (
+	NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE        = 0x00000007
+	NV2080_CTRL_FB_INFO_INDEX_TOTAL_RAM_SIZE  = 0x00000008
+	NV2080_CTRL_FB_INFO_INDEX_USABLE_RAM_SIZE = 0x00000020
+)
+
 // Numbers of entries in NV2080_CTRL_FB_GET_INFO_V2_PARAMS.FBInfoList, which
 // the driver has grown over time as it defined more NV2080_CTRL_FB_INFO_INDEX
 // values.

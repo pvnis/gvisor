@@ -478,6 +478,23 @@ const fbInfoUnitBytes = 1024
 // Free memory is reported as the smaller of the quota's remaining headroom and
 // the device's actual free memory, since memory consumed by other sandboxes is
 // genuinely unavailable to this one.
+// virtualFBSize returns the size to report for one of the indices that
+// describes how much video memory the device has, given the driver's value.
+//
+// The quota is a ceiling on what the sandbox may allocate, so reporting more
+// than it as physically present tells the sandbox about memory it can never
+// have. This is deliberately the same clamp virtualFB applies to the heap
+// size, so that every size the sandbox can ask about agrees.
+func (a *memAccount) virtualFBSize(real uint64) uint64 {
+	a.mu.Lock()
+	limit := a.gpuLimit
+	a.mu.Unlock()
+	if limit == 0 {
+		return real
+	}
+	return min(real, limit)
+}
+
 func (a *memAccount) virtualFB(realTotal, realFree uint64) (total, free uint64) {
 	a.mu.Lock()
 	limit := a.gpuLimit
