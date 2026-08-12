@@ -258,6 +258,25 @@ A benchmark-harness trap worth naming: TinyLlama-Chat given a raw
 producing a plausible-looking but wrong tok/s number. Chat-tuned models need
 `/v1/chat/completions`; a benchmark can silently measure the wrong thing.
 
+### Disjoint CU masks isolate compute, not memory bandwidth
+
+Extended the two-tenant test to three real models (Qwen2.5-0.5B, TinyLlama-1.1B,
+SmolLM2-360M on the leftover CU pair, `0xc000000`). Two tenants cost each
+other little (−10.9%/−1.9%); a third roughly **tripled** the hit on the first
+two (−35.0%/−32.2%/−9.2%), reproduced exactly across two runs and fully
+recovered to solo the instant load stopped — real-time contention, not
+throttling. Host CPU ruled out (`mpstat`: 50-98% idle throughout, `%steal` 0).
+
+The reading: CU masks partition compute pipeline occupancy, not the memory
+bus, and LLM decode is memory-bandwidth-bound. Two tenants' more modest
+overlap didn't yet expose it; three did. This sharpens the existing "past 3
+tenants the GPU throttles" note from the pure `gpuburn` sweep — that was
+compute-bound and degraded only *past* 3 with 8 CUs each; real serving hits
+comparable degradation *at* 3, because it's bottlenecked on a different shared
+resource CU-mask partitioning was never going to isolate. VRAM bandwidth is
+the leading explanation, not confirmed with memory-controller counters — see
+`~/vllm-overhead/PLAN.md`.
+
 ### SVM: denying it is better than forwarding it
 
 Do not "fix" SVM by making it reach the driver. That was tried (`95a5fa7e1`)
