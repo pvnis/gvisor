@@ -155,6 +155,61 @@ the latter.
   Concurrent `memprobe` confirmed each sandbox sees exactly its own 2048 MiB
   ceiling regardless of what the other allocates.
 
+### A sandbox gets one KFD process context, and what follows from it
+
+KFD keys its `kfd_process` on the calling process's `mm`. Under `--platform=kvm`
+the caller is **the Sentry**, one host process for the whole sandbox, so every
+sandboxed process that opens `/dev/kfd` lands on one shared `kfd_process`.
+Measured: the same command run twice in one sandbox gave INIT OK then `EBUSY`,
+while the identical pod under runc gave INIT OK twice.
+
+**Consequently only one process per sandbox could use the GPU at all**, which
+ruled out every multi-process runtime. `--amdproxy-share-kfd-vm` (off by
+default, `781f822ec`) shares the one context instead. It needed three pieces,
+each found only after the previous one moved the failure:
+
+| | failure removed |
+| --- | --- |
+| ACQUIRE_VM answered locally for later processes | `EBUSY` on ACQUIRE_VM |
+| render node shared by `dup`, so one `drm_file` | `EACCES` on a GEM mmap offset |
+| RUNTIME_ENABLE made idempotent, released by the last holder | `EBUSY` on nr `0x25` |
+
+The second is the non-obvious one: DRM checks mmap permission per *file*
+(`drm_vma_node_is_allowed`), so sharing the address space without sharing the
+file leaves the second process unable to map what the first allocated.
+
+The cost is that those processes allocate from one address space while each
+believes it has its own, so `vaGuard` refuses an allocation overlapping another
+process's rather than aliasing it. **Nothing crosses a sandbox boundary** —
+each sandbox has its own Sentry and so its own `kfd_process` — so this is not
+an isolation regression; it is a correctness trade confined to the container
+that opts in, which is why it is off by default.
+
+This is the same root as the KFD-mmap process binding and SVM's EFAULT: the
+driver seeing the Sentry where it expects the application.
+
+### SVM: denying it is better than forwarding it
+
+Do not "fix" SVM by making it reach the driver. That was tried (`95a5fa7e1`)
+and reverted (`cc8d83036`) on an A/B of that single change: forwarded, vLLM's
+engine died with exit 128 during RCCL init; denied, the identical pod reached
+an 8.66 GiB KV cache. Denial gives ROCr an error it falls back from, and under
+KVM a driver acting on a guest VA is acting on the wrong memory.
+
+Note SVM is variable-length — a header plus `NAttr` attributes — so its command
+number encodes a different size per call and the exact-match dispatch never saw
+it. That is why the log said `UNKNOWN KFD COMMAND 0xc0284b20` rather than
+naming it.
+
+### A wedged GPU sandbox does not clean up
+
+It holds `/dev/kfd` and its VRAM. `kubectl delete --force` returns while the
+Sentry keeps running, and `runsc delete --force` returns 0 without reaping it.
+`pgrep runsc-sandbox` finds nothing because the Sentry appears as **`exe`**;
+`sudo lsof /dev/kfd` names it. Until it is gone `rocm-smi` shows the VRAM still
+held and the next pod fails with "Free memory on device cuda:0 (1.38/11.98
+GiB)", which reads like a quota bug and is not one.
+
 ### A CU mask must select whole workgroup processors
 
 RDNA pairs compute units, and KFD returns `EINVAL` for a queue mask that enables
@@ -404,13 +459,10 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
    workaround.
 3. **Send the two upstream fixes** (`797e29b80`, `6bfb3c267`) and file the KVM
    issue.
-4. **SVM (`AMDKFD_IOC_SVM`) is forwarded but architecturally limited.** The
-   handler is implemented (`ae2b9b4ab`) and the ioctl reaches the driver, which
-   returns EFAULT when it validates the VA range. SVM operates on the *calling
-   process's* VA space, but under KVM the Sentry is the calling process and
-   guest VAs are not in its address space — the same root as the KFD-mmap
-   process-binding limit. `hipMallocManaged` will not work; hipMalloc workloads
-   (vecadd) are unaffected.
+4. **SVM (`AMDKFD_IOC_SVM`) is denied, deliberately.** See the SVM section
+   above: forwarding it crashes ROCr's initialisation, and denial is what lets
+   ROCr fall back. `hipMallocManaged` will not work; hipMalloc workloads
+   (vecadd, and vLLM up to graph capture) are unaffected.
 5. **`/dev/kfd` mappings are impossible on systrap** (task #18). Not a bug: KFD
    binds each mapping to the process holding the KFD context, and systrap maps
    from a stub process, so `mmap` returns `EINVAL`. Only the KFD mapping is
