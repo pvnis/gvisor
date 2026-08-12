@@ -106,6 +106,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	amdp.vaGuard.init(opts.ShareKFDVM)
 	amdp.renderShare.init(opts.ShareKFDVM)
 	amdp.runtimeShare.init(opts.ShareKFDVM)
+	amdp.eventShare.init(opts.ShareKFDVM)
 	if opts.GPUMemoryLimit != 0 {
 		log.Infof("amdproxy: GPU memory limited to %d bytes", opts.GPUMemoryLimit)
 	}
@@ -206,6 +207,10 @@ type amdproxy struct {
 	// runtimeShare makes the debug runtime, which the driver keeps once per
 	// KFD process, survive being enabled by more than one of them.
 	runtimeShare runtimeShare
+
+	// eventShare bounds the waits of processes the driver refused a signal
+	// page, since an event can never wake them.
+	eventShare eventShare
 
 	fdsMu     sync.Mutex `state:"nosave"`
 	kfdFDs    map[*kfdFD]struct{}

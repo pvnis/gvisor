@@ -301,6 +301,13 @@ func kfdGetTileConfig(ki *kfdIoctlState) (uintptr, error) {
 // interrupt a wait at all.
 const waitEventsSliceMS = 100
 
+// pollingWaitCapMS bounds an unbounded wait by a process that cannot be woken
+// by an event. It has to be short enough that work does not sit finished and
+// unnoticed, and long enough that a process waiting on something slow is not
+// spinning. The caller treats the return as an ordinary timeout and decides
+// for itself whether to wait again.
+const pollingWaitCapMS = 20
+
 // kfdWaitEvents handles AMDKFD_IOC_WAIT_EVENTS. The parameters point at an
 // application array of kfd_event_data structs, each holding an event_id input
 // and exception-data outputs, so the pointer is retargeted at a Sentry buffer.
@@ -334,6 +341,21 @@ func kfdWaitEvents(ki *kfdIoctlState) (uintptr, error) {
 	origTimeout := params.Timeout
 	infinite := origTimeout == amdgpu.KFD_EVENT_TIMEOUT_INFINITE
 	remaining := origTimeout
+
+	// A process the driver refused a signal page cannot be woken by an event
+	// at all, so any long wait for one is a wait for something that will not
+	// happen. Cap it and let the caller re-read the signal out of its own
+	// memory instead, which is where the GPU wrote it; eventShare explains why
+	// that is sufficient. The cap applies to a long finite timeout as well as
+	// an infinite one, because either leaves the caller asleep past the point
+	// its work was done.
+	if tgid := ki.t.ThreadGroup().ID(); ki.fd.dev.amdp.eventShare.mustPoll(tgid) {
+		if infinite || remaining > pollingWaitCapMS {
+			ki.fd.dev.amdp.eventShare.logCap(ki.ctx, tgid, origTimeout)
+			infinite = false
+			remaining = pollingWaitCapMS
+		}
+	}
 
 	var n uintptr
 	var errno unix.Errno

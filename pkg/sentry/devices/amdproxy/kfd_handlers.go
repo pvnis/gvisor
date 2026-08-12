@@ -61,9 +61,14 @@ func kfdCreateEvent(ki *kfdIoctlState) (uintptr, error) {
 		ki.ctx.Infof("amdproxy: CREATE_EVENT signal page tgid=%d page=%#x err=%v",
 			ki.t.ThreadGroup().ID(), inPage, err)
 		if err != nil && ki.fd.dev.amdp.vmShare.enabled {
-			ki.ctx.Warningf("amdproxy: this sandbox's KFD signal page is already owned by another of its processes, " +
-				"so events for this one will never be delivered and a wait on them will block indefinitely. " +
-				"This is the known limit of --amdproxy-share-kfd-vm")
+			// This process cannot be woken by an event, so its waits are
+			// capped and it falls back to reading the signal out of its own
+			// memory; eventShare explains why that is enough.
+			ki.fd.dev.amdp.eventShare.markDenied(ki.t.ThreadGroup().ID())
+			ki.ctx.Warningf("amdproxy: this sandbox's KFD signal page is already owned by another of its processes, "+
+				"so thread group %d cannot be woken by an event and its waits will poll instead. "+
+				"This is inherent to --amdproxy-share-kfd-vm: a KFD process has one signal page",
+				ki.t.ThreadGroup().ID())
 		}
 	}
 	if err != nil {

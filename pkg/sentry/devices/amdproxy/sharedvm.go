@@ -305,6 +305,100 @@ func (rs *runtimeShare) leave(tgid kernel.ThreadID) bool {
 	return len(rs.holders) > 0
 }
 
+// eventShare records which processes the driver refused a signal page, and
+// bounds their waits so they make progress anyway.
+//
+// A caller proposes a buffer as the KFD process's signal page, which is where
+// the driver records that an event has fired. A KFD process has exactly one,
+// and a shared sandbox has one KFD process, so only its first process is
+// accepted:
+//
+//	tgid=6   page_in=0xf97400000001  err=<nil>
+//	tgid=18  page_in=0xf97400000002  err=invalid argument
+//
+// Their later events still get distinct slots, so nothing collides. What the
+// refused processes lose is the *wakeup*: the slots index a page they never
+// mapped, so the driver signals into memory they cannot see and a wait blocks
+// until its timeout. ROCr asks for no timeout, so that was forever.
+//
+// The signal itself is not lost. An HSA signal is a value the GPU writes into
+// the signal buffer, and the KFD event only exists to wake a waiter without
+// polling. So a refused process still learns its work finished by reading its
+// own memory — it just has to look, rather than being told. Capping its waits
+// gives it the chance to: the wait returns as a timeout, ROCr re-reads the
+// signal, and either proceeds or waits again.
+//
+// This costs a wakeup per cap interval on processes that would otherwise be
+// asleep, and only on those the driver refused. The first process in the
+// sandbox keeps real interrupt-driven wakeups and is untouched.
+//
+// +stateify savable
+type eventShare struct {
+	// enabled reports whether sharing was asked for. Immutable.
+	enabled bool
+
+	mu sync.Mutex `state:"nosave"`
+
+	// denied is the set of thread groups whose signal page the driver
+	// refused, and which therefore cannot be woken by an event.
+	// +checklocks:mu
+	denied map[kernel.ThreadID]struct{}
+
+	// capsLogged counts how many capped waits have been reported per thread
+	// group, so the timeouts a runtime actually asks for are visible without
+	// a line per wait.
+	// +checklocks:mu
+	capsLogged map[kernel.ThreadID]int
+}
+
+func (es *eventShare) init(enabled bool) {
+	es.enabled = enabled
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	es.denied = make(map[kernel.ThreadID]struct{})
+	es.capsLogged = make(map[kernel.ThreadID]int)
+}
+
+// maxCapLogsPerTG bounds how many capped waits are reported per thread group.
+const maxCapLogsPerTG = 3
+
+// logCap reports the first few waits capped for a thread group, including the
+// timeout the caller asked for, which is what says whether a runtime waits
+// indefinitely or merely for a long time.
+func (es *eventShare) logCap(ctx context.Context, tgid kernel.ThreadID, timeout uint32) {
+	es.mu.Lock()
+	n := es.capsLogged[tgid]
+	if n < maxCapLogsPerTG {
+		es.capsLogged[tgid] = n + 1
+	}
+	es.mu.Unlock()
+	if n < maxCapLogsPerTG {
+		ctx.Infof("amdproxy: capping a WAIT_EVENTS of %d ms from thread group %d to %d ms; it has no signal page and cannot be woken by an event",
+			timeout, tgid, pollingWaitCapMS)
+	}
+}
+
+func (es *eventShare) markDenied(tgid kernel.ThreadID) {
+	if !es.enabled {
+		return
+	}
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	es.denied[tgid] = struct{}{}
+}
+
+// mustPoll reports whether tgid can only learn of completion by reading its
+// own memory, and so must not be left waiting indefinitely.
+func (es *eventShare) mustPoll(tgid kernel.ThreadID) bool {
+	if !es.enabled {
+		return false
+	}
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	_, ok := es.denied[tgid]
+	return ok
+}
+
 // vaRange is the GPU address range one allocation occupies, and the process
 // that asked for it.
 //
