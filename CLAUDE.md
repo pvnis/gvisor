@@ -277,6 +277,40 @@ resource CU-mask partitioning was never going to isolate. VRAM bandwidth is
 the leading explanation, not confirmed with memory-controller counters — see
 `~/vllm-overhead/PLAN.md`.
 
+### Three tenants, real vCluster isolation, sustained load
+
+`tenant-amd-a/b/c` — three new vClusters, node-sync scoped to sens1 via
+`sync.fromHost.nodes.selector.labels: {gpu.vendor: amd}`
+(`~/vcluster-multitenant/values/amd-tenant.yaml`), rather than mutating
+`tenant-a`/`tenant-b`, which deliberately keep nodes faked for other tests.
+First AMD workload run through vCluster on this branch.
+
+Two things worth knowing before touching this again:
+
+- **A netpol gotcha specific to cross-node vClusters.** `tenant-netpol.yaml`'s
+  admin-access rule works for tenant-a/b because their control planes run on
+  sensai, where local traffic reaches them under sensai's own LAN IP. A
+  control plane on sens1 crosses Cilium's overlay, and Cilium resolves that
+  traffic to the reserved identity `remote-node` *before* checking any
+  `ipBlock` — so no CIDR guess, correct or not, ever matches it (two guesses
+  were tried and both silently dropped with a hung handshake, no RST).
+  `hubble observe --pod <ns>/<pod>` named it in one line; plain NetworkPolicy
+  cannot express "allow this identity" at all, only `CiliumNetworkPolicy`'s
+  `fromEntities: [remote-node]` can (`tenant-cnp-amd.yaml`).
+- **Pods scheduled via the real `hami-scheduler` path get automatic disjoint
+  CU-mask assignment** from the HAMi-gvisor fork's own allocator
+  (`cusForRequest`, proportional to the VRAM request) — and it **overrides**
+  a manually supplied `amd.com/cu-mask` rather than trusting it. The earlier
+  bare-namespace three-tenant test bypassed `hami-scheduler` entirely (AMD
+  pods there use the default scheduler), which is why it needed manual masks.
+  Three tenants requesting only their own VRAM, no CU hint given, got
+  genuinely disjoint masks (14/22/8 CUs, zero overlap) with no coordination.
+
+150 requests × 64 tokens per tenant, three tenants, three models, concurrent,
+~3 minutes: 60.7/57.0/50.1 tok/s, GPU at 100% throughout, no restarts,
+`torch.cuda.mem_get_info()` still showed only each tenant's own quota after
+450 real requests. See `~/vllm-overhead/PLAN.md`.
+
 ### SVM: denying it is better than forwarding it
 
 Do not "fix" SVM by making it reach the driver. That was tried (`95a5fa7e1`)
