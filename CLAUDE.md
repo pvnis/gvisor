@@ -188,6 +188,33 @@ that opts in, which is why it is off by default.
 This is the same root as the KFD-mmap process binding and SVM's EFAULT: the
 driver seeing the Sentry where it expects the application.
 
+### The signal page, and why sharing needs a polling fallback
+
+A KFD process has exactly **one signal page** — where the driver records that
+an event fired — so in a shared sandbox only the first process gets one and the
+rest are refused EINVAL:
+
+```
+tgid=6   page_in=0xf97400000001  err=<nil>
+tgid=18  page_in=0xf97400000002  err=invalid argument
+```
+
+Their events still get distinct slots, so nothing collides; what they lose is
+the *wakeup*, and they waited forever for one that was not coming. The signal
+itself is never lost — an HSA signal is a value the GPU writes into the buffer,
+and the event only saves a waiter from polling. So refused processes get their
+waits capped, re-read the signal from their own memory, and proceed
+(`4196b648d`).
+
+**The cap must catch long finite waits, not just `KFD_EVENT_TIMEOUT_INFINITE`.**
+ROCr asks for `0xFFFFFFFE`, one less than the sentinel. A first version matched
+the sentinel exactly and changed nothing; that off-by-one was the whole
+difference between a hang and a working server.
+
+**vLLM 0.16.0 now serves inference under gVisor on AMD**, and costs **9.3%**:
+186.9 tok/s native against 169.5 tok/s sandboxed, both within 0.5% run to run.
+See `~/vllm-overhead/PLAN.md`; that is one model at concurrency 1, not a sweep.
+
 ### SVM: denying it is better than forwarding it
 
 Do not "fix" SVM by making it reach the driver. That was tried (`95a5fa7e1`)
