@@ -141,12 +141,96 @@ func drmAMDGPUInfo(ri *renderIoctlState) (uintptr, error) {
 	if err != nil {
 		return n, err
 	}
+	rewriteAMDGPUInfoQuery(&ri.fd.dev.amdp.memAcct, params.Query, retBuf)
 	if _, err := primitive.CopyByteSliceOut(ri.t, hostarch.Addr(origPtr), retBuf); err != nil {
 		return n, err
 	}
 	// The driver does not modify the parameter struct itself, so there is
 	// nothing else to copy out.
 	return n, nil
+}
+
+// rewriteAMDGPUInfoQuery overwrites a subset of DRM_IOCTL_AMDGPU_INFO answers
+// in place, for the query codes that report VRAM or GTT capacity and use.
+// Forwarded unchanged, those disclose the real device's total memory
+// regardless of the sandbox's quota, and every other process's usage on top
+// of it — the same thing AMDKFD_IOC_AVAILABLE_MEMORY already exists to keep a
+// sandbox from seeing. buf must be exactly the size the query answers with;
+// a caller that asked for less (or a query type that returns something
+// smaller, such as a single AMDGPU_INFO_VBIOS_SIZE integer that happens to
+// share no query code with these) is left alone rather than risk rewriting
+// past what it actually holds.
+//
+// Every other query — device info, firmware versions, engine topology — is
+// left untouched. None of them name a size a quota bounds or a rate another
+// tenant's activity would show up in.
+func rewriteAMDGPUInfoQuery(acct *memAccount, query uint32, buf []byte) {
+	vram, hostPinned, limit, limited := acct.snapshot()
+	clamp := func(v uint64) uint64 {
+		if limited && v > limit {
+			return limit
+		}
+		return v
+	}
+	switch query {
+	case amdgpu.AMDGPU_INFO_VRAM_USAGE, amdgpu.AMDGPU_INFO_VIS_VRAM_USAGE:
+		if len(buf) != 8 {
+			return
+		}
+		// Both ask "how much VRAM is in use"; VIS_VRAM_USAGE means within the
+		// CPU-visible aperture specifically, which this package does not
+		// track separately from VRAM as a whole. Reporting the sandbox's
+		// total VRAM usage is an overstatement of that narrower figure, never
+		// an understatement, and never another tenant's.
+		v := primitive.Uint64(vram)
+		v.MarshalUnsafe(buf)
+	case amdgpu.AMDGPU_INFO_GTT_USAGE:
+		if len(buf) != 8 {
+			return
+		}
+		v := primitive.Uint64(hostPinned)
+		v.MarshalUnsafe(buf)
+	case amdgpu.AMDGPU_INFO_VRAM_GTT:
+		if len(buf) != amdgpu.SizeofDRMAMDGPUVRAMGTT {
+			return
+		}
+		var vg amdgpu.DRMAMDGPUVRAMGTTInfo
+		vg.UnmarshalUnsafe(buf)
+		vg.VRAMSize = clamp(vg.VRAMSize)
+		vg.VRAMCPUAccessibleSize = clamp(vg.VRAMCPUAccessibleSize)
+		// GTTSize is host system memory available for pinning, a host
+		// property this package does not quota separately — memKindHostPinned
+		// is tracked but not limited, because it is already bounded by the
+		// sandbox's own memory limits. Left as the driver reported it.
+		vg.MarshalUnsafe(buf)
+	case amdgpu.AMDGPU_INFO_MEMORY:
+		if len(buf) != amdgpu.SizeofDRMAMDGPUMemoryInfo {
+			return
+		}
+		var mi amdgpu.DRMAMDGPUMemoryInfo
+		mi.UnmarshalUnsafe(buf)
+		mi.VRAMTotalHeapSize = clamp(mi.VRAMTotalHeapSize)
+		mi.VRAMUsableHeapSize = clamp(mi.VRAMUsableHeapSize)
+		mi.VRAMMaxAllocation = clamp(mi.VRAMMaxAllocation)
+		mi.VRAMHeapUsage = vram
+		mi.CPUAccessibleVRAMTotalHeapSize = clamp(mi.CPUAccessibleVRAMTotalHeapSize)
+		mi.CPUAccessibleVRAMUsableHeapSize = clamp(mi.CPUAccessibleVRAMUsableHeapSize)
+		mi.CPUAccessibleVRAMMaxAllocation = clamp(mi.CPUAccessibleVRAMMaxAllocation)
+		// The CPU-accessible pool is a subset of VRAM as a whole and this
+		// package does not track how much of a sandbox's usage falls inside
+		// it, so bound the estimate by the pool's own (possibly clamped)
+		// size rather than reporting all of vram, which could overstate it.
+		if vram < mi.CPUAccessibleVRAMTotalHeapSize {
+			mi.CPUAccessibleVRAMHeapUsage = vram
+		} else {
+			mi.CPUAccessibleVRAMHeapUsage = mi.CPUAccessibleVRAMTotalHeapSize
+		}
+		// GTT capacity is left as reported, for the reason given in the
+		// AMDGPU_INFO_VRAM_GTT case above; only its usage is a per-tenant
+		// figure worth hiding.
+		mi.GTTHeapUsage = hostPinned
+		mi.MarshalUnsafe(buf)
+	}
 }
 
 // sliceAddr returns the address of buf's first byte, or 0 if the application

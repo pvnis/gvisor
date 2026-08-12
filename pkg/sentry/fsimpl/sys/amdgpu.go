@@ -270,8 +270,20 @@ func (fs *filesystem) newSnapshotDir(ctx context.Context, creds *auth.Credential
 }
 
 // applyMemoryLimit returns a shallow copy of topo with GPU memory-bank
-// size_in_bytes fields rewritten to limitBytes. Only banks with heap_type 1
-// (local/VRAM) are rewritten; system-RAM banks (heap_type 0) are left alone.
+// size_in_bytes fields rewritten to limitBytes. Banks with heap_type 1 or 2
+// (local/VRAM — CDNA and RDNA discrete GPUs report different values for the
+// same kind of memory) are rewritten; system-RAM banks (heap_type 0) are left
+// alone.
+//
+// Measured on sens1's Navi 32: heap_type is 2, not 1. Checking only 1 left the
+// real 12868124672-byte device total reachable through this path regardless of
+// quota — the same disclosure AMDKFD_IOC_AVAILABLE_MEMORY exists to prevent,
+// just via sysfs instead of an ioctl, and the one a framework actually reads
+// to decide how much memory it may plan for: torch.cuda.mem_get_info()'s
+// total came from here unclamped while its free, from AVAILABLE_MEMORY, was
+// correctly the quota. The AMD device plugin's own topology discovery
+// (~/amdgpu-device-plugin/topology.go) already treats 1 and 2 alike for this
+// reason; this rewrite had not been brought into agreement with it.
 // local_mem_size in the per-node properties is also rewritten, covering
 // discrete GPUs where that field is non-zero.
 //
@@ -331,7 +343,7 @@ func rewriteNodeMemory(node *amdsysfs.Dir, limitBytes uint64) *amdsysfs.Dir {
 		}
 		for name, bank := range memBanks.Dirs {
 			if bank != nil {
-				if props, ok := bank.Files["properties"]; ok && memBankHeapType(props) == 1 {
+				if props, ok := bank.Files["properties"]; ok && isVRAMHeap(memBankHeapType(props)) {
 					newBank := &amdsysfs.Dir{
 						Files: make(map[string]string, len(bank.Files)),
 						Dirs:  bank.Dirs,
@@ -367,6 +379,15 @@ func rewriteProp(data, key string, newVal uint64) string {
 
 // memBankHeapType returns the heap_type value from a mem_banks properties
 // string, or -1 if it cannot be parsed.
+// isVRAMHeap reports whether a KFD heap_type value is device memory (as
+// opposed to system RAM the GPU can access, heap_type 0). CDNA and RDNA
+// discrete GPUs are observed to report different values — 1 and 2
+// respectively — for what the AMD device plugin's own topology discovery
+// already treats as the same thing.
+func isVRAMHeap(heapType int) bool {
+	return heapType == 1 || heapType == 2
+}
+
 func memBankHeapType(data string) int {
 	for _, line := range strings.Split(data, "\n") {
 		k, v, ok := strings.Cut(strings.TrimSpace(line), " ")

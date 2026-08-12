@@ -46,10 +46,32 @@ const DRM_COMMAND_BASE = 0x40
 // Sizes of the DRM ioctl parameter structs below, verified against
 // include/uapi/drm/drm.h and include/uapi/drm/amdgpu_drm.h.
 const (
-	SizeofDRMVersion       = 64
-	SizeofDRMClient        = 40
-	SizeofDRMAMDGPUInfo    = 32
-	SizeofDRMAMDGPUInfoDev = 448
+	SizeofDRMVersion          = 64
+	SizeofDRMClient           = 40
+	SizeofDRMAMDGPUInfo       = 32
+	SizeofDRMAMDGPUInfoDev    = 448
+	SizeofDRMAMDGPUVRAMGTT    = 24
+	SizeofDRMAMDGPUMemoryInfo = 96
+)
+
+// AMDGPU_INFO_* query codes for DRM_IOCTL_AMDGPU_INFO's Query field, from
+// include/uapi/drm/amdgpu_drm.h. Only the ones this package rewrites are
+// named; every other query is forwarded to the driver unchanged.
+//
+// These five all report how much VRAM or GTT (host memory pinned for the GPU)
+// exists or is in use, at device granularity. Forwarded unchanged, a sandboxed
+// process could read the real card's capacity regardless of its quota, and
+// read what every other process on the host — including other tenants — has
+// allocated. Ground-truthed against /usr/include/drm/amdgpu_drm.h on sens1:
+// each struct's size and field order below was read back with a C program
+// issuing the ioctl directly against the real render node, not from
+// documentation.
+const (
+	AMDGPU_INFO_VRAM_USAGE     = 0x10
+	AMDGPU_INFO_GTT_USAGE      = 0x11
+	AMDGPU_INFO_VRAM_GTT       = 0x14
+	AMDGPU_INFO_VIS_VRAM_USAGE = 0x17
+	AMDGPU_INFO_MEMORY         = 0x19
 )
 
 // DRMIoctl represents a DRM ioctl command number.
@@ -110,6 +132,41 @@ type DRMClient struct {
 	UID   uint64
 	Magic uint64
 	IOCs  uint64
+}
+
+// DRMAMDGPUVRAMGTTInfo is struct drm_amdgpu_info_vram_gtt, the answer to
+// AMDGPU_INFO_VRAM_GTT: the capacity of each memory pool the GPU draws from.
+//
+// +marshal
+type DRMAMDGPUVRAMGTTInfo struct {
+	_                     structs.HostLayout
+	VRAMSize              uint64
+	VRAMCPUAccessibleSize uint64
+	GTTSize               uint64
+}
+
+// DRMAMDGPUMemoryInfo is struct drm_amdgpu_memory_info, the answer to
+// AMDGPU_INFO_MEMORY: capacity and use of VRAM, the CPU-accessible part of
+// VRAM, and GTT. Each is struct drm_amdgpu_heap_info (total, usable, in-use
+// and maximum-single-allocation, in that order) and the three appear back to
+// back with no padding, which this flattens into one struct rather than
+// nesting three separately-marshalled ones.
+//
+// +marshal
+type DRMAMDGPUMemoryInfo struct {
+	_                               structs.HostLayout
+	VRAMTotalHeapSize               uint64
+	VRAMUsableHeapSize              uint64
+	VRAMHeapUsage                   uint64
+	VRAMMaxAllocation               uint64
+	CPUAccessibleVRAMTotalHeapSize  uint64
+	CPUAccessibleVRAMUsableHeapSize uint64
+	CPUAccessibleVRAMHeapUsage      uint64
+	CPUAccessibleVRAMMaxAllocation  uint64
+	GTTTotalHeapSize                uint64
+	GTTUsableHeapSize               uint64
+	GTTHeapUsage                    uint64
+	GTTMaxAllocation                uint64
 }
 
 // DRMAMDGPUInfo is struct drm_amdgpu_info. ReturnPointer names a buffer of

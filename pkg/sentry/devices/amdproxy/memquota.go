@@ -207,6 +207,19 @@ func (ma *memAccount) forget(handle uint64) {
 	ma.releaseLocked(c.kind, c.size)
 }
 
+// snapshot returns the sandbox's own charged VRAM and host-pinned memory,
+// together with the VRAM limit if one is set. It exists for driver queries
+// that report device-wide totals and usage — DRM_IOCTL_AMDGPU_INFO among
+// them — so that this package can rewrite them to what the sandbox itself may
+// see and has used, rather than forwarding what the whole device is doing.
+// Forwarding those unchanged would disclose one tenant's usage to another,
+// which is exactly what accounting the limit here is meant to prevent.
+func (ma *memAccount) snapshot() (vram, hostPinned, limit uint64, limited bool) {
+	ma.mu.Lock()
+	defer ma.mu.Unlock()
+	return ma.vram, ma.hostPinned, ma.gpuLimit, ma.gpuLimit != 0
+}
+
 // availableVRAM returns how many more bytes of device memory the sandbox may
 // allocate, and whether a limit applies at all.
 func (ma *memAccount) availableVRAM() (uint64, bool) {
