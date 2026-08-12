@@ -215,6 +215,49 @@ difference between a hang and a working server.
 186.9 tok/s native against 169.5 tok/s sandboxed, both within 0.5% run to run.
 See `~/vllm-overhead/PLAN.md`; that is one model at concurrency 1, not a sweep.
 
+### A sandbox's own VRAM total was leaking the real device's
+
+Two independent gaps, both letting a sandbox see the whole card instead of its
+quota, found while sizing a smaller-than-full-device slice for a two-tenant
+test (`a3d7937ed`):
+
+- `DRM_IOCTL_AMDGPU_INFO` forwarded every query unchanged — `AMDGPU_INFO_MEMORY`,
+  `VRAM_GTT`, `VRAM_USAGE`, `VIS_VRAM_USAGE`, `GTT_USAGE` all report
+  device-wide capacity and use. Ground-truthed against the real header on
+  sens1 the way this branch always does; a small C probe against the actual
+  render node confirmed struct layout before writing any Go. Now clamped and
+  rewritten to the sandbox's own accounted usage, the same shape as
+  `AMDKFD_IOC_AVAILABLE_MEMORY`.
+- The actual leak for the case that mattered: the KFD-topology sysfs rewrite
+  in `pkg/sentry/fsimpl/sys/amdgpu.go` only matched `heap_type == 1`. Measured
+  on sens1's Navi 32, the real value is **`heap_type 2`** — RDNA reports VRAM
+  differently from CDNA — so `size_in_bytes` was never rewritten and
+  `torch.cuda.mem_get_info()` returned quota-correct `free` next to the whole
+  device's `total`. The AMD device plugin's own topology code
+  (`~/amdgpu-device-plugin/topology.go`) already treated `1` and `2` alike;
+  the gVisor-side rewrite had never been brought into agreement with it.
+
+Symptom before the fix: a small slice (e.g. 6 of 23) failed
+`--gpu-memory-utilization` outright, because vLLM computed its budget against
+the real 12272 MiB card rather than the sandbox's quota. Fixed, an ordinary
+utilization value works regardless of slice size.
+
+### Two vLLM tenants, two different models, concurrently: it works
+
+Qwen2.5-0.5B and TinyLlama-1.1B-Chat, disjoint 26-CU halves
+(`0x3ffffff`/`0x3ffffff0000000`), each with its own quota, both under
+`--amdproxy-share-kfd-vm`. Both served the full request load: A 77.1→68.7
+tok/s (−10.9%) under B's load, B 63.4→62.2 tok/s (−1.9%) under A's — the same
+shape already measured with `gpuburn` on disjoint masks, now with two real
+models actually serving. `torch.cuda.mem_get_info()` in each pod showed only
+its own quota throughout, holding under concurrent load. First
+concurrent-workload result on the sharing branch; see `~/vllm-overhead/PLAN.md`.
+
+A benchmark-harness trap worth naming: TinyLlama-Chat given a raw
+`/v1/completions` prompt emitted EOS immediately (`completion_tokens: 1`),
+producing a plausible-looking but wrong tok/s number. Chat-tuned models need
+`/v1/chat/completions`; a benchmark can silently measure the wrong thing.
+
 ### SVM: denying it is better than forwarding it
 
 Do not "fix" SVM by making it reach the driver. That was tried (`95a5fa7e1`)
