@@ -136,6 +136,9 @@ func (fs *filesystem) newAMDGPUPCI(ctx context.Context, creds *auth.Credentials,
 		files    map[string]string
 		drm      []amdsysfs.DRMNode
 		hwmon    map[string]map[string]string
+		// depth is how many components the node's path has under
+		// /sys/devices, used to aim the "subsystem" symlink back at /sys.
+		depth int
 	}
 	roots := make(map[string]*node)
 	getNode := func(p string) *node {
@@ -160,6 +163,7 @@ func (fs *filesystem) newAMDGPUPCI(ctx context.Context, creds *auth.Credentials,
 		n := getNode(d.Path)
 		n.files = attrs[d.Path]
 		n.hwmon = d.Hwmon
+		n.depth = len(strings.Split(d.Path, "/"))
 	}
 	for pciPath, nodes := range nodesByPCI {
 		getNode(pciPath).drm = nodes
@@ -177,6 +181,21 @@ func (fs *filesystem) newAMDGPUPCI(ctx context.Context, creds *auth.Credentials,
 			if amdsysfs.SafeName(name) {
 				contents[name] = build(child, name)
 			}
+		}
+		if n.depth > 0 {
+			// libdrm reads this to learn which bus the device is on. Its
+			// absence is not handled as an error: readlink returns ENOENT and
+			// libdrm then corrupts its heap, which surfaces as "double free
+			// or corruption" and a SIGABRT in anything using it - amdsmi, and
+			// so every ROCm framework that probes for a GPU that way.
+			//
+			// Only the link's text is read, never followed, so it does not
+			// matter that /sys/bus is not otherwise synthesised; what libdrm
+			// wants is the final component, "pci". The depth is the node's
+			// own path components plus one for "devices", to climb back to
+			// /sys.
+			contents["subsystem"] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(),
+				strings.Repeat("../", n.depth+1)+"bus/pci")
 		}
 		if len(n.hwmon) > 0 {
 			// The AMD SMI library reads the card's sensor names and labels
