@@ -191,7 +191,7 @@ func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 	case amdgpu.AMDKFD_IOC_GET_CLOCK_COUNTERS:
 		return kfdIoctlSimple[amdgpu.KFDIoctlGetClockCountersArgs](ki)
 	case amdgpu.AMDKFD_IOC_CREATE_EVENT:
-		return kfdIoctlSimple[amdgpu.KFDIoctlCreateEventArgs](ki)
+		return kfdCreateEvent(ki)
 	case amdgpu.AMDKFD_IOC_DESTROY_EVENT:
 		return kfdIoctlSimple[amdgpu.KFDIoctlDestroyEventArgs](ki)
 	case amdgpu.AMDKFD_IOC_SET_EVENT:

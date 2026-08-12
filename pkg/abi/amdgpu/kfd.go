@@ -121,6 +121,22 @@ var (
 	AMDKFD_IOC_DBG_TRAP                  = KFDIoctl(linux.IOWR(KFD_IOCTL_BASE, 0x26, SizeofKFDIoctlDbgTrapArgs))
 )
 
+// Timeout values for KFDIoctlWaitEventsArgs.Timeout, in milliseconds, from the
+// KFD_EVENT_TIMEOUT_* macros.
+const (
+	KFD_EVENT_TIMEOUT_IMMEDIATE = 0
+	KFD_EVENT_TIMEOUT_INFINITE  = 0xFFFFFFFF
+)
+
+// Values of KFDIoctlWaitEventsArgs.WaitResult, from the
+// KFD_IOC_WAIT_RESULT_* macros. The ioctl succeeds on a timeout and reports it
+// here rather than through an errno.
+const (
+	KFD_IOC_WAIT_RESULT_COMPLETE = 0
+	KFD_IOC_WAIT_RESULT_TIMEOUT  = 1
+	KFD_IOC_WAIT_RESULT_FAIL     = 2
+)
+
 // kfdIoctlNRSVM is AMDKFD_IOC_SVM's ioctl number.
 //
 // SVM is the one KFD ioctl whose parameter struct is variable-length: a header

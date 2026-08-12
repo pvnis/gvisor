@@ -295,12 +295,28 @@ func kfdGetTileConfig(ki *kfdIoctlState) (uintptr, error) {
 	return n, nil
 }
 
+// waitEventsSliceMS bounds how long a single forwarded WAIT_EVENTS may block
+// before this package looks at the calling task again. It trades a wakeup
+// every tenth of a second, on a task that is asleep anyway, for the ability to
+// interrupt a wait at all.
+const waitEventsSliceMS = 100
+
 // kfdWaitEvents handles AMDKFD_IOC_WAIT_EVENTS. The parameters point at an
 // application array of kfd_event_data structs, each holding an event_id input
 // and exception-data outputs, so the pointer is retargeted at a Sentry buffer.
 //
-// WAIT_EVENTS can block for its Timeout duration; unix.Syscall is used so
-// the Go runtime may schedule other goroutines on this OS thread while waiting.
+// The wait is forwarded in slices rather than in one call, because a task
+// parked in a host ioctl cannot be interrupted. Forwarding an application's
+// whole timeout — commonly infinite — made a sandbox that was waiting on an
+// event that never arrives unkillable: the pod stuck in Terminating, the GPU
+// stayed allocated, and only killing the Sentry by pid released it. A
+// container could strand a GPU that way, so the wait now returns to this
+// package often enough to notice that its task has been interrupted.
+//
+// KFD reports a timeout by succeeding and setting WaitResult, not through an
+// errno, so a slice that expires is not an error and the loop simply continues
+// until the caller's own timeout runs out. Events stay signalled until a wait
+// consumes them, so slicing cannot miss one that arrives between calls.
 func kfdWaitEvents(ki *kfdIoctlState) (uintptr, error) {
 	var params amdgpu.KFDIoctlWaitEventsArgs
 	if _, err := params.CopyIn(ki.t, ki.argAddr); err != nil {
@@ -315,12 +331,43 @@ func kfdWaitEvents(ki *kfdIoctlState) (uintptr, error) {
 	}
 	defer runtime.KeepAlive(events)
 	origPtr := params.EventsPtr
-	params.EventsPtr = uint64(uintptr(unsafe.Pointer(&events[0])))
-	n, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(ki.fd.hostFD), uintptr(ki.cmd), uintptr(unsafe.Pointer(&params)))
-	params.EventsPtr = origPtr
-	if errno != 0 {
-		return n, errno
+	origTimeout := params.Timeout
+	infinite := origTimeout == amdgpu.KFD_EVENT_TIMEOUT_INFINITE
+	remaining := origTimeout
+
+	var n uintptr
+	var errno unix.Errno
+	for {
+		if ki.t.Interrupted() {
+			return 0, linuxerr.ErrInterrupted
+		}
+		slice := remaining
+		if infinite || slice > waitEventsSliceMS {
+			slice = waitEventsSliceMS
+		}
+		params.Timeout = slice
+		params.EventsPtr = uint64(uintptr(unsafe.Pointer(&events[0])))
+		n, _, errno = unix.Syscall(unix.SYS_IOCTL, uintptr(ki.fd.hostFD), uintptr(ki.cmd), uintptr(unsafe.Pointer(&params)))
+		params.EventsPtr = origPtr
+		if errno != 0 {
+			return n, errno
+		}
+		if params.WaitResult != amdgpu.KFD_IOC_WAIT_RESULT_TIMEOUT {
+			// Completed, or failed in a way the caller is told about through
+			// WaitResult. Either way the wait is over.
+			break
+		}
+		if !infinite {
+			if remaining <= slice {
+				// The caller's own timeout has expired; report the timeout it
+				// asked to be told about.
+				break
+			}
+			remaining -= slice
+		}
 	}
+	// The caller sees the timeout it asked for, not the slice this loop used.
+	params.Timeout = origTimeout
 	if _, err := amdgpu.CopyKFDEventDataSliceOut(ki.t, hostarch.Addr(origPtr), events); err != nil {
 		return n, err
 	}

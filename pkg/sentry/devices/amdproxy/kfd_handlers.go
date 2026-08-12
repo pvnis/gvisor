@@ -30,6 +30,51 @@ const (
 	maxKFDCUMaskLen = 1024 // in bits
 )
 
+// kfdCreateEvent handles AMDKFD_IOC_CREATE_EVENT.
+//
+// A caller that passes an EventPageOffset is proposing a buffer as the KFD
+// process's signal page, which is where the driver records that an event has
+// fired. A KFD process has exactly one, and a sandbox that shares a context
+// has one KFD process, so only the first of its processes gets its page
+// accepted and the rest are refused EINVAL. Measured:
+//
+//	tgid=6   page_in=0xf97400000001  err=<nil>
+//	tgid=18  page_in=0xf97400000002  err=invalid argument
+//	tgid=29  page_in=0xf97400000022  err=invalid argument
+//
+// Their later events still get distinct slots, so event IDs do not collide —
+// but those slots index the page the *first* process registered, which the
+// others never mapped. So the driver signals into memory the waiter cannot
+// see, and the waiter blocks in WAIT_EVENTS forever. This is what stops vLLM.
+//
+// The refusal is logged rather than worked around, because working around it
+// means making every process in the sandbox map one page, which is a real
+// design decision and not a patch.
+func kfdCreateEvent(ki *kfdIoctlState) (uintptr, error) {
+	var params amdgpu.KFDIoctlCreateEventArgs
+	if _, err := params.CopyIn(ki.t, ki.argAddr); err != nil {
+		return 0, err
+	}
+	inPage := params.EventPageOffset
+	n, err := kfdIoctlInvoke(ki, &params)
+	if inPage != 0 {
+		ki.ctx.Infof("amdproxy: CREATE_EVENT signal page tgid=%d page=%#x err=%v",
+			ki.t.ThreadGroup().ID(), inPage, err)
+		if err != nil && ki.fd.dev.amdp.vmShare.enabled {
+			ki.ctx.Warningf("amdproxy: this sandbox's KFD signal page is already owned by another of its processes, " +
+				"so events for this one will never be delivered and a wait on them will block indefinitely. " +
+				"This is the known limit of --amdproxy-share-kfd-vm")
+		}
+	}
+	if err != nil {
+		return n, err
+	}
+	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 // kfdRuntimeEnable handles AMDKFD_IOC_RUNTIME_ENABLE, which brings the KFD
 // process's debug runtime up or takes it down.
 //
