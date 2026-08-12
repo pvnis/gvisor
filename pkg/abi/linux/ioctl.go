@@ -150,6 +150,12 @@ func IOC_NR(nr uint32) uint32 {
 	return (nr >> IOC_NRSHIFT) & ((1 << IOC_NRBITS) - 1)
 }
 
+// IOC_TYPE outputs the result of IOC_TYPE macro in
+// include/uapi/asm-generic/ioctl.h.
+func IOC_TYPE(nr uint32) uint32 {
+	return (nr >> IOC_TYPESHIFT) & ((1 << IOC_TYPEBITS) - 1)
+}
+
 // IOC_SIZE outputs the result of IOC_SIZE macro in
 // include/uapi/asm-generic/ioctl.h.
 func IOC_SIZE(nr uint32) uint32 {

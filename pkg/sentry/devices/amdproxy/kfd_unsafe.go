@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/amdgpu"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
@@ -197,7 +198,15 @@ func kfdSVM(ki *kfdIoctlState) (uintptr, error) {
 		return 0, linuxerr.EINVAL
 	}
 	attrBytes := int(header.NAttr) * amdgpu.SizeofKFDIoctlSVMAttribute
-	buf := make([]byte, amdgpu.SizeofKFDIoctlSVMArgs+attrBytes)
+	// The driver copies as many bytes as the command number's size field says,
+	// and the application chooses that independently of NAttr. A buffer sized
+	// from NAttr alone would be read past by a command claiming a larger size,
+	// out of the Sentry's heap, so take whichever is bigger.
+	bufLen := amdgpu.SizeofKFDIoctlSVMArgs + attrBytes
+	if cmdLen := int(linux.IOC_SIZE(ki.cmd)); cmdLen > bufLen {
+		bufLen = cmdLen
+	}
+	buf := make([]byte, bufLen)
 	header.MarshalBytes(buf[:amdgpu.SizeofKFDIoctlSVMArgs])
 	if header.NAttr > 0 {
 		if _, err := ki.t.CopyInBytes(ki.argAddr+hostarch.Addr(amdgpu.SizeofKFDIoctlSVMArgs), buf[amdgpu.SizeofKFDIoctlSVMArgs:]); err != nil {
