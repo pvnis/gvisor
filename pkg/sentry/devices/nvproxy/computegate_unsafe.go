@@ -66,3 +66,38 @@ func preemptChannelGroup(fd *frontendFD, hClient, hObject nvgpu.Handle) error {
 	}
 	return nil
 }
+
+// scheduleChannelGroup adds the channel group hObject to the GPU's runlist, or
+// removes it from the runlist when enable is false.
+//
+// This is the lever that revoking a mapping is not. Revocation stops the
+// sandbox submitting only insofar as submission writes to a command buffer the
+// Sentry has unmapped, and a workload replaying a captured CUDA graph does not
+// write one: it faults on nothing, so it is neither seen nor stopped. Removing
+// the channel group from the runlist is decided entirely by a timer in the
+// Sentry and enforced by the GPU's own scheduler, so it holds regardless of
+// what the sandbox does or does not touch.
+//
+// It is issued on the Sentry's own behalf, with the same shape and the same
+// reasoning about privilege as preemptChannelGroup above.
+func scheduleChannelGroup(fd *frontendFD, hClient, hObject nvgpu.Handle, enable bool) error {
+	var ctrlParams nvgpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS
+	if enable {
+		ctrlParams.BEnable = 1
+	}
+	defer runtime.KeepAlive(&ctrlParams) // since we convert to non-pointer-typed P64
+	ioctlParams := nvgpu.NVOS54_PARAMETERS{
+		HClient:    hClient,
+		HObject:    hObject,
+		Cmd:        nvgpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE,
+		Params:     p64FromPtr(unsafe.Pointer(&ctrlParams)),
+		ParamsSize: uint32(ctrlParams.SizeBytes()),
+	}
+	if _, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fd.hostFD), frontendIoctlCmd(nvgpu.NV_ESC_RM_CONTROL, nvgpu.SizeofNVOS54Parameters), uintptr(unsafe.Pointer(&ioctlParams))); errno != 0 {
+		return errno
+	}
+	if ioctlParams.Status != nvgpu.NV_OK {
+		return fmt.Errorf("NvStatus %d", ioctlParams.Status)
+	}
+	return nil
+}

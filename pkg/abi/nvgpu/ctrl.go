@@ -1017,6 +1017,24 @@ type NVA06C_CTRL_SET_TIMESLICE_PARAMS struct {
 	TimesliceUs uint64
 }
 
+// NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS is the parameter type for
+// NVA06C_CTRL_CMD_GPFIFO_SCHEDULE. ctrla06c.h defines it as a typedef of
+// NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS, from
+// src/common/sdk/nvidia/inc/ctrl/ctrla06f/ctrla06fgpfifo.h.
+//
+// With BEnable unset the driver disables the channel group and removes it from
+// the runlist, which is what makes this usable as a scheduling lever: unlike
+// revoking a mapping, it does not depend on the sandbox faulting on anything,
+// so it holds against work that never touches its command buffer again.
+//
+// +marshal
+type NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS struct {
+	_           structs.HostLayout
+	BEnable     uint8
+	BSkipSubmit uint8
+	BSkipEnable uint8
+}
+
 // NVA06C_CTRL_CMD_PREEMPT_MAX_MANUAL_TIMEOUT_US is the largest timeout the
 // driver accepts in NVA06C_CTRL_PREEMPT_PARAMS.TimeoutUs, from
 // src/common/sdk/nvidia/inc/ctrl/ctrla06c.h.

@@ -55,6 +55,7 @@ const (
 	flagNVProxyGPUMemLimit       = "nvproxy-gpu-memory-limit"
 	flagNVProxyMinComputePreempt = "nvproxy-min-compute-preemption"
 	flagNVProxyGPUPreempt        = "nvproxy-gpu-preempt"
+	flagNVProxyGPUUnschedule     = "nvproxy-gpu-unschedule"
 	flagAMDProxyCUMask           = "amdproxy-cu-mask"
 	flagAMDProxyGPUMemLimit      = "amdproxy-gpu-memory-limit"
 	flagAMDProxyShareKFDVM       = "amdproxy-share-kfd-vm"
@@ -198,6 +199,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Uint64("nvproxy-max-timeslice-us", 0, "longest GPU scheduler timeslice, in microseconds, that a sandbox may request for its channel groups. A longer timeslice increases the sandbox's share of the GPU relative to others sharing it. 0 means no limit.")
 	flagSet.String(flagNVProxyMinComputePreempt, "", "least preemptible GPU compute context-switch mode a sandbox may select: \"wfi\", \"cta\" or \"cilp\". Under wfi the GPU cannot take work away from a sandbox until that work finishes on its own, so a sandbox that selects it resists being descheduled. Empty means no limit.")
 	flagSet.Bool(flagNVProxyGPUPreempt, false, "preempt the sandbox's GPU channel groups when its share of the GPU ends, evicting work that is already running. Without this, the sandbox is only stopped from submitting more work, so a long kernel submitted just before the deadline runs on into other sandboxes' time. Requires --nvproxy-gpu-compute-percent or --nvproxy-gpu-scheduler-socket.")
+	flagSet.Bool(flagNVProxyGPUUnschedule, false, "DO NOT USE: take the sandbox's GPU channel groups off the runlist for the rest of each period once its share of the GPU ends. This starves any sandbox the scheduler marks idle: an idle client keeps only the 5ms MinAllowance floor, which is enough time to fault and be counted active again but not enough GPU time to finish a unit of work and report one, so it stays idle and never recovers. Measured, a weight-100 tenant produced no output at all while its weight-25 neighbour ran unimpeded. The revocation-based limit this was meant to replace works correctly; see ~/vllm-overhead/PLAN.md. Kept only because the control it issues is ground-truthed and works, should a workload ever turn out to need it.")
 	flagSet.Uint64(flagNVProxyGPUMemLimit, 0, "maximum number of bytes of GPU memory that the sandbox may allocate, counting device memory and address space reserved for CUDA unified memory. 0 means no limit.")
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("amdproxy", false, "WIP: enable support for AMD GPUs. AMD GPU support gets automatically enabled if /dev/kfd is present in the OCI spec.")
@@ -246,6 +248,7 @@ var overrideAllowlist = map[string]struct {
 	flagNVProxyGPUWeight:         {check: checkNVProxyGPUWeight},
 	flagNVProxyMinComputePreempt: {check: checkNVProxyMinComputePreemption},
 	flagNVProxyGPUPreempt:        {check: checkNVProxyGPUPreempt},
+	flagNVProxyGPUUnschedule:     {check: checkNVProxyGPUUnschedule},
 	flagAMDProxyCUMask:           {check: checkAMDProxyCUMask},
 	flagAMDProxyGPUMemLimit:      {check: checkAMDProxyGPUMemoryLimit},
 	// Sharing an address space grants a container nothing at anyone else's
@@ -272,6 +275,24 @@ func checkNVProxyGPUPreempt(c *Config, name string, value string) error {
 	}
 	if c.NVProxyGPUPreempt && !want {
 		return fmt.Errorf("%s=%q cannot disable the GPU preemption required by the runtime", name, value)
+	}
+	return nil
+}
+
+// checkNVProxyGPUUnschedule ensures that a container may ask to be taken off
+// the runlist when its GPU window closes, but may not annotate away the
+// runtime's decision to do so.
+//
+// Same direction and same reasoning as checkNVProxyGPUPreempt: submitting to it
+// costs nobody else anything, while turning it off would let a workload run
+// past its share.
+func checkNVProxyGPUUnschedule(c *Config, name string, value string) error {
+	want, err := strconv.ParseBool(value)
+	if err != nil {
+		return fmt.Errorf("invalid %s annotation %q: %w", name, value, err)
+	}
+	if c.NVProxyGPUUnschedule && !want {
+		return fmt.Errorf("%s=%q cannot disable the GPU unscheduling required by the runtime", name, value)
 	}
 	return nil
 }

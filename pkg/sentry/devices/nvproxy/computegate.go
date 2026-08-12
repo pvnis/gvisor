@@ -89,6 +89,27 @@ type computeGate struct {
 	// work. It is immutable after Register().
 	preempt bool
 
+	// unschedule is true if the sandbox's channel groups should be taken off
+	// the GPU's runlist for the remainder of each period once its window
+	// closes, and put back when the next one opens. It is immutable after
+	// Register().
+	//
+	// This does not work and defaults to off. It was written to close a gap
+	// that turned out not to exist -- revocation does hold against a sandbox
+	// replaying a captured CUDA graph, and the apparent evidence otherwise was
+	// measured while the load generators were still ramping. What it does
+	// instead is starve any sandbox the scheduler marks idle: such a sandbox
+	// keeps only MinAllowance, which is ample time to fault and be counted
+	// active again but not enough GPU time to complete a unit of work and
+	// report one, so it never leaves the idle state. Measured, a weight-100
+	// tenant produced nothing at all beside a weight-25 neighbour.
+	//
+	// Repairing it means declining to unschedule at or below MinAllowance, so
+	// that the fault-based gate covers the idle case. That is not done because
+	// there is no longer a problem for the lever to solve. See
+	// ~/vllm-overhead/PLAN.md.
+	unschedule bool
+
 	// tsgs is the set of channel groups (KEPLER_CHANNEL_GROUP_A) the sandbox
 	// has allocated, which are the units the GPU schedules and therefore the
 	// units that can be preempted. It is protected by mu.
@@ -164,15 +185,27 @@ type computeGate struct {
 	// costing revocations. It exists to catch that happening rather than to
 	// prevent it.
 	preemptOverranPeriod atomicbitops.Bool
+
+	// warnedUnschedule and warnedReschedule record that taking the sandbox off
+	// the runlist, or putting it back, has already failed once, so that a
+	// driver which refuses either does not log every period forever.
+	//
+	// They are separate because the two directions fail for different reasons
+	// and only one of them is dangerous: failing to unschedule leaves the
+	// sandbox running when it should not, while failing to reschedule leaves
+	// it unable to run at all.
+	warnedUnschedule atomicbitops.Bool
+	warnedReschedule atomicbitops.Bool
 }
 
 // init prepares g to gate submission, permitting it for the given share of each
 // period until a scheduler supplies a window. If scheduled is true, gating is in
 // effect even when percent is unset, because the scheduler decides the share.
-func (g *computeGate) init(percent uint64, scheduled, preempt bool) {
+func (g *computeGate) init(percent uint64, scheduled, preempt, unschedule bool) {
 	g.percent = percent
 	g.scheduled = scheduled
 	g.preempt = preempt
+	g.unschedule = unschedule
 	g.cmdBufs = make(map[nvgpu.Handle]struct{})
 	g.byMem = make(map[nvgpu.Handle]*frontendFD)
 	g.gated = make(map[*frontendFD]struct{})
@@ -425,6 +458,68 @@ func (g *computeGate) run() {
 		// 100ms period, so that does not happen today; preemptOverranPeriod
 		// reports it if it ever starts to.
 		g.preemptAll()
+		// Take the sandbox off the runlist for the rest of the period, and
+		// sleep until its next window opens to put it back. Both are decided
+		// by this timer alone, so a sandbox that never faults is held anyway.
+		//
+		// Nothing is done when the sandbox has the whole period: there is no
+		// deny window to enforce, and unscheduling only to immediately
+		// reschedule would cost two controls per period for nothing.
+		if !g.unschedule || g.currentGrant().Allowance >= g.currentGrant().Period {
+			continue
+		}
+		g.setScheduled(false)
+		time.Sleep(g.untilWindowStart(time.Now()))
+		g.setScheduled(true)
+	}
+}
+
+// untilWindowStart returns how long until the beginning of the next window.
+//
+// This is the counterpart of untilWindowEnd, and is what the loop above waits
+// out while the sandbox is off the runlist. A sandbox is put back exactly when
+// its window opens rather than early, for the same reason mappings are revoked
+// exactly at the close: any other moment gives it time it was not granted.
+func (g *computeGate) untilWindowStart(t time.Time) time.Duration {
+	grant := g.currentGrant()
+	if grant.Period <= 0 {
+		return computeGatePeriod
+	}
+	pos := time.Duration(t.UnixNano()) % grant.Period
+	if pos < grant.Phase {
+		return grant.Phase - pos
+	}
+	return grant.Period - pos + grant.Phase
+}
+
+// setScheduled adds every channel group the sandbox has to the GPU's runlist,
+// or removes them all from it.
+//
+// Failures are logged once per direction and otherwise ignored, as with
+// preemptAll: a driver that refuses the control must not take the GPU away from
+// every tenant on the machine. The two directions are not equally safe to lose,
+// though, so they are reported separately -- failing to unschedule costs
+// isolation for a period, while failing to reschedule would strand the sandbox,
+// and the log should say which happened.
+func (g *computeGate) setScheduled(enable bool) {
+	g.mu.Lock()
+	tsgs := make(map[nvgpu.Handle]channelGroup, len(g.tsgs))
+	for hObject, tsg := range g.tsgs {
+		tsgs[hObject] = tsg
+	}
+	g.mu.Unlock()
+	for hObject, tsg := range tsgs {
+		if err := scheduleChannelGroup(tsg.fd, tsg.hClient, hObject, enable); err != nil {
+			warned := &g.warnedUnschedule
+			what := "take GPU channel group %v off the runlist: %v; the sandbox may submit work outside its window"
+			if enable {
+				warned = &g.warnedReschedule
+				what = "put GPU channel group %v back on the runlist: %v; the sandbox may be unable to submit work at all"
+			}
+			if !warned.Swap(true) {
+				log.Warningf("nvproxy: failed to "+what, hObject, err)
+			}
+		}
 	}
 }
 
@@ -553,12 +648,24 @@ func (g *computeGate) revoke() {
 	for _, fd := range fds {
 		fd.revokeMappings()
 	}
-	// revoke() runs unconditionally once per period regardless of activity,
-	// so this is a steady ~10Hz heartbeat rather than something that could
-	// itself go quiet: a gap here means the sandbox's run() goroutine has
-	// stopped, not that nothing was submitted.
-	log.Infof("nvproxy: computeGate heartbeat: revokes=%d totalSubmissions=%d gatedFDs=%d", revokes, g.totalSubmissions.Load(), len(fds))
+	// revoke() runs unconditionally once per period regardless of activity, so
+	// this is a heartbeat rather than something that could itself go quiet: a
+	// gap in it means the sandbox's run() goroutine has stopped, not that
+	// nothing was submitted. That property is what makes the submission count
+	// beside it readable -- the two are only comparable because one of them
+	// cannot stall.
+	//
+	// Rate-limited because the loop runs at 10Hz and this would otherwise be
+	// ten lines per second per sandbox forever. Every few seconds is frequent
+	// enough to see a ratio change, which is all this is for.
+	if revokes%revokeReportInterval == 0 {
+		log.Infof("nvproxy: computeGate: %d revocations, %d submissions, %d gated file descriptions", revokes, g.totalSubmissions.Load(), len(fds))
+	}
 }
+
+// revokeReportInterval is how many revocations separate the summaries above. At
+// one period each, this is a line every few seconds.
+const revokeReportInterval = 50
 
 // noteSubmission records that the sandbox tried to submit work, which is what
 // the scheduler is told in order to distinguish a sandbox using the GPU from

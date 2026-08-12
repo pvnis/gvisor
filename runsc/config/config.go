@@ -397,6 +397,11 @@ type Config struct {
 	// more from being submitted.
 	NVProxyGPUPreempt bool `flag:"nvproxy-gpu-preempt"`
 
+	// NVProxyGPUUnschedule takes the sandbox's GPU channel groups off the
+	// runlist for the remainder of each period once its window closes, so that
+	// the limit does not depend on the sandbox faulting on a revoked mapping.
+	NVProxyGPUUnschedule bool `flag:"nvproxy-gpu-unschedule"`
+
 	// NVProxyGPUSchedulerSocket is the path of a GPU scheduler dividing the
 	// GPU between the sandboxes sharing it. Empty means the sandbox is not
 	// scheduled and keeps whatever fixed share it was configured with.
