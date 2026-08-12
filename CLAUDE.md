@@ -311,6 +311,37 @@ Two things worth knowing before touching this again:
 `torch.cuda.mem_get_info()` still showed only each tenant's own quota after
 450 real requests. See `~/vllm-overhead/PLAN.md`.
 
+### The two mechanisms tested together: vCluster tenancy + host-level slicing, NVIDIA
+
+Cluster-level tenancy (vCluster) and host-level GPU slicing (gVisor/nvproxy)
+are orthogonal in what they *guarantee* -- confirmed, not assumed. Three
+genuinely separate vClusters (`tenant-nv-a`, `tenant-nv-b`, `tenant-c`),
+weights 100/50/25, all reporting the identical `80,944`-token KV cache
+(comparable setups). `nvidia-smi` inside each still reports the 3072 MiB
+quota, not the real device, and a cross-tenant pod probe timed out rather
+than connecting. Neither mechanism weakened the other.
+
+They are **not** orthogonal in what they *deliver*: throughput ordered
+correctly (2763.96/1936.79/1660.84 tok/s, A>B>C) but compressed toward equal
+much more than the bare-namespace reference test at the same weights
+(-13.7/+1.8/+11.8 points vs -2.6/+0.1/+2.6). Not yet explained; every tenant
+here runs its own control plane and synced networking path, any of which
+could interact with the scheduler's granting, but that's a hypothesis. See
+`~/vllm-overhead/PLAN.md`.
+
+**A real, unresolved finding along the way, worth knowing before touching
+tenant-a/b again**: reusing them (as asked) hit two of their own deliberate
+hardening measures — PodSecurity `baseline` blocking `hostPath`, and the
+Cilium tenant floor blocking egress *even to the cluster's own excepted
+pod/service CIDR*, in a way a scoped `NetworkPolicy` egress allow did not
+fix. `hubble observe` showed `Policy denied DROPPED` for traffic to a
+ClusterIP inside the supposedly-excepted range. Root cause not settled —
+possibly `toCIDRSet`+`except` never applies to a destination that already
+resolves to a known Cilium identity (a real pod) rather than a genuinely
+external one. Left open rather than bypassed; needs `cilium policy trace` or
+direct map inspection, not more guessing. Worked around for this test with
+two fresh tenants matching the AMD side's simpler `tenant-amd-a/b/c` recipe.
+
 ### SVM: denying it is better than forwarding it
 
 Do not "fix" SVM by making it reach the driver. That was tried (`95a5fa7e1`)
