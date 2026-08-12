@@ -376,6 +376,17 @@ func (s *Server) Tick() {
 			sched.Observe(id, used)
 		}
 		grants[d] = sched.Grants()
+		if len(grants[d]) > 1 {
+			// Contention is exactly when a division could go wrong, and it is
+			// the one thing nothing else here reports.
+			for id, g := range grants[d] {
+				weight := uint64(0)
+				if sc, ok := s.conns[id]; ok {
+					weight = sc.weight
+				}
+				log.Infof("gpusched: device %v client %q weight=%d idle=%v allowance=%v phase=%v", d, id, weight, idle[id], g.Allowance, g.Phase)
+			}
+		}
 	}
 
 	// Choose the one window each sandbox will be held to, and record it as what
