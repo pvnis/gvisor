@@ -1,49 +1,68 @@
-# Handoff: test NVIDIA compute-isolation primitives on the RTX A6000
+# Handoff: test NVIDIA compute-isolation primitives on a new GPU
 
-For an agent picking this up on the A6000 machine with no prior context. Read
+For an agent picking this up on a GPU machine with no prior context. Read
 `../NVIDIA-COMPUTE-ISOLATION.md` first (the full findings + playbook); this file
-is the concrete, machine-adaptable procedure.
+is the concrete, machine-adaptable procedure. It was written for the RTX A6000
+and has since been *run* on an A100 80GB PCIe (`gpu0-a`, 2026-08-17), which is
+where the reference numbers below come from.
 
 ## Situation in one paragraph
 
 This branch builds GPU compute+memory isolation between *mutually-untrusting*
 containers, enforced in the gVisor Sentry (never inside the container). **Memory
-quota works everywhere.** *Compute* isolation is the hard part, and we proved —
-exhaustively, down to a kernel-privileged driver hook — that on the **consumer
-RTX 5070 (Blackwell GB205)** no mechanism can enforce a compute share against an
-arbitrary (doorbell-driven) CUDA workload: temporal levers (compute gate,
-timeslice, TSG detach) are ineffective, and the spatial control-plane controls
-(`SET_TPC_PARTITION_TABLE`, `SET_CWD_WATERMARK`) return `NV_ERR_NOT_SUPPORTED`.
-The wall was **not privilege** (we bypassed that by moving into the open driver);
-it is **GPU die/firmware feature support**. Datacenter dies (A100/H100) are known
-to support the primitives (Ghost paper). **The open question this handoff resolves:
-does the RTX A6000 (Ampere GA102 — a *pro/workstation* die, no MIG) support them,
-or does it behave like the consumer 5070?** We honestly do not know; measure it.
+quota works everywhere.** *Compute* isolation is the hard part. Work submission
+on Volta+ never enters the kernel (mapped pushbuffer + doorbell), so the Sentry
+cannot meter it; the only imposable levers are RM controls, and whether they do
+anything is a property of the GPU die and its GSP firmware. On the **A100
+(GA100)** the spatial control works and every temporal one is inert. On the
+**consumer RTX 5070 (GB205)** the temporal ones are inert too, and its spatial
+negative turned out to be a mis-read status code (below) — so consumer/pro dies
+are an open question again.
 
 ## Your immediate task
 
-Run the three driver probes on the A6000 and report the NvStatus + throughput:
+Run the driver probes on this machine and report each control's NvStatus **and
+the throughput it produced**:
 
-- **0c** `SET_TPC_PARTITION_TABLE` — impose a specific-TPC partition (AMD-CU-mask analog). The prize.
+- **0c/0f** `SET_TPC_PARTITION_TABLE` — impose specific TPCs (the AMD-CU-mask
+  analog). The prize. **A100: `NV_OK`, and enforced.**
 - **0d** `SET_CWD_WATERMARK` — per-subcontext Work-Distributor throttle.
-- **0b** `GPFIFO_SCHEDULE(disable)` — does a driver TSG detach stop a running doorbell workload?
+  **A100: `NV_OK`, no measurable effect.**
+- **0b** `GPFIFO_SCHEDULE(disable)` — does a driver TSG detach stop a running
+  doorbell workload? **A100: `NV_OK`, no effect.**
+- **0g** `SET_TIMESLICE` — per-TSG timeslice as a weight. **A100: 16:1 → 1:1.**
+- **0h** `SET_INTERLEAVE_LEVEL` — runlist priority. **A100: `NV_OK` at kernel
+  priv, GET says NOT_SUPPORTED, HIGH vs LOW → 1:1.**
 
-**Key simplification: the probes are driver-level hooks that fire on ANY CUDA
-context creation. You do NOT need gVisor, k3s, or nvproxy for them** — just the
-modified open driver + any CUDA workload (native `burn.py` or a CUDA container).
-gVisor is only needed later, to build the full broker (see `../GHOST-PLAN.md`).
+**Two rules learned the hard way:**
+
+1. **Issue the controls from the deferred call site, never only from
+   `kctxshareapiConstruct_IMPL`.** Inside the ctxshare's own constructor a
+   ROUTE_TO_PHYSICAL control cannot be resolved by GSP and returns `0x57` =
+   `NV_ERR_OBJECT_NOT_FOUND`, which is *not* `NV_ERR_NOT_SUPPORTED` (`0x56`).
+   The A100 returns `0x57` there and `NV_OK` from
+   `kchangrpapiCtrlCmdGpFifoSchedule_IMPL`. This exact confusion produced a
+   wrong conclusion on the 5070. Decode every status against
+   `src/common/sdk/nvidia/inc/nvstatuscodes.h`.
+2. **Judge by throughput, not by `NV_OK`.** Several controls are accepted,
+   stored, read back, and ignored.
+
+**The probes are driver-level hooks that fire on ANY CUDA context creation. You
+do NOT need gVisor, k3s, or nvproxy for them** — just the modified open driver +
+any CUDA workload (native `burn.py` or a CUDA container). gVisor is only needed
+later, to build the full broker (see `../GHOST-PLAN.md`).
 
 ## Procedure
 
 ### 1. Match the driver version to the machine's GSP firmware
 
 ```
-cat /proc/driver/nvidia/version                 # installed driver version, e.g. 570.x
-ls /lib/firmware/nvidia/                         # firmware version dir(s), e.g. 570.86.15
+cat /proc/driver/nvidia/version                 # installed driver version
+ls /lib/firmware/nvidia/                         # firmware version dir(s)
 ```
 Clone the open modules and check out the tag matching the **installed firmware
 version** (so the built modules load the firmware already on disk — this is what
-made the swap low-risk on sensai):
+makes the swap low-risk):
 ```
 git clone https://github.com/NVIDIA/open-gpu-kernel-modules
 cd open-gpu-kernel-modules && git checkout <version-matching-/lib/firmware/nvidia/>
@@ -51,125 +70,147 @@ cd open-gpu-kernel-modules && git checkout <version-matching-/lib/firmware/nvidi
 
 ### 2. Apply the GHOST hooks
 
-`git apply /path/to/gvisor/ghost-experiment/driver-hooks.patch` (2 files, ~60
-lines). If it doesn't apply cleanly to a different driver version, add them by
-hand — they are small and the target functions are stable:
+`git apply /path/to/gvisor/ghost-experiment/driver-hooks.patch` (2 files). If it
+doesn't apply cleanly to a different driver version, add them by hand — they are
+small and the target functions are stable:
 
-- `src/nvidia/src/kernel/gpu/fifo/kernel_ctxshare.c`, in
-  `kctxshareapiConstruct_IMPL`, just before the `failed:` label: originate
-  `SET_TPC_PARTITION_MODE(STATIC)` + `SET_TPC_PARTITION_TABLE` (0c) and
-  `SET_CWD_WATERMARK` (0d) via `rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL)->Control`,
-  logging each NvStatus. Needs `#include "rmapi/rmapi.h"`,
-  `"ctrl/ctrl0080/ctrl0080gr.h"`, `"ctrl/ctrl9067.h"`.
-- `src/nvidia/src/kernel/gpu/fifo/kernel_channel_group_api.c`, in
+- `src/nvidia/src/kernel/gpu/fifo/kernel_ctxshare.c` — the early 0c/0d probe in
+  `kctxshareapiConstruct_IMPL`, the ctxshare bookkeeping, and
+  `ghostReprobeDeferred_GHOST()` which re-issues mode/table/watermark later.
+  Needs `#include "rmapi/rmapi.h"`, `"ctrl/ctrl0080/ctrl0080gr.h"`,
+  `"ctrl/ctrl9067.h"`, `"kernel/os/os.h"`.
+- `src/nvidia/src/kernel/gpu/fifo/kernel_channel_group_api.c` — in
   `kchangrpapiCtrlCmdGpFifoSchedule_IMPL`, in the `IS_GSP_CLIENT` branch after
-  `NV_RM_RPC_CONTROL`: the 0b force-disable, gated by `bGhostDetach` (default
-  `NV_FALSE`).
+  `NV_RM_RPC_CONTROL`: 0b detach, 0g timeslice, 0h interleave, then the call to
+  `ghostReprobeDeferred_GHOST()`.
 
-**Adjust `GHOST_TPC_COUNT`** in the ctxshare hook to ~half the A6000's TPC count.
-The A6000 (full GA102) has **84 SMs = 42 TPCs**, so use **21** for a half-partition
-test (the hook ships with 12 for the 5070's 24). If 0c returns NV_OK, a ~0.5x
-throughput drop is the confirmation the partition is real.
+**Set `GHOST_TOTAL_TPC`** in `kernel_ctxshare.c` to this GPU's TPC count (SMs/2:
+A100 = 54, A6000 = 42, RTX 5070 = 24). Everything else is a runtime knob.
 
 ### 3. Build
 
 ```
-make modules -j$(nproc)
+make modules -j$(nproc)      # ~4 min from clean, ~40 s incremental
 ```
 
 ### 4. Swap proprietary -> open driver
 
-The scripts `swap.sh` / `reload.sh` / `revert.sh` here are **tuned for sensai**
-(they stop k3s + `runsc-gpu-scheduler` + `nvidia-persistenced` + gdm, kill
-leftover GPU-holding containers, then rmmod/insmod). **Adapt them to the A6000
-machine's setup** — the essential sequence is:
+On a bare GPU box (no k8s, docker, or display) this is just:
 ```
-# stop everything using the GPU (display manager, any CUDA procs/containers,
-#   persistenced); find holders with: sudo fuser -v /dev/nvidia*  and
-#   sudo lsof /dev/nvidia*  (gVisor sandboxes appear as 'exe')
-sudo rmmod nvidia_drm nvidia_modeset nvidia_uvm nvidia_peermem nvidia
-sudo insmod .../kernel-open/nvidia.ko NVreg_OpenRmEnableUnsupportedGpus=1
-sudo insmod .../kernel-open/nvidia-uvm.ko
-nvidia-smi   # confirm the GPU is alive on the open driver
+sudo rmmod nvidia_uvm nvidia
+sudo insmod kernel-open/nvidia.ko NVreg_OpenRmEnableUnsupportedGpus=1 \
+     NVreg_RegistryDwords="GhostTpcCount=27;GhostDisjoint=1"
+sudo insmod kernel-open/nvidia-uvm.ko
+nvidia-smi                                    # confirm the GPU is alive
+grep -i '^RegistryDwords:' /proc/driver/nvidia/params   # confirm the knobs
 ```
+`swap.sh` / `reload.sh` / `revert.sh` here do the same with the extra quiescing
+sensai needs (stop k3s + `runsc-gpu-scheduler` + `nvidia-persistenced` + gdm,
+kill leftover GPU-holding containers). Find holders with `sudo fuser -v
+/dev/nvidia*` and `sudo lsof /dev/nvidia*` (gVisor sandboxes appear as `exe`).
 This uses `insmod` (not `modules_install`), so **a reboot reverts to
 proprietary** — the whole experiment is cleanly reversible.
 
-### 5. Run a CUDA workload and read the probe results
+### 5. The knobs (one build sweeps everything)
 
 ```
-python3 burn.py &          # or run any CUDA container; prints matmul/s
-sudo dmesg | grep GHOST     # the control statuses
+GhostTpcCount=N     TPCs granted to the first tenant (0 = leave the table alone)
+GhostTpcCountB=N    TPCs for every later tenant (0 = same as GhostTpcCount)
+GhostDisjoint=1     lay each tenant's range after the previous one's
+GhostWatermark=1    also clamp the CWD watermark to MIN
+GhostDetach=1       0b: force-disable the TSG right after the tenant enables it
+GhostTimeslice=us   0g: timeslice for tenant 0 (GhostTimesliceB for later ones)
+GhostInterleave=L   0h: runlist level 0=LOW/1=MED/2=HIGH (255 = don't touch)
 ```
+Tenants are identified by **pid** (`ghostTenantIndex_GHOST`), so a workload's
+several RM clients count as one tenant.
 
-### 6. For the 0b temporal test (separate run)
+### 6. Run the workload and read the log
 
-0b force-disables the TSG, which (if it works) stalls the workload — so it can't
-share a run with a throughput measurement. Enable it by setting
-`bGhostDetach = NV_TRUE` in the channel-group hook, rebuild, reload, run burn.py.
-If burn makes no progress / stalls, detach sticks (temporal viable). If it runs
-at full rate with `disable = 0x0` in dmesg, detach is ineffective (like the 5070).
+```
+python3 burn.py                       # fp16 4096^3 matmul loop, prints matmul/s
+sudo dmesg | grep GHOST                # the control statuses
+```
+`run-tenants.sh <tag> <n> <secs>` launches N tenants at once and prints each
+one's median rate; `run-staggered.sh` starts them 8 s apart so tenant *i* is
+deterministically slice *i* (needed whenever tenants get different widths).
+Both take `PY=`, `BURN=`, `OUT=` overrides.
 
-## Interpretation (per NVIDIA-COMPUTE-ISOLATION.md)
+The measurements that matter, in order:
+
+1. **Solo sweep** — `GhostTpcCount` ∈ {0, ¼, ½, ¾, all}. Does the rate track the
+   TPC count? (A100: 1550 / 502 @13 / 960 @27 / 1244 @40 / 1550 @54.)
+2. **Two tenants, disjoint vs overlapping** — `GhostTpcCount=half;
+   GhostDisjoint=1` against `GhostDisjoint=0`. **If those two differ, this GPU
+   runs partitioned contexts concurrently.** (A100: 442/443 vs 440/441 — no
+   difference; contexts time-slice regardless.)
+3. **Two tenants, unequal** — `GhostTpcCount=40;GhostTpcCountB=14`. Does the
+   ratio track the widths? (A100: 2.66:1 for 2.86:1 of TPCs.)
+4. **Temporal levers** — `GhostDetach=1`, then `GhostTimeslice/B`, then
+   `GhostInterleave/B`. Any *throughput* change at all?
+
+## Interpretation
 
 | dmesg / behavior | meaning | next |
 | --- | --- | --- |
-| `SET_TPC_PARTITION_TABLE = 0x0` AND rate drops to the TPC fraction | **imposed spatial partition WORKS on A6000** | build the spatial broker (finish `smpart_unsafe.go`) |
-| `... = 0x0` but rate unchanged | accepted, not enforced | investigate mode/setup |
-| `... = 0x57` (NOT_SUPPORTED) | die/firmware lacks it (5070 result) | spatial dead on A6000 |
-| `... = 0x1b` (INSUFFICIENT_PERMISSIONS) | not at kernel priv | origination path wrong |
-| 0b: `disable = 0x0`, burn stalls / no matmuls | **detach STICKS — temporal viable** | port `pkg/gpusched` into the driver (GHOST-PLAN Phase 2) |
-| 0b: `disable = 0x0`, burn at full rate | detach ineffective (5070 result) | temporal dead on A6000 |
+| `SET_TPC_PARTITION_TABLE = 0x0` AND rate tracks the TPC count | **imposed spatial partition works** (A100 result) | build the spatial broker (finish `smpart_unsafe.go`) |
+| `... = 0x0` but rate unchanged | accepted, not enforced — check `GET_TPC_PARTITION_MODE` reads back `mode=1` | investigate mode/setup |
+| `... = 0x57` | OBJECT_NOT_FOUND — wrong call site, **not** a verdict | re-issue from the deferred site |
+| `... = 0x56` | NOT_SUPPORTED — die/firmware really lacks it | spatial dead on this GPU |
+| `... = 0x1b` | INSUFFICIENT_PERMISSIONS — not at kernel priv | origination path wrong |
+| 0b/0g/0h `NV_OK`, rates unchanged | runlist levers inert (both dies so far) | temporal dead on this GPU |
+| 0b: burn stalls / no matmuls | **detach STICKS — temporal viable** | port `pkg/gpusched` into the driver (GHOST-PLAN Phase 2) |
 
-**A positive 0c is the headline result** — it means imposed spatial partitioning
-(the AMD-CU-mask analog) is viable on the A6000, and the whole `GHOST-PLAN.md`
-design goes live there. Caveat from `NVIDIA-COMPUTE-ISOLATION.md ‡`: even a
-positive result may turn out MIG-internal-only — confirm the throughput actually
-drops, don't trust the status code alone.
+**A positive spatial result is the headline** — it means imposed partitioning
+(the AMD-CU-mask analog) is viable here. Confirm the throughput actually moves;
+do not trust the status code alone.
 
 ## Context & artifacts (all committed in the gvisor repo, branch `gpuslicing`)
 
-- `../NVIDIA-COMPUTE-ISOLATION.md` — definitive findings + the mechanism×die-class
-  matrix + this playbook's rationale. **Read first.**
-- `../GHOST-PLAN.md` — the driver-broker design (what to build if a probe passes);
-  Phase-2-temporal is a port of `pkg/gpusched`.
+- `../NVIDIA-COMPUTE-ISOLATION.md` — definitive findings, the mechanism×die-class
+  matrix, the A100 data, and this playbook's rationale. **Read first.**
+- `../GHOST-PLAN.md` — the driver-broker design; its temporal premise is
+  falsified on the A100, so read the 2026-08-17 section at the top.
 - `../SECURITY-FINDINGS.md` — the full red-team + every lever measured.
 - `../pkg/sentry/devices/nvproxy/smpart_unsafe.go` — Sentry-side spatial
   scaffolding (ABI + origination), blocked by privilege there; the driver hook is
   the kernel-priv version.
 - `../pkg/sentry/devices/nvproxy/gpuarch.go` — runtime die/arch detection
-  (`archFromClass`); on the A6000 it will report "Ampere" (AMPERE_COMPUTE_A/B).
-- `../pkg/gpusched/` — the weighted-credit scheduler (Ghost's policy, ready to
-  port into the driver if temporal works).
-- `driver-hooks.patch`, `burn.py`, `swap.sh`/`reload.sh`/`revert.sh` — here.
+  (`archFromClass`).
+- `../pkg/gpusched/` — the weighted-credit scheduler (only worth porting into
+  the driver if 0b actually stalls a burn).
+- `driver-hooks.patch`, `burn.py`, `run-tenants.sh`, `run-staggered.sh`,
+  `swap.sh`/`reload.sh`/`revert.sh` — here.
 
-## Gotchas (learned the hard way on sensai)
+## Gotchas
 
-- **`systemctl stop k3s` does NOT stop the pods** — containerd keeps them running;
-  kill the GPU-holding containers (device-plugin, etc.) before rmmod. Not relevant
-  if the A6000 box isn't running k8s.
+- **`systemctl stop k3s` does NOT stop the pods** — containerd keeps them
+  running; kill the GPU-holding containers before rmmod. Irrelevant on a bare
+  GPU box.
 - **The display manager (gdm) holds the GPU** if there's an attached display and
-  no iGPU. Stopping it kills the desktop session. Check `fuser /dev/dri/*`.
+  no iGPU. Check `fuser /dev/dri/*`.
 - **k8s only:** a service restart can exhaust `fs.inotify.max_user_instances`
   (default 128) → device-plugin CrashLoop. Fix: `sudo sysctl -w
   fs.inotify.max_user_instances=1024`.
-- **The Claude Code auto-classifier blocks rmmod/insmod/`systemctl stop`/`kill`
-  from the agent.** Either have the human run the swap script (`! sudo bash
-  swap.sh`) or add a Bash permission rule to pre-authorize.
-- `GPFIFO_SCHEDULE(disable)` returning `0x0` (NV_OK) does NOT mean it worked —
-  it's accepted but only takes effect when the channel idles, which a saturating
-  workload never does. Judge by throughput, not the status code.
+- **The Claude Code auto-classifier may block writing a *script* containing
+  `rmmod`/`insmod`/`kill`** even where running those commands inline is allowed;
+  on the A100 VM the inline `sudo rmmod`/`insmod` sequence went through fine.
+- **`nvidia-smi` itself creates ctxshares**, so it appears in the GHOST log
+  (with `SETMODE=0x57`, since its clients have no channel group). Ignore those
+  lines; the tenant's own ctxshare is the one that reports `mode=1`.
+- `GPFIFO_SCHEDULE(disable)` returning `0x0` does NOT mean it worked.
 
-## Source-machine (sensai) state
+## Machine state
 
-sensai (RTX 5070) is currently on the **open 610.43.02 driver** with these hooks
-loaded (an earlier build; the committed source is the consolidated version).
-Revert with `revert.sh` or a reboot. sensai is now just the code source-of-truth;
-the live experiment moves to the A6000.
+- **A100 VM (`gpu0-a`)**: running the open 610.43.02 modules with all hooks;
+  results in `~/ghost-a100/` (one file per run, named by tag). Reboot reverts to
+  the proprietary driver.
+- **sensai (RTX 5070)**: was left on the open 610.43.02 driver with the earlier
+  hooks. Its spatial result needs re-taking with the deferred call site.
 
 ## What to report back
 
-The `GHOST 0c` / `GHOST 0d` dmesg lines, the `GHOST 0b` behavior, and the burn
-throughput vs a solo baseline. That triple determines whether the A6000 unlocks
-spatial partitioning, temporal scheduling, both, or neither — and thus which part
-of `GHOST-PLAN.md` becomes buildable.
+The `GHOST 0c/0f/0d/0b/0g/0h` dmesg lines, each with the burn throughput beside
+it, plus the disjoint-vs-overlapping pair test. That set determines whether the
+GPU unlocks spatial partitioning, temporal scheduling, both, or neither — and
+thus which part of `GHOST-PLAN.md` is buildable there.

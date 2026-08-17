@@ -7,17 +7,20 @@ deliberately-unprivileged gVisor Sentry cannot. Driver clone is at
 from the deployed proprietary **610.43.02**). Reference paper: Ghost, "Breaking
 the Tradeoff: Elastic and Isolated GPU Sharing" (see memory `ghost-gvm`).
 
-## PHASE 0 RESULTS (2026-08-14): both enforcement primitives are dead on consumer Blackwell
+## PHASE 0 RESULTS (2026-08-14): the temporal primitive is dead on consumer Blackwell; the spatial verdict was mis-read (see the A100 section below)
 
 Executed on the RTX 5070 after swapping to the open 610.43.02 driver and adding
 hooks that originate the controls at kernel privilege (the whole point of the
-driver approach). Both negative:
+driver approach).
 
 - **0c (spatial, NV9067 TPC table):** the `0x1b` INSUFFICIENT_PERMISSIONS wall is
-  **bypassed at kernel priv** — proven — but the table then returns
-  **NV_ERR_NOT_SUPPORTED (0x57)**; `SET_TPC_PARTITION_MODE(STATIC)` is a no-op
-  success. It's an SMC/MIG feature GB205's GSP firmware doesn't implement. Burn
-  rate unchanged.
+  **bypassed at kernel priv** — proven — but the table then returns **`0x57`**;
+  `SET_TPC_PARTITION_MODE(STATIC)` is a no-op success. Burn rate unchanged.
+  **Read at the time as NOT_SUPPORTED; `0x57` is actually
+  `NV_ERR_OBJECT_NOT_FOUND` (`0x56` is NOT_SUPPORTED), and the A100 — where this
+  control works — returns the identical `0x57` from this same call site inside
+  the ctxshare's own constructor. This result is void; GB205 needs re-probing
+  from the deferred call site.**
 - **0b (temporal, TSG detach):** a driver-issued `GPFIFO_SCHEDULE(disable)`
   returns **NV_OK** but the doorbell burn keeps running at the **full 458
   matmul/s** — the detach doesn't stick, identical to userspace. The disable only
@@ -25,22 +28,53 @@ driver approach). Both negative:
 
 - **0d (WDU/CWD credit path):** the core CWD partition/credit code isn't in the
   open driver (it's GSP firmware); the one driver-reachable ctxshare throttle,
-  `SET_CWD_WATERMARK`, returns **NV_ERR_NOT_SUPPORTED (0x57)** too. Another
-  SMC/datacenter feature GB205 lacks.
+  `SET_CWD_WATERMARK`, returns `0x57` too — **same mis-read, same correction.**
+  (On the A100 it returns `NV_OK` from the deferred site, reads back MIN, and
+  changes nothing measurable.)
 
-**Bottom line:** the driver-broker DOES unlock privilege (the one thing we set out
-to prove), but consumer Blackwell's signed GSP firmware honors none of the
-enforcement primitives — temporal detach/timeslice are ineffective on doorbell
-workloads, and every spatial control (TPC table, CWD watermark) is NOT_SUPPORTED —
-and the driver can't change GSP firmware. Ghost works on A100 because datacenter
-GSP firmware honors these and supports SMC partitioning — which is also where MIG
-exists. **On this consumer GPU, no driver-imposable compute isolation exists.**
+**Bottom line, as revised:** the driver-broker DOES unlock privilege (the one
+thing we set out to prove), and consumer Blackwell's GSP honors none of the
+*temporal* primitives — detach and timeslice are ineffective against doorbell
+workloads, judged by throughput rather than status codes, which is why that half
+survives. The *spatial* half was decided by a status code read from the wrong
+call site and is now open again. Ghost was assumed to work on A100 because
+datacenter GSP honors detach/timeslice; **measured, it does not** (see below).
 The only thing that isolates (green contexts) is the per-TMD userspace/cooperative
 path, below the ioctl boundary, so not imposable on an adversarial tenant. Revert
 the open-driver swap when done (ghost-revert.sh / reboot). The design below stands
 for a *datacenter* GPU; it does not rescue consumer Blackwell.
 
-## Executing this on a datacenter GPU (the decided direction, 2026-08-14)
+## PHASE 0 ON THE A100 (2026-08-17): spatial works, temporal is dead, and the 5070's spatial negative was mis-read
+
+Run on `gpu0-a`, an A100 80GB PCIe (GA100) with the same open 610.43.02 modules
+and the same hooks plus a **deferred re-probe**. Full data, method and tables in
+`NVIDIA-COMPUTE-ISOLATION.md`; the four things that change this plan:
+
+1. **`SET_TPC_PARTITION_TABLE` returns `NV_OK` and the hardware enforces it.**
+   13/27/40/54 TPCs → 502/960/1244/1550 matmul/s. First positive measurement of
+   this control anywhere on this branch, and not MIG-internal — MIG was disabled
+   and the context was an ordinary CUDA context. **Phase-2-spatial is live on
+   this hardware.**
+2. **The 5070's `0x57` was `NV_ERR_OBJECT_NOT_FOUND`, not `NOT_SUPPORTED`
+   (`0x56`).** The control was issued from inside `kctxshareapiConstruct_IMPL`,
+   where GSP cannot resolve the not-yet-registered handle. The A100 returns the
+   same `0x57` there and `NV_OK` from `kchangrpapiCtrlCmdGpFifoSchedule_IMPL`.
+   **The consumer/pro spatial verdicts must be re-taken from the deferred site.**
+3. **Every temporal lever is inert on the A100 too**, at kernel privilege:
+   detach `NV_OK` → full rate; timeslice 16:1 → 1:1 division; interleave
+   HIGH-vs-LOW → 1:1. The premise of this whole plan — "datacenter GSP honors
+   detach/timeslice, which is why Ghost works on A100" — **is false for driver
+   610.43.02.** Phase-2-temporal has no primitive to stand on and must not be
+   built until 0b/0g/0h show a *throughput* change on the target machine.
+4. **A spatial partition is a ceiling, not concurrency.** Two tenants on
+   disjoint 27+27 TPCs measure the same as two tenants on the *same* 27 TPCs
+   (442/443 vs 440/441): CUDA contexts time-slice regardless, and the partition
+   narrows each tenant inside its own slice. It costs ~40% of aggregate
+   throughput (885 vs 1422 unpartitioned) and buys a hard cap plus an
+   approximate proportional dial (40:14 TPCs → 2.66:1). Design accordingly: this
+   is *not* AMD's concurrent CU-mask behaviour, and it is not work-conserving.
+
+## Executing this on a datacenter GPU (the decided direction, 2026-08-14; superseded in part by the A100 results above)
 
 Phase 0 on the consumer RTX 5070 is a firm negative (above): the driver-broker
 unlocks privilege but GB205's GSP firmware implements none of the primitives.

@@ -631,16 +631,35 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
    Extend this to drive family-specific behaviour wherever the code currently
    assumes one architecture, and to gate/deny features a given family does not
    support. **`NVIDIA-COMPUTE-ISOLATION.md` is the definitive record + per-GPU
-   test playbook:** on the consumer RTX 5070 (Blackwell GB205), *no* Sentry- or
-   driver-reachable mechanism enforces a compute share against a doorbell
-   workload — every temporal lever is ineffective and every spatial control
-   (`SET_TPC_PARTITION_TABLE`, `SET_CWD_WATERMARK`) is `NV_ERR_NOT_SUPPORTED`,
-   even at kernel privilege via the open driver (privilege was not the wall; die/
-   firmware feature-support is). Compute isolation for arbitrary CUDA is a
-   property of the GPU *die class*, not gVisor. **Immediate next work: run that
-   doc's Step-3 playbook on the DC/pro nodes (RTX A6000 GA102, RTX 6000 Pro
-   Blackwell GB202)** to find whether they enable those controls where GB205 did
-   not. (Memory-quota isolation is separate and works everywhere.)
+   test playbook**, and the A100 run (2026-08-17, `gpu0-a`, GA100) changed two
+   of its conclusions:
+   - **An imposed spatial partition works on the A100.**
+     `SET_TPC_PARTITION_TABLE` returns `NV_OK` at kernel privilege and the
+     hardware enforces it — 13/27/40/54 of 54 TPCs → 502/960/1244/1550
+     matmul/s. First positive measurement of this control anywhere on this
+     branch, with MIG disabled, on an ordinary CUDA context.
+   - **But it is a ceiling, not concurrency.** Two tenants on *disjoint* halves
+     measure the same as two on the *same* half (442/443 vs 440/441): CUDA
+     contexts time-slice regardless, so the partition narrows each tenant
+     inside its own slice. ~40% aggregate cost (885 vs 1422 unpartitioned), a
+     hard cap, and an approximate proportional dial (40:14 TPCs → 2.66:1).
+     Unlike AMD's CU masks, which genuinely run concurrently.
+   - **Every temporal lever is inert on the A100 too** — detach, timeslice
+     (16:1 → 1:1) and interleave (HIGH vs LOW → 1:1) are all `NV_OK` at kernel
+     privilege and all ignored by GSP. The premise "datacenter firmware honors
+     these, which is why Ghost works on A100" is false for driver 610.43.02.
+   - **The 5070's spatial negative was a mis-read and is void.** `0x57` is
+     `NV_ERR_OBJECT_NOT_FOUND`, not `NOT_SUPPORTED` (`0x56`); the control had
+     been issued from inside the ctxshare's own constructor, where GSP cannot
+     resolve the handle. The A100 gives the same `0x57` there and `NV_OK` from
+     the deferred `GPFIFO_SCHEDULE` call site. **Re-probe GB205 (and any pro
+     die) from the deferred site before believing a negative.**
+
+   **Immediate next work: re-run the Step-3 playbook from the deferred call
+   site on sensai's RTX 5070 and on the pro nodes (RTX A6000 GA102, RTX 6000
+   Pro Blackwell GB202)** — `ghost-experiment/HANDOFF.md` is the procedure and
+   `driver-hooks.patch` carries all the hooks. (Memory-quota isolation is
+   separate and works everywhere.)
 4. **Send the two upstream fixes** (`797e29b80`, `6bfb3c267`) and file the KVM
    issue.
 5. **SVM (`AMDKFD_IOC_SVM`) is denied, deliberately.** See the SVM section
