@@ -31,6 +31,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -61,6 +62,15 @@ type Options struct {
 	// MaxTimesliceUs is the longest GPU scheduler timeslice, in microseconds,
 	// that the sandbox may request. Zero means no limit.
 	MaxTimesliceUs uint64
+
+	// SetTimesliceUs, when nonzero, is the GPU scheduler timeslice in
+	// microseconds that nvproxy proactively imposes on every channel group the
+	// sandbox creates. EXPERIMENTAL smoke-test lever.
+	SetTimesliceUs uint64
+
+	// SetInterleaveLevel, when nonzero, is the runlist interleave level nvproxy
+	// imposes on every channel group: 1=LOW, 2=MEDIUM, 3=HIGH. EXPERIMENTAL.
+	SetInterleaveLevel uint64
 
 	// MinComputePreemption is the least preemptible GPU compute
 	// context-switch mode the sandbox may select. WFI means no limit, since
@@ -131,6 +141,8 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	}
 	nvp.memAcct.gpuLimit = opts.GPUMemoryLimit
 	nvp.maxTimesliceUs = opts.MaxTimesliceUs
+	nvp.setTimesliceUs = opts.SetTimesliceUs
+	nvp.setInterleaveLevel = opts.SetInterleaveLevel
 	nvp.minComputePreemption = opts.MinComputePreemption
 	scheduled := opts.SchedulerFD >= 0
 	nvp.computeGate.init(opts.ComputePercent, scheduled, opts.Preempt, opts.Unschedule)
@@ -150,6 +162,12 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	}
 	if opts.MaxTimesliceUs != 0 {
 		log.Infof("nvproxy: GPU scheduler timeslice limited to %d us", opts.MaxTimesliceUs)
+	}
+	if opts.SetTimesliceUs != 0 {
+		log.Infof("nvproxy: EXPERIMENTAL: imposing a %d us GPU scheduler timeslice on every channel group", opts.SetTimesliceUs)
+	}
+	if opts.SetInterleaveLevel != 0 {
+		log.Infof("nvproxy: EXPERIMENTAL: imposing interleave level %d (1=LOW,2=MED,3=HIGH) on every channel group", opts.SetInterleaveLevel)
 	}
 	if opts.MinComputePreemption != nvconf.ComputePreemptionWFI {
 		log.Infof("nvproxy: GPU compute preemption mode required to be at least %s", opts.MinComputePreemption)
@@ -272,15 +290,53 @@ func DeviceInfoFromVFS(vfsObj *vfs.VirtualFilesystem) *DeviceInfo {
 	return nil
 }
 
+// arch returns the detected GPU architecture, or archUnknown if no class
+// identifying it has been allocated yet.
+func (nvp *nvproxy) arch() gpuArch {
+	return gpuArch(nvp.gpuArch.Load())
+}
+
+// noteGPUArch records the GPU architecture the first time an allocated class
+// identifies it, so that behaviour which differs by GPU generation can be
+// adapted at runtime rather than assumed from the driver version (one driver
+// version spans several generations). It is called on every allocation and is
+// cheap once the architecture is known; classes that do not identify a
+// generation are ignored.
+func (nvp *nvproxy) noteGPUArch(class nvgpu.ClassID) {
+	if nvp.gpuArch.Load() != int32(archUnknown) {
+		return
+	}
+	arch, ok := archFromClass(class)
+	if !ok {
+		return
+	}
+	if !nvp.gpuArch.CompareAndSwap(int32(archUnknown), int32(arch)) {
+		// Another allocation identified it first.
+		return
+	}
+	if arch.submitsByDoorbell() && nvp.computeGate.enabled() {
+		log.Warningf("nvproxy: GPU architecture is %s: work is submitted by ringing a doorbell, which the Sentry cannot fault on, so the compute gate bounds only workloads that also rewrite a command buffer per submission -- others (e.g. cuBLAS) are not held to their share. See SECURITY-FINDINGS.md.", arch)
+	} else {
+		log.Infof("nvproxy: GPU architecture is %s", arch)
+	}
+}
+
 // +stateify savable
 type nvproxy struct {
 	abi                    *driverABI `state:"nosave"`
 	version                nvconf.DriverVersion
 	capsEnabled            nvconf.DriverCaps
 	maxTimesliceUs         uint64
+	setTimesliceUs         uint64
+	setInterleaveLevel     uint64
 	minComputePreemption   nvconf.ComputePreemption
 	computeGate            computeGate
-	useDevGofer            bool
+	// gpuArch is the GPU architecture, detected from the first compute or
+	// channel class the sandbox allocates, or archUnknown until then. It is an
+	// atomic because allocations race, and is read to adapt behaviour that
+	// differs by GPU generation. See noteGPUArch.
+	gpuArch     atomicbitops.Int32
+	useDevGofer bool
 	procDriverNvidiaParams string
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice

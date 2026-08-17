@@ -44,12 +44,14 @@ go_library(
     srcs = [
         "computegate.go",
         "computegate_unsafe.go",
+        "smpart_unsafe.go",
         "fds_mutex.go",
         "frontend.go",
         "frontend_mmap.go",
         "frontend_mmap_mutex.go",
         "frontend_mmap_unsafe.go",
         "frontend_unsafe.go",
+        "gpuarch.go",
         "handlers.go",
         "memquota.go",
         "nvproxy.go",
@@ -108,6 +110,7 @@ go_test(
     name = "nvproxy_test",
     srcs = [
         "computegate_test.go",
+        "gpuarch_test.go",
         "memquota_test.go",
         "nvproxy_test.go",
         "preemption_test.go",

@@ -100,21 +100,27 @@ func TestSMISamplerForgetsDepartedProcesses(t *testing.T) {
 	}
 }
 
-// TestServerChargesMeasuredOverrun tests the reason for measuring at all.
+// TestServerDoesNotChargeMeasuredOverrun tests that driver-measured utilization
+// is not turned into debt.
 //
-// A GPU cannot be made to abandon work already submitted to it, so a sandbox
-// that submits one very long kernel keeps the GPU past the end of its window.
-// From inside it looks exactly like one that submitted a short kernel, so only
-// what the driver reports can tell them apart, and charging the excess back is
-// what stops it being a way to take more than a share.
-func TestServerChargesMeasuredOverrun(t *testing.T) {
+// A sandbox that submits one very long kernel keeps the GPU past its window, and
+// charging that excess back sounds like the way to stop it taking more than its
+// share. It was tried -- it is what --measure-usage did -- and it diverges:
+// nvidia-smi pmon samples once a second and blames most of a contended device on
+// whichever sandbox happens to be running when it samples, so that sandbox is
+// charged a huge overrun and throttled into running even less (two equal pods
+// split 31/618 instead of 324/324). So measurement no longer feeds debt;
+// overruns are bounded by preempting the channel groups at the window's close.
+// Two equally weighted sandboxes that both submit therefore get equal windows
+// however their measured use differs.
+func TestServerDoesNotChargeMeasuredOverrun(t *testing.T) {
 	s, connect := testServer(t)
 	hog := connect(t, Hello{ID: "hog", Weight: 100, PID: 111})
 	victim := connect(t, Hello{ID: "victim", Weight: 100, PID: 222})
 	waitForClients(t, s, 2)
 
-	// The hog takes the whole GPU despite being granted half of it; the victim
-	// takes only what it was given.
+	// The hog occupies the whole GPU despite being granted half of it; the victim
+	// takes only what it was given. The scheduler must not turn that into debt.
 	s.SetSampler(&FakeSampler{Utilization: Usage{{PID: 111}: 1.0, {PID: 222}: 0.5}})
 
 	var hogGrant, victimGrant Grant
@@ -126,8 +132,8 @@ func TestServerChargesMeasuredOverrun(t *testing.T) {
 		hogGrant, victimGrant = recvGrant(t, hog), recvGrant(t, victim)
 	}
 
-	if hogGrant.Allowance >= victimGrant.Allowance {
-		t.Errorf("the sandbox running past its window was granted %v and its neighbour %v; want the overrun charged back",
+	if hogGrant.Allowance != victimGrant.Allowance {
+		t.Errorf("equally weighted sandboxes were granted %v and %v; measured use must not be charged back as debt",
 			hogGrant.Allowance, victimGrant.Allowance)
 	}
 }
@@ -182,11 +188,15 @@ func TestServerWithoutSamplerStillSchedules(t *testing.T) {
 	}
 }
 
-// TestServerTakesPIDFromAnnouncement tests that the process ID runsc reports is
-// what the measurements are attributed to.
+// TestServerTakesPIDFromAnnouncement tests that the host process ID runsc
+// reports is what a sandbox's GPU use is attributed to.
 //
 // A sandbox cannot report this itself: it runs in a process namespace where it
-// is process 1, while the GPU driver reports the number it has on the host.
+// is process 1, while the driver reports the number it has on the host. A
+// sandbox that submits by ringing a doorbell faults almost never, so it reports
+// no submissions and would be taken for idle; only the driver's utilization,
+// keyed by the announced host PID, keeps it scheduled. Were the announced PID
+// ignored, its own PID would not match the sample and it would be starved.
 func TestServerTakesPIDFromAnnouncement(t *testing.T) {
 	s, connect := testServer(t)
 
@@ -194,25 +204,28 @@ func TestServerTakesPIDFromAnnouncement(t *testing.T) {
 	announce := connect(t, Hello{ID: "hog", PID: 4242, AnnounceOnly: true})
 	announce.Close()
 
-	// The sandbox connects without a process ID, as it must.
+	// The sandbox connects without a process ID, as it must, and submits nothing
+	// the gate can see -- it rings a doorbell.
 	hog := connect(t, Hello{ID: "hog", Weight: 100})
 	victim := connect(t, Hello{ID: "victim", Weight: 100, PID: 555})
 	waitForClients(t, s, 2)
 
-	// The announced process is taking the whole GPU despite its window.
-	s.SetSampler(&FakeSampler{Utilization: Usage{{PID: 4242}: 1.0, {PID: 555}: 0.5}})
+	// Only the sample, keyed by the announced PID, shows the hog active.
+	s.SetSampler(&FakeSampler{Utilization: Usage{{PID: 4242}: 1.0}})
 
-	var hogGrant, victimGrant Grant
+	var hogGrant Grant
 	for i := 0; i < 6; i++ {
-		hog.SendReport(Report{Submissions: 1})
 		victim.SendReport(Report{Submissions: 1})
-		waitForReports(t, s, 2)
+		waitForReports(t, s, 1)
 		s.Tick()
-		hogGrant, victimGrant = recvGrant(t, hog), recvGrant(t, victim)
+		hogGrant = recvGrant(t, hog)
+		recvGrant(t, victim)
 	}
-	if hogGrant.Allowance >= victimGrant.Allowance {
-		t.Errorf("the announced process overran and was granted %v against its neighbour's %v; want the overrun charged back",
-			hogGrant.Allowance, victimGrant.Allowance)
+
+	// Seen as active only through its announced PID, it keeps a real share; had
+	// the announcement been ignored it would have been idled to the floor.
+	if hogGrant.Fraction() < 0.3 {
+		t.Errorf("a sandbox active only by its announced PID got %.0f%% of the GPU; want about half", hogGrant.Fraction()*100)
 	}
 }
 

@@ -167,7 +167,7 @@ func TestPreemptDisabledByDefault(t *testing.T) {
 // later inherits the handle.
 func TestChannelGroupTracking(t *testing.T) {
 	g := &computeGate{}
-	g.init(50 /* percent */, false /* scheduled */, true /* preempt */)
+	g.init(50 /* percent */, false /* scheduled */, true /* preempt */, false /* unschedule */)
 
 	fd1, fd2 := &frontendFD{}, &frontendFD{}
 	hClient := nvgpu.Handle{Val: 0xc1}

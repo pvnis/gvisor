@@ -610,18 +610,48 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
 2. **Fix or default off `--measure-usage`.** It is on by default and makes an
    ordinary two-pod split *worse* than no scheduler at all (31/618 against
    324/324). The documented setup works around it; the code should not need the
-   workaround.
-3. **Send the two upstream fixes** (`797e29b80`, `6bfb3c267`) and file the KVM
+   workaround. Related, still open: the compute gate assigns *correct weighted
+   windows* once the scheduler knows a sandbox is active, but on Volta+ GPUs it
+   cannot *enforce* them against a doorbell-submission workload (cuBLAS) — see
+   `SECURITY-FINDINGS.md`, where three mechanisms (command-buffer revocation,
+   TSG preempt/unschedule, doorbell/USERMODE revocation) are each measured to
+   fail. A `pkg/gpusched/server.go` change that uses the sampler for *activity
+   detection* (not the divergent debt path) is in the tree and fixes the
+   scheduling half.
+3. **nvproxy must handle multiple NVIDIA GPU architectures, with runtime family
+   detection.** One driver ABI spans Turing→Blackwell, and behaviour differs by
+   generation — e.g. cuBLAS on a *Blackwell* GPU allocates a *Hopper* USERMODE
+   class, and whether the compute gate can enforce at all is a per-family
+   property (all Volta+ submit by doorbell). Detecting the GPU from the driver
+   version alone is wrong. First piece landed (`pkg/sentry/devices/nvproxy/
+   gpuarch.go`): a `gpuArch` enum + `archFromClass` (compute class is
+   authoritative; channel class is the fallback; USERMODE is unreliable) +
+   `submitsByDoorbell()`, detected at runtime from the classes the sandbox
+   allocates and logged once (verified: reports "Blackwell" on the RTX 5070).
+   Extend this to drive family-specific behaviour wherever the code currently
+   assumes one architecture, and to gate/deny features a given family does not
+   support. **`NVIDIA-COMPUTE-ISOLATION.md` is the definitive record + per-GPU
+   test playbook:** on the consumer RTX 5070 (Blackwell GB205), *no* Sentry- or
+   driver-reachable mechanism enforces a compute share against a doorbell
+   workload — every temporal lever is ineffective and every spatial control
+   (`SET_TPC_PARTITION_TABLE`, `SET_CWD_WATERMARK`) is `NV_ERR_NOT_SUPPORTED`,
+   even at kernel privilege via the open driver (privilege was not the wall; die/
+   firmware feature-support is). Compute isolation for arbitrary CUDA is a
+   property of the GPU *die class*, not gVisor. **Immediate next work: run that
+   doc's Step-3 playbook on the DC/pro nodes (RTX A6000 GA102, RTX 6000 Pro
+   Blackwell GB202)** to find whether they enable those controls where GB205 did
+   not. (Memory-quota isolation is separate and works everywhere.)
+4. **Send the two upstream fixes** (`797e29b80`, `6bfb3c267`) and file the KVM
    issue.
-4. **SVM (`AMDKFD_IOC_SVM`) is denied, deliberately.** See the SVM section
+5. **SVM (`AMDKFD_IOC_SVM`) is denied, deliberately.** See the SVM section
    above: forwarding it crashes ROCr's initialisation, and denial is what lets
    ROCr fall back. `hipMallocManaged` will not work; hipMalloc workloads
    (vecadd, and vLLM up to graph capture) are unaffected.
-5. **`/dev/kfd` mappings are impossible on systrap** (task #18). Not a bug: KFD
+6. **`/dev/kfd` mappings are impossible on systrap** (task #18). Not a bug: KFD
    binds each mapping to the process holding the KFD context, and systrap maps
    from a stub process, so `mmap` returns `EINVAL`. Only the KFD mapping is
    process-bound; the render node's is not. KVM is the platform to use.
-6. **Registration keys off the root container's spec.** `registerFilesystems`
+7. **Registration keys off the root container's spec.** `registerFilesystems`
    takes `&l.root`, so under Kubernetes — where the root is the pause container
    and carries no devices — spec-based detection never fires and a pod depends
    on `--amdproxy` being set for the whole sandbox. nvproxy has the same shape,

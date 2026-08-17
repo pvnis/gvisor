@@ -1469,6 +1469,9 @@ func rmAlloc(fi *frontendIoctlState) (uintptr, error) {
 	// sessionAddDependant(), or sessionAddDependency(), which need to be
 	// mirrored by dependencies in the call to nvproxy.objAddLocked().
 	// - Add handling below.
+	// Detect the GPU generation from the classes the sandbox allocates, so that
+	// behaviour differing by generation can be adapted at runtime.
+	fi.fd.dev.nvp.noteGPUArch(ioctlParams.HClass)
 	result, err := fi.fd.dev.nvp.abi.allocationClass[ioctlParams.HClass].handle(fi, &ioctlParams, isNVOS64)
 	if err != nil {
 		if handleErr, ok := err.(*errHandler); ok {
@@ -1706,6 +1709,34 @@ func rmAllocChannelGroup(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAM
 		// A channel group is the unit the GPU schedules, and therefore the unit
 		// the compute gate preempts when the sandbox's window closes.
 		fi.fd.dev.nvp.computeGate.addChannelGroup(fi.fd, ioctlParams.HRoot, ioctlParams.HObjectNew)
+		// Experiment: impose a GPU scheduler timeslice on this channel group so
+		// the sandbox's share of a contended GPU is weighted by the runlist
+		// itself, independent of how it submits work. Smoke test only -- not yet
+		// normalized by the number of channel groups the sandbox holds.
+		if ts := fi.fd.dev.nvp.setTimesliceUs; ts != 0 {
+			if err := setChannelGroupTimeslice(fi.fd, ioctlParams.HRoot, ioctlParams.HObjectNew, ts); err != nil {
+				fi.ctx.Warningf("nvproxy: failed to impose a %d us timeslice on chgroup %#x: %v", ts, ioctlParams.HObjectNew.Val, err)
+			}
+		}
+		// Experiment: impose a runlist interleave level (coarse priority) on this
+		// channel group. Flag 1/2/3 -> LOW/MEDIUM/HIGH. Measured admin-gated on
+		// this driver (fails NV_ERR_INSUFFICIENT_PERMISSIONS); see
+		// setChannelGroupInterleaveLevel.
+		if il := fi.fd.dev.nvp.setInterleaveLevel; il != 0 {
+			level := uint32(il - 1) // LOW=0, MEDIUM=1, HIGH=2
+			if err := setChannelGroupInterleaveLevel(fi.fd, ioctlParams.HRoot, ioctlParams.HObjectNew, level); err != nil {
+				fi.ctx.Warningf("nvproxy: failed to impose interleave level %d on chgroup %#x: %v", level, ioctlParams.HObjectNew.Val, err)
+			}
+		}
+		// Experiment: impose a static TPC partition on this channel group so the
+		// sandbox is confined to a subset of SMs. HObjectParent is the device.
+		if len(smPartitionTPCs) > 0 {
+			if err := imposeTPCPartitionMode(fi.fd, ioctlParams.HRoot, ioctlParams.HObjectParent, ioctlParams.HObjectNew); err != nil {
+				fi.ctx.Warningf("nvproxy: smpart: SET_TPC_PARTITION_MODE(STATIC) on chgroup %#x failed: %v", ioctlParams.HObjectNew.Val, err)
+			} else {
+				fi.ctx.Infof("nvproxy: smpart: STATIC TPC mode set on chgroup %#x (device %#x)", ioctlParams.HObjectNew.Val, ioctlParams.HObjectParent.Val)
+			}
+		}
 		// Note: When the channel group's engine type is GR, which is always
 		// true unless MIG is enabled, kchangrpapiConstruct_IMPL() constructs a
 		// KERNEL_GRAPHICS_CONTEXT whose lifetime is the same as the channel
@@ -1758,6 +1789,14 @@ func rmAllocContextShare(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAM
 		// dependencies as channel group dependencies) no separate dependency
 		// is required.
 		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace)
+		// Experiment: confine this subcontext to the assigned TPC subset.
+		if len(smPartitionTPCs) > 0 {
+			if err := imposeTPCPartitionTable(fi.fd, ioctlParams.HRoot, ioctlParams.HObjectNew, smPartitionTPCs); err != nil {
+				fi.ctx.Warningf("nvproxy: smpart: SET_TPC_PARTITION_TABLE on ctxshare %#x failed: %v", ioctlParams.HObjectNew.Val, err)
+			} else {
+				fi.ctx.Infof("nvproxy: smpart: assigned %d TPCs to ctxshare %#x", len(smPartitionTPCs), ioctlParams.HObjectNew.Val)
+			}
+		}
 	})
 }
 

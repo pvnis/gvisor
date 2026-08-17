@@ -333,9 +333,36 @@ func (s *Server) Tick() {
 	// nothing is idle, and its share goes to one that will use it. Submissions
 	// are counted per sandbox rather than per device, because the sandbox has
 	// one gate covering all of them.
+	//
+	// The submission count comes from the compute gate's fault path, which only
+	// fires when the sandbox writes a revoked command-buffer mapping. That
+	// misses a whole class of workload: cuBLAS (and anything replaying a
+	// persistent GPFIFO) submits by ringing a doorbell, rewriting no
+	// Sentry-revocable mapping, so it faults a handful of times a second while
+	// keeping the GPU fully busy. Such a sandbox reported ~zero submissions and
+	// was taken for idle, handed the whole period, and never gated at all --
+	// weight ignored, neighbours starved. So a direct GPU-utilization reading,
+	// when available, is trusted as evidence of activity alongside the fault
+	// count: a sandbox the driver says is using the GPU is not idle whatever its
+	// fault count. (The reading is used only to tell active from idle here, not
+	// to charge overruns; that path is left to the window below, because
+	// charging measured use back as debt diverges -- see the device loop.)
 	idle := make(map[ID]bool, len(s.conns))
 	for id, sc := range s.conns {
-		if sc.submissions.Swap(0) > 0 {
+		active := sc.submissions.Swap(0) > 0
+		if !active && measured != nil {
+			pid := sc.pid
+			if p, ok := s.pids[id]; ok {
+				pid = p
+			}
+			for _, d := range sc.devices {
+				if u, ok := measured.Of(d, pid); ok && u > 0 {
+					active = true
+					break
+				}
+			}
+		}
+		if active {
 			sc.idleTicks = 0
 		} else {
 			sc.idleTicks++
@@ -353,26 +380,21 @@ func (s *Server) Tick() {
 				sched.Observe(id, 0)
 				continue
 			}
-			// It is using the GPU. Prefer what the driver says it took from
-			// this device, which is the only account that includes work still
-			// running after the window closed; fall back to crediting it with
-			// the window it was given.
+			// It is using the GPU; credit it with the window it was given.
+			//
+			// Crediting it instead with the driver-measured utilization -- to
+			// charge back work still running after the window closed -- was
+			// tried and is what --measure-usage did. On an ordinary workload it
+			// diverges: nvidia-smi pmon samples once a second and attributes
+			// most of a contended device to whichever sandbox happens to be
+			// running when it samples, so that sandbox is charged a large
+			// overrun, throttled by the resulting debt, and thereby made to run
+			// even less -- two equal pods split 31/618 instead of 324/324
+			// (CLAUDE.md). Overruns are now bounded by preempting the sandbox's
+			// channel groups at the window's close instead, which needs no
+			// per-sandbox measurement. The measurement is still taken, but only
+			// to distinguish active from idle above, where it cannot diverge.
 			used := sc.lastAllowance[d]
-			pid := sc.pid
-			if p, ok := s.pids[id]; ok {
-				// What runsc announced is authoritative: a sandbox reporting
-				// its own process ID reports the one it has inside its
-				// namespace.
-				pid = p
-			}
-			if util, ok := measured.Of(d, pid); ok && pid != 0 {
-				used = time.Duration(util * float64(s.period))
-				if used <= 0 {
-					// It submitted something, so it is not idle even if the GPU
-					// was busy with it for too little of the period to register.
-					used = time.Nanosecond
-				}
-			}
 			sched.Observe(id, used)
 		}
 		grants[d] = sched.Grants()

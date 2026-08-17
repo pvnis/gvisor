@@ -388,6 +388,47 @@ const (
 	NV0080_CTRL_CMD_GR_GET_CAPS_V2            = 0x801109
 )
 
+// TPC partition mode values for NV0080_CTRL_GR_TPC_PARTITION_MODE_PARAMS.Mode.
+const (
+	NV0080_CTRL_GR_TPC_PARTITION_MODE_NONE    = 0
+	NV0080_CTRL_GR_TPC_PARTITION_MODE_STATIC  = 1
+	NV0080_CTRL_GR_TPC_PARTITION_MODE_DYNAMIC = 2
+)
+
+// NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE assigns a subset of the GPU's TPCs to
+// a context share (subcontext); FERMI_CONTEXT_SHARE_A is class 0x9067.
+const NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE = 0x90670102
+
+// NV0080_CTRL_GR_TPC_PARTITION_MODE_PARAMS is the parameter type for
+// NV0080_CTRL_CMD_GR_{GET,SET}_TPC_PARTITION_MODE. From ctrl0080gr.h.
+type NV0080_CTRL_GR_TPC_PARTITION_MODE_PARAMS struct {
+	_              structs.HostLayout
+	HChannelGroup  Handle
+	Mode           uint32
+	BEnableAllTpcs uint8
+	_              [7]byte
+	GRRouteInfo    NV0080_CTRL_GR_ROUTE_INFO
+}
+
+// NV9067_CTRL_TPC_PARTITION_TABLE_TPC_INFO names one TPC in a partition table.
+// From ctrl9067.h.
+type NV9067_CTRL_TPC_PARTITION_TABLE_TPC_INFO struct {
+	_              structs.HostLayout
+	GlobalTpcIndex uint16
+	LmemBlockIndex uint16
+}
+
+// NV9067_CTRL_TPC_PARTITION_TABLE_TPC_COUNT_MAX bounds the table. From ctrl9067.h.
+const NV9067_CTRL_TPC_PARTITION_TABLE_TPC_COUNT_MAX = 256
+
+// NV9067_CTRL_TPC_PARTITION_TABLE_PARAMS is the parameter type for
+// NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE. From ctrl9067.h.
+type NV9067_CTRL_TPC_PARTITION_TABLE_PARAMS struct {
+	_          structs.HostLayout
+	NumUsedTpc uint16
+	TpcList    [NV9067_CTRL_TPC_PARTITION_TABLE_TPC_COUNT_MAX]NV9067_CTRL_TPC_PARTITION_TABLE_TPC_INFO
+}
+
 // NV0080_CTRL_GET_CAPS_PARAMS is used to represent the following:
 // - NV0080_CTRL_FB_GET_CAPS_PARAMS
 // - NV0080_CTRL_GR_GET_CAPS_PARAMS
@@ -1017,10 +1058,21 @@ const (
 
 // From src/common/sdk/nvidia/inc/ctrl/ctrla06c.h:
 const (
-	NVA06C_CTRL_CMD_GPFIFO_SCHEDULE = 0xa06c0101
-	NVA06C_CTRL_CMD_SET_TIMESLICE   = 0xa06c0103
-	NVA06C_CTRL_CMD_GET_TIMESLICE   = 0xa06c0104
-	NVA06C_CTRL_CMD_PREEMPT         = 0xa06c0105
+	NVA06C_CTRL_CMD_GPFIFO_SCHEDULE      = 0xa06c0101
+	NVA06C_CTRL_CMD_SET_TIMESLICE        = 0xa06c0103
+	NVA06C_CTRL_CMD_GET_TIMESLICE        = 0xa06c0104
+	NVA06C_CTRL_CMD_PREEMPT              = 0xa06c0105
+	NVA06C_CTRL_CMD_SET_INTERLEAVE_LEVEL = 0xa06c0107
+	NVA06C_CTRL_CMD_GET_INTERLEAVE_LEVEL = 0xa06c0108
+)
+
+// TSG interleave levels, from ctrla06c.h. HIGH-level channel groups are
+// interleaved into the runlist between lower-level ones, so they are scheduled
+// more frequently. MEDIUM is the driver default.
+const (
+	NVA06C_CTRL_INTERLEAVE_LEVEL_LOW    = 0x00000000
+	NVA06C_CTRL_INTERLEAVE_LEVEL_MEDIUM = 0x00000001
+	NVA06C_CTRL_INTERLEAVE_LEVEL_HIGH   = 0x00000002
 )
 
 // NVA06C_CTRL_SET_TIMESLICE_PARAMS is the parameter type for
@@ -1031,6 +1083,16 @@ const (
 type NVA06C_CTRL_SET_TIMESLICE_PARAMS struct {
 	_           structs.HostLayout
 	TimesliceUs uint64
+}
+
+// NVA06C_CTRL_INTERLEAVE_LEVEL_PARAMS is the parameter type for
+// NVA06C_CTRL_CMD_SET_INTERLEAVE_LEVEL and NVA06C_CTRL_CMD_GET_INTERLEAVE_LEVEL,
+// from src/common/sdk/nvidia/inc/ctrl/ctrla06c.h.
+//
+// +marshal
+type NVA06C_CTRL_INTERLEAVE_LEVEL_PARAMS struct {
+	_                  structs.HostLayout
+	TsgInterleaveLevel uint32
 }
 
 // NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS is the parameter type for

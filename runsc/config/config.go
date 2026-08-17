@@ -383,6 +383,19 @@ type Config struct {
 	// means no limit.
 	NVProxyMaxTimesliceUs uint64 `flag:"nvproxy-max-timeslice-us"`
 
+	// NVProxySetTimesliceUs, when nonzero, is the GPU scheduler timeslice in
+	// microseconds that nvproxy proactively imposes on every channel group the
+	// sandbox creates, weighting the sandbox's share of a contended GPU. Unlike
+	// the compute gate, the division is enforced by the GPU's own runlist.
+	// EXPERIMENTAL smoke-test lever; not yet TSG-count-normalized.
+	NVProxySetTimesliceUs uint64 `flag:"nvproxy-set-timeslice-us"`
+
+	// NVProxySetInterleaveLevel, when nonzero, is the runlist interleave level
+	// nvproxy imposes on every channel group the sandbox creates: 1=LOW,
+	// 2=MEDIUM, 3=HIGH (0 = leave alone). A coarse priority knob distinct from
+	// the timeslice. EXPERIMENTAL smoke-test lever.
+	NVProxySetInterleaveLevel uint64 `flag:"nvproxy-set-interleave-level"`
+
 	// NVProxyMinComputePreemption is the least preemptible GPU compute
 	// context-switch mode the sandbox may select: "wfi", "cta" or "cilp".
 	// Empty, like "wfi", means no limit.
