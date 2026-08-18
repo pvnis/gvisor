@@ -100,10 +100,17 @@ proportional (not just binary) dial.
 **Caveats.** The `0i` test is a *one-way* stall (permanent detach), which proves
 the preempt sticks but is not yet the work-conserving elastic scheduler Ghost
 describes — that needs the attach/detach toggle and the timeslice dial wired to
-a period. And this is measured on 575.57.08 specifically; the same primitive
-should now be re-run on 610 to confirm it also works on the deployed driver
-(the mechanism is version-stable, but it was our own version-bracketing that
-misled us once already).
+a period. **Confirmed on the deployed driver too.** The `0i` hook was ported to
+610.43.02 (the driver the k8s stack runs) and gives the identical result:
+tenant 0 at **1564.9 matmul/s** (whole device), tenant 1 **stalled to zero**,
+the control returning `NV_OK` on its channels. So the primitive is not specific
+to 575 — it works on 575.57.08 and 610.43.02 alike, which is what lets a broker
+built on it run on the node as deployed.
+
+One caveat remains: the `0i` test is still a *one-way* permanent detach (proves
+the preempt sticks, not the elastic scheduler). Turning it into Ghost's
+work-conserving broker needs the attach/detach toggle per period and the
+`SetTimeslice`-via-active-runlist proportional dial, wired to `pkg/gpusched`.
 
 ## TL;DR
 
