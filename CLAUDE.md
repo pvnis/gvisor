@@ -66,6 +66,18 @@ it before touching either node's Kubernetes setup.
 | kubernetes | **k3s control-plane**, Cilium, HAMi, vCluster | **k3s agent** + AMD device plugin | **yes, with the AMD device plugin** |
 | `sudo` | passwordless | passwordless | **passwordless (`(ALL) NOPASSWD: ALL`)** |
 
+**`gpu0-a` is a fourth machine, and since 2026-08-18 it runs the whole NVIDIA
+stack on its own**: an A100 80GB PCIe VM (Ubuntu 24.04, 6.8.0-138, driver
+610.43.02, MIG disabled), single-node k3s + HAMi + `runsc gpu-scheduler` +
+two vClusters, all built from this branch. It is not part of the sensai/sens1
+cluster and is reached only through its own session.
+**`A100-CLUSTER.md` is the reference** — read it before rebuilding anything
+there. Two things about it are unusual: the NVIDIA driver is the
+GHOST-instrumented open build (there is no packaged driver on the host at all,
+so the modules now live in `/lib/modules/.../updates` to survive a reboot), and
+its 610.43.02 is *unsupported* rather than unknown to nvproxy, so every sandbox
+needs `--nvproxy-allow-unsupported-driver`.
+
 The RTX 5070 is on sensai, so nvproxy measurements can be re-run there;
 `~/nvproxy-quota-test/` holds that harness. sensai has **no docker** and the
 user is not in the `kvm` group, so `//pkg/sentry/platform/kvm:kvm_cgo_test`
@@ -617,7 +629,12 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
    TSG preempt/unschedule, doorbell/USERMODE revocation) are each measured to
    fail. A `pkg/gpusched/server.go` change that uses the sampler for *activity
    detection* (not the divergent debt path) is in the tree and fixes the
-   scheduling half.
+   scheduling half. **Reproduced on GA100 through the full Kubernetes stack
+   (2026-08-18, `gpu0-a`)**: two vCluster tenants at weights 75/25 were granted
+   `75ms`/`25ms` windows and still measured 706/706 matmul/s under cuBLAS,
+   while a plain kernel-launch loop under the identical weights measured
+   81,099/22,270 launches/s (3.64:1). The workload, not the GPU family alone,
+   decides whether the gate binds. See `A100-CLUSTER.md`.
 3. **nvproxy must handle multiple NVIDIA GPU architectures, with runtime family
    detection.** One driver ABI spans Turing→Blackwell, and behaviour differs by
    generation — e.g. cuBLAS on a *Blackwell* GPU allocates a *Hopper* USERMODE
