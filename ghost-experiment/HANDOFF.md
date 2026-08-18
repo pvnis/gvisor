@@ -19,6 +19,26 @@ anything is a property of the GPU die and its GSP firmware. On the **A100
 negative turned out to be a mis-read status code (below) — so consumer/pro dies
 are an open question again.
 
+## Update, 2026-08-18: the temporal question is closed on the A100
+
+The A100 numbers here were on 610.43.02. The hooks have since been **ported to
+R535.183.06** (the paper-era A100 open-module driver; port committed in the
+`ogkm-535` tree) and re-run on `gpu0-a`. Result: **every temporal lever is inert
+on 535 too** (timeslice 16:1 -> 1:1, detach -> full rate, interleave HIGH/LOW ->
+1:1), and the **spatial partition is identical** (13/40/54 TPCs -> ~502/1252/
+1552). So on this GA100 the temporal primitives are dead across the 535->610
+driver span; do not spend more effort trying to revive them here. The remaining
+open probes are the *consumer/pro dies* (GB205 / GA102 / GB202) from the
+deferred call site — those verdicts are still void. See
+`../NVIDIA-COMPUTE-ISOLATION.md` "Validating Ghost by driver generation".
+
+The TPC partition on the A100 was also shown to be **adversarially sound** (a
+tenant cannot exceed its slice by oversubscribing streams/threads or spawning
+processes — context time-slicing bounds the aggregate) with two caveats: the
+experimental hook keys slices to a global counter not the tenant, and MPS is
+the one unhandled escape vector. See the same file, "Is the TPC partition
+adversarially sound?".
+
 ## Your immediate task
 
 Run the driver probes on this machine and report each control's NvStatus **and

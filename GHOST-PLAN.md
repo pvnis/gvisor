@@ -44,6 +44,24 @@ path, below the ioctl boundary, so not imposable on an adversarial tenant. Rever
 the open-driver swap when done (ghost-revert.sh / reboot). The design below stands
 for a *datacenter* GPU; it does not rescue consumer Blackwell.
 
+## PHASE 0 CLOSED (2026-08-18): the temporal primitive is dead on the A100 across two driver generations
+
+The A100 results below were on 610.43.02. The open objection was that Ghost's
+driver predates 610 and NVIDIA changed GSP, so the temporal levers might live on
+an older driver. **Settled by porting the hooks to R535.183.06 — the paper-era
+A100 open-module driver — and re-running on the same GA100.** Every temporal
+lever is inert on 535 exactly as on 610: timeslice 16:1 -> 442/442 (1:1),
+detach -> full 1559 matmul/s, interleave HIGH-vs-LOW -> 442/442. The spatial TPC
+partition is identical on both (13/40/54 TPCs -> ~502/1252/1552). Full data,
+method and the two honest caveats (paper's exact driver unconfirmed; only the
+open-module-reachable levers were exercised) are in
+`NVIDIA-COMPUTE-ISOLATION.md`, section "Validating Ghost by driver generation".
+**The temporal half of this plan has no primitive to stand on across the driver
+span tested and must not be built on this hardware. The spatial partition works
+but is a hard rate-ceiling that time-slices (a tenant cannot escape it by
+oversubscribing contexts or spawning processes — the same test file), not the
+elastic work-conserving scheduler Ghost describes.**
+
 ## PHASE 0 ON THE A100 (2026-08-17): spatial works, temporal is dead, and the 5070's spatial negative was mis-read
 
 Run on `gpu0-a`, an A100 80GB PCIe (GA100) with the same open 610.43.02 modules

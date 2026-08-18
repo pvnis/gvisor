@@ -26,11 +26,17 @@ to `/lib/modules/$(uname -r)/updates/` with `depmod -a` run and
 `/etc/modules-load.d/nvidia.conf` listing `nvidia` and `nvidia_uvm`, so a
 reboot brings the GPU back on its own.
 
-Those are still the hooked modules, and that is deliberate — they are the only
-ones on the host. The hooks are inert unless the registry knobs are passed:
-loading without `NVreg_RegistryDwords` (as `modprobe` now does) leaves every
-CUDA context on all 54 TPCs. To go back to imposing a partition, reload by hand
-with `GhostTpcCount=...` as `ghost-experiment/HANDOFF.md` describes.
+**As of 2026-08-18 these are clean, unhooked 610.43.02 modules** built from the
+base tag `57130a27` in `~/ogkm-610-clean`, installed both live and under
+`/lib/modules/.../updates`. An earlier point in the tree used the
+GHOST-instrumented build, whose deferred re-probe defaults to a **27-TPC
+partition even with no registry knobs** — which silently caps every CUDA context
+at ~960 matmul/s of the ~1550 the card gives. If you ever reload the hooked
+build (`~/open-gpu-kernel-modules`, for a compute-isolation probe), it is *not*
+inert by default; pass `GhostTpcCount=54` to neutralise it, and restore the
+clean modules before running the k8s stack again. The GHOST hooks and their
+per-driver findings live in `NVIDIA-COMPUTE-ISOLATION.md` and
+`ghost-experiment/HANDOFF.md`.
 
 ## Building runsc on a bare Ubuntu 24.04
 
