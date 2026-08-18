@@ -670,15 +670,17 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
      (`DetachTSG`/`AttachTSG`; `SetTimeslice` applied via the *active* runlist),
      which we never tested: our `GPFIFO_SCHEDULE(disable)` acts only on idle and
      our `SET_TIMESLICE` never resubmitted the runlist. So "temporal levers are
-     inert on the A100" describes our probe, not the firmware. **Reproduction done and positive**: on 575.57.08 the real
-     primitive — `FifoDisableChannels` with a forced preempt
-     (`bOnlyDisableScheduling=FALSE`), originated at kernel privilege (hook
-     `0i` in the `ogkm-575` tree) — stalled a saturating cuBLAS tenant to zero
-     while its neighbour took the whole GPU (1565 matmul/s vs 711 when
-     sharing). So a *driver-resident* temporal broker can bind an adversarial
-     doorbell workload on this A100; it needs kernel privilege, so it belongs
-     in a trusted host component (the scheduler / a driver hook), not the
-     Sentry. Spatial + memory + adversarial results below stand.
+     inert on the A100" describes our probe, not the firmware. **Reproduction, then a correction (see NVIDIA-COMPUTE-ISOLATION.md
+     "CORRECTION 2").** `FifoDisableChannels`+preempt (hook `0i`) detaching a
+     tenant *as it enables* keeps it off the GPU (1565 vs a stalled neighbour) —
+     a hard admission block. But deeper testing for a scheduler showed it does
+     **not** preempt a *running* tenant: mid-run detach of a saturating or
+     yielding tenant has no effect, and `CHANNEL_PREEMPTIVE_REMOVAL` is
+     NOT_SUPPORTED on this GSP. So a work-conserving temporal broker is **not**
+     achievable with the reachable controls — you cannot take the GPU from a
+     running tenant. The spatial TPC partition remains the only imposable
+     compute-isolation primitive here. Spatial + memory + adversarial results
+     below stand.
    - **The 5070's spatial negative was a mis-read and is void.** `0x57` is
      `NV_ERR_OBJECT_NOT_FOUND`, not `NOT_SUPPORTED` (`0x56`); the control had
      been issued from inside the ctxshare's own constructor, where GSP cannot

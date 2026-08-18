@@ -51,7 +51,7 @@ document are unaffected. The sections further below are left as originally
 written, with this correction governing their temporal conclusions.
 
 
-## Reproducing Ghost's real primitive: runlist detach + preempt WORKS on the A100 (2026-08-18, `gpu0-a`)
+## Reproducing Ghost's real primitive: runlist detach + preempt (2026-08-18, `gpu0-a`) — SEE CORRECTION 2 ABOVE
 
 After obtaining the Ghost paper (CORRECTION at top), we ported the hooks to
 Ghost's exact driver — **open modules 575.57.08**, A100, GSP — and implemented
@@ -111,6 +111,70 @@ One caveat remains: the `0i` test is still a *one-way* permanent detach (proves
 the preempt sticks, not the elastic scheduler). Turning it into Ghost's
 work-conserving broker needs the attach/detach toggle per period and the
 `SetTimeslice`-via-active-runlist proportional dial, wired to `pkg/gpusched`.
+
+
+## CORRECTION 2 (2026-08-18): detach blocks a tenant at *enable*, but does NOT preempt a *running* one — a work-conserving time-slicer is not achievable here
+
+Attempting to build the work-conserving scheduler the reproduction seemed to
+justify exposed that the previous "the temporal lever is real" conclusion was
+**over-claimed**, and this section corrects it. The scheduler needs to preempt a
+*running* tenant to hand the GPU to another; deeper testing shows the reachable
+controls cannot do that on this A100 GSP.
+
+Built and tested: a dynamic driver control (`/proc/driver/nvidia/gpusched`
+accepting `detach <pid>` / `attach <pid>`, issuing `FifoDisableChannels` with a
+forced preempt from an RM work item at kernel privilege — the same RPC the `0i`
+hook used). Results, all on 610.43.02:
+
+| scenario | result |
+| --- | --- |
+| **enable-time** detach (GhostPreempt, staggered so the 2nd tenant is detached as it enables) | 2nd tenant stalls to zero, 1st runs full (1564 matmul/s) — reproduces the earlier "0i" result |
+| **mid-run** detach of a lone running **saturating** tenant (repeated 10×) | no effect — 965 matmul/s throughout |
+| **mid-run** detach of one of **two running** tenants | no effect — 715/715, the "detached" tenant keeps its half |
+| **mid-run** detach of a **yielding** tenant (15% util, idle every 3 ms) | no effect — 270 matmul/s throughout |
+| `CHANNEL_PREEMPTIVE_REMOVAL` (a dedicated forced evict) via RPC | **`NV_ERR_NOT_SUPPORTED` (0x56)** on this GSP |
+
+The same recorded channel handles that stall a tenant at enable do **nothing**
+to it once it is running, and the work-item path is not the problem (GhostPreempt
+drives the identical work item and does stall at enable). So the distinction is
+timing, not plumbing: **`FifoDisableChannels` governs a channel only at/before it
+becomes active on the runlist; GSP does not honor a disable/detach of an
+already-running channel.** This is the same shape as the timeslice and interleave
+results — the driver→GSP runlist RPCs do not control work that is already
+scheduled — and it means the earlier "0i" stall was a tenant **blocked from
+starting** (detached the instant it enabled, repeatedly), not a running tenant
+**evicted**.
+
+**Consequences:**
+
+- **The "reproduce Ghost's real primitive — detach+preempt WORKS" claim is
+  narrowed.** What works: detaching a tenant *as it enables* keeps it off the
+  GPU entirely (a hard admission block). What does *not* work: preempting or
+  throttling a tenant that is already running — which is exactly what a
+  time-slicer needs.
+- **A work-conserving temporal scheduler is not achievable with the controls
+  reachable from the open driver on this A100.** You cannot take the GPU away
+  from a running tenant to give another its turn. The one lever that does bind —
+  the **spatial TPC partition** — remains the only imposable compute-isolation
+  primitive measured on this hardware, and it is a static ceiling, not elastic.
+- **How Ghost reconciles with this is now genuinely open.** The paper reports
+  `SetTimeslice`/`DetachTSG` preempting running kernels on an A100 (575.57.08);
+  every runtime test here says the reachable RPCs do not. The difference must be
+  either a control/parameter path we have not reproduced (their code is not
+  public) or a firmware/config difference we have not isolated — but "it works,
+  we just drove the wrong primitive" is no longer supported by measurement:
+  we drove `FifoDisableChannels`+preempt, the paper's stated `DetachTSG`, and it
+  does not evict running work here.
+
+The driver control and the scheduler design are left in the tree
+(`ogkm-610` hooks, `/proc/driver/nvidia/gpusched`) as a probe, not a working
+scheduler. The node is restored to clean 610 + the k8s stack.
+
+**Method note, against myself:** the earlier positive was a single staggered
+two-tenant run where the victim produced no output, read as "evicted." It was
+"never started." The lesson is the branch's own: measure the thing you're
+claiming (here, *preempt a running tenant*), not a proxy that a different
+mechanism also satisfies.
 
 ## TL;DR
 
