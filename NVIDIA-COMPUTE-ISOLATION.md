@@ -355,6 +355,98 @@ same control issued from an unprivileged context returns
 reaches even that far — the control is not in nvproxy's allowlist, so the ioctl
 is refused in the Sentry before any driver code runs.
 
+
+## Validating Ghost by driver generation: R535 behaves like 610 (2026-08-18, `gpu0-a`)
+
+The premise this whole line of work rested on — "datacenter GSP firmware honors
+the temporal primitives (detach / timeslice / interleave), which is why Ghost
+works on A100" — was measured **false on driver 610.43.02**. The obvious
+objection is that 610 is newer than whatever Ghost used, and NVIDIA changed GSP.
+The paper's exact driver is not recoverable (not on this host, not findable
+online), so rather than guess, the ghost hooks were **ported to R535.183.06**
+— the open-kernel-module branch that is nvproxy-supported and the overwhelmingly
+likely A100 driver of the paper's era — and the temporal probes re-run on the
+*same GA100*, at kernel privilege, judged by throughput.
+
+Method: the 535.183.06 open modules built from source with the GHOST hooks
+(`git apply` of `driver-hooks.patch`, one additive conflict resolved), 535
+userspace from the `.run` installer (`--no-kernel-modules`), the same
+`burn.py` doorbell matmul workload and the same venv. The 610 boot-survival
+modules were stashed so `modprobe` could not auto-reload them.
+
+**Per-TSG timeslice, set 16:1 at kernel privilege — inert, exactly as on 610:**
+
+| driver | tenant 0 SET | tenant 1 SET | readback | throughput |
+| --- | --- | --- | --- | --- |
+| 610.43.02 | 8000 µs | 500 µs | both correct | 708.9 / 706.7 (1.00:1) |
+| **535.183.06** | 8000 µs | 500 µs | both correct | **442.3 / 442.1 (1.00:1)** |
+
+The control is accepted, the runlist stores the value and reads it back, and
+GSP divides the two doorbell tenants **evenly regardless**. A 16:1 timeslice
+ratio produced a 1.00:1 throughput ratio on the paper-era driver. (The absolute
+rate differs — 442 vs 708 — only because this run used two full-device tenants
+time-slicing 1:1, i.e. ~half of the ~885 two-tenant aggregate; the *ratio* is
+the measurement, and it is 1:1.)
+
+**Runlist interleave, HIGH vs LOW at kernel privilege — inert.** Tenant 0 set
+to interleave level 3 (HIGH), tenant 1 to level 1 (LOW), both accepted
+(`SET_INTERLEAVE(3)`/`(1)` returned `NV_OK`, where 610 had refused the GET with
+`0x56`): **441.9 / 441.9, 1.00:1**. The coarse priority knob changes nothing
+either.
+
+**TSG detach — inert, exactly as on 610.** With `GhostDetach=1` the driver
+issues `GPFIFO_SCHEDULE(disable)` on every TSG at kernel privilege and each
+returns `NV_OK` (dmesg: `force-disabled ... after enable -> 0x0`). The burn
+kept running at the **full 1558.9 matmul/s**. A "disabled" TSG whose channel
+never idles is never actually descheduled — the doorbell workload sails through,
+the same result 610 gave.
+
+**The spatial TPC partition is identical on 535 — it works.** The `0f` grant
+fires from the deferred call site and the hardware enforces it, matmul/s
+tracking the TPC count essentially to the digit:
+
+| TPCs | 13 | 40 | 54 |
+| --- | --- | --- | --- |
+| 610.43.02 | 502 | 1244 | 1550 |
+| **535.183.06** | **502.6** | **1251.6** | **1551.7** |
+
+So the two drivers are indistinguishable on this GPU for every lever that
+matters: the spatial partition works on both, and every temporal lever is inert
+on both.
+
+### What this means for "validating Ghost on this architecture"
+
+The exercise set out to reproduce Ghost's elastic temporal sharing on an A100.
+On **two** driver generations now — the deployed 610.43.02 and the paper-era
+535.183.06 — the temporal primitives a driver-level broker would drive
+(per-TSG timeslice, runlist interleave, TSG detach) are **accepted at kernel
+privilege and ignored by GSP** for a doorbell-submission workload. The only
+control that isolates compute is the **spatial TPC partition**, and that is a
+hard rate-ceiling that time-slices rather than running tenants concurrently
+(see the partition sections above), not the work-conserving elastic scheduler
+Ghost describes.
+
+Two honest limits on this conclusion:
+
+- **The paper's exact driver is unconfirmed.** 535.183.06 is the most likely
+  A100 open-module driver of that era and the nearest nvproxy-supported branch,
+  but it is an inference, not the paper's stated version (which could not be
+  located). What is now firm is that the temporal levers are inert across a
+  *span* of driver generations (535 → 610), so a single intervening version
+  reviving them is unlikely but not excluded.
+- **These are the levers *reachable from the open kernel modules*.** Ghost may
+  drive the GSP scheduler through an interface these hooks do not exercise —
+  a different RM control, a GSP RPC issued from a component we do not patch, or
+  the cooperative green-context/per-TMD path that lives below the ioctl boundary
+  and so cannot be imposed on an adversarial tenant anyway. What is measured is
+  narrow and true: *these* controls, at kernel privilege, do not divide a
+  doorbell workload on this GA100 under either driver.
+
+The practical conclusion is unchanged and now doubly grounded: on this
+hardware, use **MIG** or the **spatial TPC partition** for mutually-untrusting
+compute, cap concurrent tenants, and do not expect a temporal broker to bind an
+adversarial doorbell workload.
+
 ## Per-GPU-class expectation
 
 | die class | examples | MIG | TPC table | detach/timeslice/interleave | practical answer |
