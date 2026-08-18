@@ -661,10 +661,18 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
      inside its own slice. ~40% aggregate cost (885 vs 1422 unpartitioned), a
      hard cap, and an approximate proportional dial (40:14 TPCs → 2.66:1).
      Unlike AMD's CU masks, which genuinely run concurrently.
-   - **Every temporal lever is inert on the A100 too** — detach, timeslice
-     (16:1 → 1:1) and interleave (HIGH vs LOW → 1:1) are all `NV_OK` at kernel
-     privilege and all ignored by GSP. The premise "datacenter firmware honors
-     these, which is why Ghost works on A100" is false for driver 610.43.02.
+   - **The temporal controls we drove produced no division — but they were the
+     wrong primitives (CORRECTED 2026-08-18 against the Ghost paper).**
+     `SET_TIMESLICE` on the TSG object (16:1 → 1:1), `GPFIFO_SCHEDULE(disable)`,
+     and interleave (HIGH vs LOW → 1:1) all returned `NV_OK` and did nothing.
+     But Ghost — A100, open modules **575.57.08**, GSP, mutually-untrusted
+     tenants — divides compute by **manipulating the global runlist**
+     (`DetachTSG`/`AttachTSG`; `SetTimeslice` applied via the *active* runlist),
+     which we never tested: our `GPFIFO_SCHEDULE(disable)` acts only on idle and
+     our `SET_TIMESLICE` never resubmitted the runlist. So "temporal levers are
+     inert on the A100" describes our probe, not the firmware. Reproduction on
+     575.57.08 with the real primitives is in progress. Spatial + memory +
+     adversarial results below stand.
    - **The 5070's spatial negative was a mis-read and is void.** `0x57` is
      `NV_ERR_OBJECT_NOT_FOUND`, not `NOT_SUPPORTED` (`0x56`); the control had
      been issued from inside the ctxshare's own constructor, where GSP cannot

@@ -11,6 +11,42 @@ datacenter A100 80GB PCIe (GA100)**, which changed two of the conclusions below.
 > paths, `--nvproxy-gpu-memory-limit`, with `cuMemGetInfo`/NVML rewritten) and
 > works on every GPU regardless of anything here.
 
+## CORRECTION (2026-08-18): the temporal levers we drove were the wrong primitives
+
+We obtained the Ghost paper — "Breaking the Tradeoff: Elastic and Isolated GPU
+Sharing with Ghost" (Liu, Qiao, et al.; UCLA/Berkeley/Rice). It **falsifies the
+framing of the temporal-lever results below**, though not the spatial, memory,
+or adversarial ones.
+
+- **Ghost runs on GSP, on the open modules, on an A100** — the same stack we
+  have. Testbed: A100-40G, Ubuntu 24.04 / Linux 6.14, CUDA 12.9, **open kernel
+  modules 575.57.08**. So the discrepancy is *not* a pre-GSP driver era and not
+  a datacenter-vs-consumer firmware difference.
+- **Ghost targets mutually-untrusted tenants** and relies on real GSP
+  preemption at timeslice boundaries. So it is not a cooperative-only scheme.
+- **Ghost's compute primitive is *runlist manipulation*, via two RPCs**:
+  `DetachTSG`/`AttachTSG` (remove/re-insert the TSG entry in the global
+  hardware runlist) and `SetTimeslice` (applied by updating the *active
+  runlist*, which "compels the GSP to preempt running kernels once the timeslice
+  expires").
+- **What we drove was adjacent to, but not, those primitives.** Our `0b`
+  "detach" issued `NVA06C_CTRL_CMD_INTERNAL_GPFIFO_SCHEDULE(disable)` — which by
+  our own measurement only takes effect when the channel *idles*, so a saturating
+  workload sails through; that is not `DetachTSG` removing the runlist entry.
+  Our `0g` "timeslice" set `SET_TIMESLICE` on the TSG object and read it back,
+  but never rewrote/resubmitted the active runlist, so GSP kept scheduling from
+  the old runlist copy.
+
+**So "every temporal lever is inert on the A100" is measuring the wrong thing.**
+The correct, narrow statement is: *the specific controls we issued
+(GPFIFO_SCHEDULE-disable, SET_TIMESLICE-without-runlist-resubmit,
+SET_INTERLEAVE_LEVEL) produced no division; Ghost's runlist-manipulation
+primitives (DetachTSG/AttachTSG, SetTimeslice-via-active-runlist) were not
+tested, and the paper reports they work on this class of hardware.* The reproduction
+is in progress on 575.57.08; the spatial-partition, memory-quota and adversarial
+results in this document are unaffected. The sections below are left as
+originally written, with this correction governing their temporal conclusions.
+
 ## TL;DR
 
 - The governing constraint is that enforcement must live in the **Sentry** (or a
@@ -32,13 +68,14 @@ datacenter A100 80GB PCIe (GA100)**, which changed two of the conclusions below.
   from that call site and `NV_OK` from a later one (the `GPFIFO_SCHEDULE` path).
   **The 5070 must be re-probed from the deferred call site before its negative
   stands.**
-- **Every temporal lever is inert on the A100 too** — and that *was* expected to
-  be the datacenter difference. TSG detach, per-TSG timeslice (16:1 → measured
-  1:1), and runlist interleave HIGH-vs-LOW (→ 1:1) are all accepted with
-  `NV_OK` at kernel privilege and all ignored by GSP. So "datacenter firmware
-  honors detach/timeslice, which is why Ghost works on A100" is **false for
-  driver 610.43.02**; whatever Ghost does, it is not these controls on this
-  firmware.
+- **The temporal controls *we drove* produced no division — but see the
+  CORRECTION above: they were not Ghost's primitives.** `SET_TIMESLICE` on the
+  TSG object (16:1 → measured 1:1), `GPFIFO_SCHEDULE(disable)`, and
+  `SET_INTERLEAVE_LEVEL` (HIGH-vs-LOW → 1:1) are all accepted with `NV_OK` at
+  kernel privilege and none divided the GPU. Ghost instead *manipulates the
+  global runlist* (DetachTSG/AttachTSG; SetTimeslice applied via the active
+  runlist), which we did **not** test. So this is a fidelity gap in our probe,
+  not a demonstrated property of the firmware.
 - **A spatial partition does not buy concurrency on NVIDIA, only a cap.** Two
   processes on *disjoint* halves (27+27 TPC) and two on the *same* 27 TPCs
   perform identically (442/443 vs 440/441 matmul/s) — separate CUDA contexts
@@ -67,8 +104,8 @@ datacenter A100 80GB PCIe (GA100)**, which changed two of the conclusions below.
 | --- | --- | --- | --- | --- |
 | **Compute gate** (revoke command-buffer mappings so the next submit faults) | Sentry | fault in the Sentry | **fails for doorbell** — cuBLAS/graph replay faults ~0/period; enforces only frequently-faulting kernel loops | not re-tested; same mechanism, same doorbell submission |
 | **Scheduler window / `pkg/gpusched`** (weighted, work-conserving) | Sentry | the compute gate | correct windows; **no enforcement** for doorbell (the gate can't) | same |
-| **Static TSG timeslice** (`NVA06C_CTRL_CMD_SET_TIMESLICE`) | Sentry/driver | GSP runlist | **inert** — 16:1 ratio → 1:1 division; value round-trips but GSP ignores it | **inert** — 8000 vs 500 µs at kernel priv, both `NV_OK`, both read back; division 708.9/706.7 = 1:1 |
-| **TSG detach** (`GPFIFO_SCHEDULE(disable)`) | Sentry/driver | GSP runlist | returns `NV_OK` but **ineffective** — doorbell workload runs at full rate | **ineffective** — `disable -> 0x0` on all 4 TSGs, burn keeps its full 1547 matmul/s |
+| **Static TSG timeslice** (`NVA06C_CTRL_CMD_SET_TIMESLICE`) | Sentry/driver | GSP runlist | no division — but set on the TSG object *without resubmitting the runlist*; **not** Ghost's SetTimeslice-via-active-runlist (see CORRECTION) | no division — 8000 vs 500 µs, both `NV_OK`, both read back, 708.9/706.7 = 1:1; runlist never rewritten, so untested as Ghost drives it |
+| **Channel-group disable** (`GPFIFO_SCHEDULE(disable)`) | Sentry/driver | GSP runlist | `NV_OK` but takes effect only on idle — a saturating workload runs at full rate; **this is not Ghost's DetachTSG** (runlist-entry removal), see CORRECTION | same — burn keeps its full 1547 matmul/s; the true runlist-detach RPC was not driven |
 | **Interleave level** (`SET_INTERLEAVE_LEVEL`, LOW/MED/HIGH priority) | Sentry/driver | GSP runlist | **admin-gated** (`0x1b`) from the Sentry; efficacy untested | **inert** — SET HIGH vs LOW both `NV_OK` at kernel priv (no privilege wall), GET returns NOT_SUPPORTED, division 708.1/706.0 = 1:1 |
 | **Static TPC partition table** (`NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE`) | Sentry/driver | GPU hardware (WDU) | `0x57` at kernel priv **from the constructor call site — that is OBJECT_NOT_FOUND, so this is not a verdict**; re-probe needed | **`NV_OK` and enforced** — 13/27/40/54 TPCs → 502/960/1244/1550 matmul/s |
 | **CWD watermark** (`NV9067_CTRL_CMD_SET_CWD_WATERMARK`, per-subcontext CUDA Work Distributor throttle) | Sentry/driver | GPU hardware (WDU) | `0x57` from the same wrong call site; re-probe needed | **`NV_OK`, reads back MIN, no measurable effect** — 1547.5 matmul/s, unchanged. It throttles subcontexts *within* one context; separate tenants are separate contexts |
@@ -442,10 +479,24 @@ Two honest limits on this conclusion:
   narrow and true: *these* controls, at kernel privilege, do not divide a
   doorbell workload on this GA100 under either driver.
 
-The practical conclusion is unchanged and now doubly grounded: on this
-hardware, use **MIG** or the **spatial TPC partition** for mutually-untrusting
-compute, cap concurrent tenants, and do not expect a temporal broker to bind an
-adversarial doorbell workload.
+**Resolved by the paper (see the CORRECTION at the top).** The second bullet
+above turned out to be the answer: Ghost *does* drive the GSP scheduler through
+an interface these hooks did not exercise — not a different die or firmware, but
+**runlist manipulation** (`DetachTSG`/`AttachTSG` and `SetTimeslice` applied to
+the active runlist), on the same GSP, on open modules 575.57.08, for
+mutually-untrusted tenants. Our `0b`/`0g`/`0h` probes drove
+`GPFIFO_SCHEDULE(disable)` (idle-only), `SET_TIMESLICE` on the TSG object
+without resubmitting the runlist, and `SET_INTERLEAVE_LEVEL` — adjacent
+controls, not the runlist rewrite. So "the temporal levers are inert across
+535→610" describes *our probes*, not the firmware. The reproduction with the
+real primitives is in progress on 575.57.08.
+
+Until that returns a verdict, the safe operational guidance still holds — on
+this hardware, **MIG** or the **spatial TPC partition** are the *measured*
+options for mutually-untrusting compute — but "do not expect a temporal broker
+to bind an adversarial doorbell workload" is now **an open question, not a
+finding**: Ghost claims exactly such a broker, and we have not yet tested its
+actual mechanism.
 
 ## Per-GPU-class expectation
 
@@ -574,7 +625,7 @@ while True:
 | `... = 0x57` (**OBJECT_NOT_FOUND**, not "not supported") | you called it before GSP knew the object — move to the deferred call site and ask again |
 | `... = 0x56` (NOT_SUPPORTED) | die/firmware genuinely doesn't implement it — dead on this GPU |
 | `... = 0x1b` (INSUFFICIENT_PERMISSIONS) | you're not at kernel priv — the origination path is wrong |
-| 0b/0g/0h: `NV_OK` but rate unchanged | the runlist lever is inert — measured on **both** GB205 and GA100, so expect this |
+| 0b/0g/0h: `NV_OK` but rate unchanged | **the control we drove** is inert — but 0b/0g are GPFIFO_SCHEDULE-disable and SET_TIMESLICE-without-runlist-resubmit, **not** Ghost's DetachTSG/AttachTSG + SetTimeslice-via-active-runlist. A no-division here means *our probe* did nothing, not that the runlist lever cannot work (see CORRECTION at the top) |
 | 0b detach: burn stalls / no matmuls | **detach sticks** — Ghost-style temporal scheduling is viable; port `pkg/gpusched` into the driver |
 
 Then run the pair test, which is what actually decides the design: two tenants

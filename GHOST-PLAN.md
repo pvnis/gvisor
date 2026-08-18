@@ -7,6 +7,30 @@ deliberately-unprivileged gVisor Sentry cannot. Driver clone is at
 from the deployed proprietary **610.43.02**). Reference paper: Ghost, "Breaking
 the Tradeoff: Elastic and Isolated GPU Sharing" (see memory `ghost-gvm`).
 
+## CORRECTION (2026-08-18): we drove the wrong primitive; the temporal lever is not disproven
+
+We obtained the Ghost paper ("Breaking the Tradeoff: Elastic and Isolated GPU
+Sharing with Ghost", Liu/Qiao et al., UCLA/Berkeley/Rice). It changes the
+temporal verdict recorded throughout this plan:
+
+- Ghost runs on **open modules 575.57.08, on an A100, on GSP** — the same stack
+  class we tested — for **mutually-untrusted** tenants. So the failures below are
+  not a pre-GSP era, a firmware difference, or a cooperative-only design.
+- Ghost's compute primitive is **runlist manipulation** via two RPCs:
+  `DetachTSG`/`AttachTSG` (remove/re-insert the TSG in the global hardware
+  runlist) and `SetTimeslice` (applied by updating the *active runlist*, which
+  compels GSP to preempt at expiry).
+- Our probes drove **`GPFIFO_SCHEDULE(disable)`** (takes effect only on idle —
+  not `DetachTSG`) and **`SET_TIMESLICE` on the TSG object without resubmitting
+  the runlist** (so GSP never re-read it). Both return `NV_OK` and do nothing —
+  because they are adjacent to, not, the runlist rewrite.
+
+So "the temporal primitive is dead on the A100" is a **fidelity gap in our
+probe**, not a measured property of GSP. The spatial-partition, memory-quota,
+and adversarial results elsewhere on this branch are unaffected. The
+reproduction with the real primitives is under way on 575.57.08 (tasks #8/#9).
+The consumer/pro (GB205/GA102/GB202) spatial re-probe is still separately open.
+
 ## PHASE 0 RESULTS (2026-08-14): the temporal primitive is dead on consumer Blackwell; the spatial verdict was mis-read (see the A100 section below)
 
 Executed on the RTX 5070 after swapping to the open 610.43.02 driver and adding

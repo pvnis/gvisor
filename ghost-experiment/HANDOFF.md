@@ -19,18 +19,9 @@ anything is a property of the GPU die and its GSP firmware. On the **A100
 negative turned out to be a mis-read status code (below) — so consumer/pro dies
 are an open question again.
 
-## Update, 2026-08-18: the temporal question is closed on the A100
+## Update, 2026-08-18: we drove the WRONG temporal primitive (corrected against the Ghost paper)
 
-The A100 numbers here were on 610.43.02. The hooks have since been **ported to
-R535.183.06** (the paper-era A100 open-module driver; port committed in the
-`ogkm-535` tree) and re-run on `gpu0-a`. Result: **every temporal lever is inert
-on 535 too** (timeslice 16:1 -> 1:1, detach -> full rate, interleave HIGH/LOW ->
-1:1), and the **spatial partition is identical** (13/40/54 TPCs -> ~502/1252/
-1552). So on this GA100 the temporal primitives are dead across the 535->610
-driver span; do not spend more effort trying to revive them here. The remaining
-open probes are the *consumer/pro dies* (GB205 / GA102 / GB202) from the
-deferred call site — those verdicts are still void. See
-`../NVIDIA-COMPUTE-ISOLATION.md` "Validating Ghost by driver generation".
+An earlier version of this note claimed the temporal question was "closed" on the A100 across 535->610. **That is wrong**, and the Ghost paper says why. Ghost runs on an A100, open modules **575.57.08**, GSP, mutually-untrusted tenants — the same stack class — and divides compute by **manipulating the global runlist**: `DetachTSG`/`AttachTSG` (remove/re-insert the TSG entry) and `SetTimeslice` applied via the *active runlist*. Our `0b` hook drove `GPFIFO_SCHEDULE(disable)` (idle-only, not DetachTSG) and our `0g` hook set `SET_TIMESLICE` on the TSG object without resubmitting the runlist. Both return `NV_OK` and do nothing — they are adjacent to, not, the runlist rewrite. So the "inert" result is a probe fidelity gap, not a firmware property. Reproduction with the real primitives is in progress on 575.57.08. The spatial partition IS confirmed on the A100 (and adversarially sound); the consumer/pro spatial re-probe (GB205/GA102/GB202) is still separately open. See `../NVIDIA-COMPUTE-ISOLATION.md` CORRECTION at the top.
 
 The TPC partition on the A100 was also shown to be **adversarially sound** (a
 tenant cannot exceed its slice by oversubscribing streams/threads or spawning
