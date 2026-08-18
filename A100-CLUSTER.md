@@ -167,12 +167,38 @@ gvisor`, 4 GiB quota:
 Aggregate throughput of the gated pair was ~103k launches/s against ~130k solo
 (79%); the cuBLAS pair kept 1412 of 1547 (91%).
 
-## Not done here
+## The admission webhook
 
-The admission webhook in `webhook/` is not deployed — it needs a container
-image, and this host has no docker to build one (`//webhook:image` shells out
-to the docker CLI). Pods therefore carry
-`dev.gvisor.flag.nvproxy-gpu-memory-limit` and
-`dev.gvisor.flag.nvproxy-gpu-weight` themselves, which the guide describes as
-the simplest way to run without it. Nothing else in the documented setup is
-missing.
+`~/gpu-quota-webhook` — not gVisor's own `webhook/`, which is a different tool —
+derives both annotations from the pod's resource request, so a tenant no longer
+writes its own quota. It is deployed here as of 2026-08-18.
+
+There is no docker on this host, and the image is `FROM scratch` with one
+static binary in it, so the image was assembled by hand as a docker-archive
+(a `layer.tar` holding the binary, a config naming its `diff_id`, a
+`manifest.json`) and imported with `sudo k3s ctr -n k8s.io images import`. That
+is worth knowing generally: **any single-binary image can be built on a host
+with no container tooling at all**, in about twenty lines of Python.
+
+The `MutatingWebhookConfiguration` is applied *last*, after both replicas are
+Ready. It is `failurePolicy: Fail` by design — a GPU pod admitted while the
+webhook is down would get the node-wide ceiling — so registering it before the
+backend serves would wedge pod creation everywhere outside `kube-system`.
+
+Verified here after deploying, each case run as a real pod on the A100:
+
+| case | requested | pod annotated itself | result |
+| --- | --- | --- | --- |
+| suffixed quantity | `gpumem: "2k"` | — | 2000 MiB (**40960 MiB before**) |
+| raise while `Pending` | `gpumem: 2000` | 1 GiB, then patched to 32 GiB | rewritten back; came up at 2000 MiB (**32768 MiB before**) |
+| self-restriction | `gpumem: 2000` | 512 MiB | 512 MiB, honoured |
+| through a vCluster tenant | `gpumem: "2Ki"` | 32 GiB | 2048 MiB |
+| untranslatable request | `gpumem-percentage: 50` | — | refused at admission, with the reason |
+| non-GPU pod | — | — | untouched, no annotations |
+| `kube-system` pod | — | — | created normally, webhook not consulted |
+
+The first two are holes that were measured open on this node before the fixes
+that closed them: a quantity written as `2k` parsed as unreadable and derived
+no limit at all, and the rules covered only `CREATE` while runsc reads the
+annotations when the *sandbox* starts. Neither needed a race — HAMi's 100-core
+budget will hold a pod `Pending` for as long as a tenant needs to edit it.
