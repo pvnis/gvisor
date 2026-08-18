@@ -176,6 +176,84 @@ two-tenant run where the victim produced no output, read as "evicted." It was
 claiming (here, *preempt a running tenant*), not a proxy that a different
 mechanism also satisfies.
 
+
+## CORRECTION 3 (2026-08-18): the temporal levers DO work — the missing companion was RESTART_RUNLIST
+
+CORRECTION 2 concluded a work-conserving temporal scheduler was not achievable
+here. **That was wrong, and this is the resolution.** Every earlier "inert"
+measurement — SET_TIMESLICE (16:1 → 1:1), the mid-run detaches — was missing a
+single companion RPC that commits the change to GSP: **`NVA06F_CTRL_CMD_RESTART_RUNLIST`**,
+which *"expires the current timeslice and restarts the runlist... effectively
+preempts the current channel"* (privileged-only). It returns **`NV_OK` on this
+A100's GSP** (unlike `CHANNEL_PREEMPTIVE_REMOVAL`, which is NOT_SUPPORTED). Pair
+either lever with it and both of Ghost's primitives work, measured on 610.43.02:
+
+**DetachTSG/AttachTSG** (`FIFO_DISABLE_CHANNELS` + `RESTART_RUNLIST`):
+
+| | A | B |
+| --- | --- | --- |
+| both attached (share) | 710 | 714 |
+| **detach B + restart** | **1551 (whole device)** | evicted — no progress |
+| **attach B** | 709 | 709 (resumed cleanly) |
+
+A running tenant is genuinely evicted and cleanly restored — a full reversible
+cycle, repeated over a 40 s scheduler run, not a startup artifact.
+
+**SetTimeslice** (`SET_TIMESLICE` + `RESTART_RUNLIST`), the finer lever, no full
+detach:
+
+| timeslice A:B | measured throughput A:B |
+| --- | --- |
+| 8000 µs : 500 µs (16:1) | 1406 : 79 → **14:1** (42 vs 3 samples / 15 s) |
+
+Shrinking a *running* tenant's timeslice shifts its compute share proportionally
+— Ghost's exact "shrinking the timeslice compels GSP to preempt" behaviour,
+which was measured inert before only because SET_TIMESLICE alone never committed
+a new runlist to GSP.
+
+### A work-conserving weighted scheduler, driven from userspace
+
+A minimal host-side loop (`/proc/driver/nvidia/gpusched` accepting
+`detach`/`attach`/`ts <pid> <us>`, the policy in userspace, the mechanism in the
+driver at kernel privilege) time-slices two tenants by weight:
+
+- **3:1 request → 71%/29% (2.49:1) measured** by total work over 40 s
+  (92 vs 37 completed 500-matmul samples). The gap from 3:1 is switch overhead
+  and the bash loop's timing jitter, not a mechanism limit.
+- **Aggregate 1612 matmul/s** — *above* naive contention (1420) and at solo
+  level (1550), because time-slicing runs one tenant at full rate instead of two
+  contending.
+- **Work-conserving:** kill one tenant and the survivor immediately gets the
+  whole GPU (1541 matmul/s ≈ solo). Idle time is not wasted.
+
+### What this means, and the correction to the whole arc
+
+A **driver-resident, work-conserving temporal scheduler that binds a running
+(saturating) doorbell tenant is achievable on this A100** through controls
+reachable from the open driver, at kernel privilege — the thing the
+compute-isolation investigation had repeatedly concluded was impossible. It uses
+exactly Ghost's two primitives (`SetTimeslice`, `DetachTSG`) plus the runlist
+commit (`RESTART_RUNLIST`) they depend on. It needs kernel privilege, so it
+belongs in a trusted host component (`runsc gpu-scheduler` / a driver hook),
+never the Sentry — consistent with the governing constraint and with Ghost's own
+architecture.
+
+The arc that led here, stated plainly so the record is not trusted too much at
+any single step: (1) "every temporal lever is inert" — measured, but with
+SET_TIMESLICE-without-commit and GPFIFO_SCHEDULE-disable, both missing the
+restart; (2) "detach+preempt works" — an enable-time block, over-read; (3)
+"not achievable" — measured with channel-level controls but still no runlist
+restart; (4) **this** — the levers work once the change is committed with
+`RESTART_RUNLIST`, measured two independent ways (detach and timeslice) with
+quantified, reversible results. The single technical fact under all of it:
+**GSP does not act on a per-object runlist change until the runlist is
+restarted; `RESTART_RUNLIST` is that commit, and it is supported here.**
+
+The prior CORRECTION 2, the "not achievable" lines in CLAUDE.md/GHOST-PLAN, and
+the Reproducing-Ghost section above are superseded by this. The driver control
+(detach/attach/ts + RESTART_RUNLIST via an RM work item) is in the `ogkm-610`
+tree; the node is restored to clean 610 + the k8s stack.
+
 ## TL;DR
 
 - The governing constraint is that enforcement must live in the **Sentry** (or a

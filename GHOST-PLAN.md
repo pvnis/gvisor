@@ -28,16 +28,16 @@ temporal verdict recorded throughout this plan:
 So "the temporal primitive is dead on the A100" is a **fidelity gap in our
 probe**, not a measured property of GSP. The spatial-partition, memory-quota,
 and adversarial results elsewhere on this branch are unaffected. The
-reproduction with the real primitives was **partly positive, then corrected**
-(see `NVIDIA-COMPUTE-ISOLATION.md` CORRECTION 2). `FifoDisableChannels`+preempt
-detaching a tenant *as it enables* keeps it off the GPU entirely (1565 matmul/s
-for the survivor, the other stalled) — a hard admission block. But it does
-**not** preempt a *running* tenant: mid-run detach of a saturating or yielding
-tenant is inert, and `CHANNEL_PREEMPTIVE_REMOVAL` is NOT_SUPPORTED on this GSP.
-A work-conserving temporal broker is therefore **not** viable with the reachable
-controls — you cannot take the GPU from a running tenant. Phase 2-temporal has
-no runtime primitive to stand on; the spatial TPC partition (a static ceiling)
-is the only imposable compute lever measured here.
+reproduction resolved **positive** (see `NVIDIA-COMPUTE-ISOLATION.md`
+CORRECTION 3). The earlier negatives were all missing the runlist commit
+`NVA06F_CTRL_CMD_RESTART_RUNLIST` (supported on this GSP). With it, both Ghost
+primitives work on a *running* tenant: `SET_TIMESLICE`+restart shifts the share
+proportionally (16:1 → 14:1), and `FIFO_DISABLE_CHANNELS`+restart evicts and
+cleanly restores a tenant. A userspace-driven work-conserving weighted
+time-slicer gives 71/29 for a 3:1 request, aggregate 1612 matmul/s, and full
+GPU to a lone tenant. **Phase 2-temporal has a working runtime primitive**;
+porting `pkg/gpusched` to drive detach/attach + timeslice via a driver control
+is the concrete next step.
 The consumer/pro (GB205/GA102/GB202) spatial re-probe is still separately open.
 
 ## PHASE 0 RESULTS (2026-08-14): the temporal primitive is dead on consumer Blackwell; the spatial verdict was mis-read (see the A100 section below)

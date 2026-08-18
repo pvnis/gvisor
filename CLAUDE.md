@@ -670,17 +670,19 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
      (`DetachTSG`/`AttachTSG`; `SetTimeslice` applied via the *active* runlist),
      which we never tested: our `GPFIFO_SCHEDULE(disable)` acts only on idle and
      our `SET_TIMESLICE` never resubmitted the runlist. So "temporal levers are
-     inert on the A100" describes our probe, not the firmware. **Reproduction, then a correction (see NVIDIA-COMPUTE-ISOLATION.md
-     "CORRECTION 2").** `FifoDisableChannels`+preempt (hook `0i`) detaching a
-     tenant *as it enables* keeps it off the GPU (1565 vs a stalled neighbour) —
-     a hard admission block. But deeper testing for a scheduler showed it does
-     **not** preempt a *running* tenant: mid-run detach of a saturating or
-     yielding tenant has no effect, and `CHANNEL_PREEMPTIVE_REMOVAL` is
-     NOT_SUPPORTED on this GSP. So a work-conserving temporal broker is **not**
-     achievable with the reachable controls — you cannot take the GPU from a
-     running tenant. The spatial TPC partition remains the only imposable
-     compute-isolation primitive here. Spatial + memory + adversarial results
-     below stand.
+     inert on the A100" describes our probe, not the firmware. **The temporal lever works after all — see NVIDIA-COMPUTE-ISOLATION.md
+     "CORRECTION 3".** Earlier "inert"/"not achievable" results were all missing
+     one companion RPC, `NVA06F_CTRL_CMD_RESTART_RUNLIST` (supported on this
+     GSP, unlike CHANNEL_PREEMPTIVE_REMOVAL), which commits a runlist change so
+     GSP acts on it. With it: `SET_TIMESLICE`+restart shifts a *running*
+     tenant's share proportionally (16:1 timeslice → 14:1 throughput), and
+     `FIFO_DISABLE_CHANNELS`+restart evicts a running tenant (710→1551 for the
+     survivor) and cleanly restores it. A userspace-driven, **work-conserving
+     weighted time-slicer** on this A100 gives 71/29 for a 3:1 request,
+     aggregate 1612 matmul/s, and hands the whole GPU to a lone tenant (1541).
+     It needs kernel privilege, so it belongs in a trusted host component
+     (`runsc gpu-scheduler` / a driver hook), not the Sentry. Spatial + memory
+     + adversarial results below stand.
    - **The 5070's spatial negative was a mis-read and is void.** `0x57` is
      `NV_ERR_OBJECT_NOT_FOUND`, not `NOT_SUPPORTED` (`0x56`); the control had
      been issued from inside the ctxshare's own constructor, where GSP cannot
