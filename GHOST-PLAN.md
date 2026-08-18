@@ -28,7 +28,13 @@ temporal verdict recorded throughout this plan:
 So "the temporal primitive is dead on the A100" is a **fidelity gap in our
 probe**, not a measured property of GSP. The spatial-partition, memory-quota,
 and adversarial results elsewhere on this branch are unaffected. The
-reproduction with the real primitives is under way on 575.57.08 (tasks #8/#9).
+reproduction with the real primitives is **done and positive** on 575.57.08:
+`FifoDisableChannels` with `bOnlyDisableScheduling=FALSE` (a forced preempt)
+originated at kernel privilege stalled a saturating cuBLAS tenant to **zero**
+while its neighbour took the whole GPU (1565 matmul/s), where
+GPFIFO_SCHEDULE(disable) had been inert. A driver-resident temporal broker IS
+viable on this A100 — Phase 2-temporal has a primitive to stand on after all.
+See `NVIDIA-COMPUTE-ISOLATION.md` "Reproducing Ghost's real primitive".
 The consumer/pro (GB205/GA102/GB202) spatial re-probe is still separately open.
 
 ## PHASE 0 RESULTS (2026-08-14): the temporal primitive is dead on consumer Blackwell; the spatial verdict was mis-read (see the A100 section below)
