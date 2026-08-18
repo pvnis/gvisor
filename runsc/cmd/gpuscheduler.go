@@ -31,9 +31,10 @@ import (
 
 // GPUScheduler implements subcommands.Command for the "gpu-scheduler" command.
 type GPUScheduler struct {
-	socket  string
-	period  time.Duration
-	measure bool
+	socket         string
+	period         time.Duration
+	measure        bool
+	runlistControl string
 }
 
 // Name implements subcommands.Command.Name.
@@ -72,6 +73,7 @@ func (g *GPUScheduler) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&g.socket, "socket", "/run/runsc-gpu-scheduler.sock", "path of the socket sandboxes connect to.")
 	f.DurationVar(&g.period, "period", gpusched.DefaultPeriod, "length of the cycle that windows are placed within.")
 	f.BoolVar(&g.measure, "measure-usage", true, "judge sandboxes by what they take from the GPU, as reported by nvidia-smi, rather than by whether they submitted anything. Scheduling continues without it if nvidia-smi cannot be run.")
+	f.StringVar(&g.runlistControl, "runlist-control", "", "path of the ghost-instrumented driver's runlist control (e.g. /proc/driver/nvidia/gpusched). When set, the scheduler divides each GPU by driving the hardware runlist -- detach/attach and per-TSG timeslice -- which binds doorbell-submission workloads (cuBLAS) the compute gate cannot. Requires the ghost driver; empty leaves enforcement to the gate.")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -122,6 +124,15 @@ func (g *GPUScheduler) Execute(_ context.Context, f *flag.FlagSet, args ...any) 
 		} else {
 			server.SetSampler(sampler)
 			log.Infof("Measuring GPU use per sandbox with nvidia-smi")
+		}
+	}
+
+	if g.runlistControl != "" {
+		if _, err := os.Stat(g.runlistControl); err != nil {
+			log.Warningf("Runlist control %q not present, dividing the GPU by the compute gate only: %v", g.runlistControl, err)
+		} else {
+			server.SetEnforcer(&gpusched.ProcfsEnforcer{Path: g.runlistControl})
+			log.Infof("Dividing each GPU by its hardware runlist via %q", g.runlistControl)
 		}
 	}
 

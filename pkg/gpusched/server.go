@@ -73,6 +73,13 @@ type Server struct {
 	// was given whenever it submitted anything, which cannot distinguish a
 	// sandbox that used its window from one that ran far past it.
 	sampler Sampler
+
+	// enforcer, when set, divides the GPU by driving the hardware runlist
+	// (detach/attach and per-TSG timeslice) instead of -- or alongside -- the
+	// per-sandbox compute gate. It is the only path that can bind a workload
+	// submitting by doorbell (cuBLAS), which the gate cannot touch. nil leaves
+	// enforcement to the gate, as before.
+	enforcer *runlistEnforcer
 }
 
 // SetSampler makes the scheduler judge sandboxes by what they took from the GPU
@@ -89,6 +96,21 @@ func (s *Server) SetDeviceTable(table *DeviceTable) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.table = table
+}
+
+// SetEnforcer makes the scheduler divide each GPU by driving its hardware
+// runlist through the given control, in addition to sending each sandbox its
+// window for the compute gate. This is what binds doorbell-submission
+// workloads, and it requires the ghost-instrumented driver; without it, only
+// the gate enforces.
+func (s *Server) SetEnforcer(e Enforcer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e == nil {
+		s.enforcer = nil
+		return
+	}
+	s.enforcer = newRunlistEnforcer(e)
 }
 
 // serverConn is one connected sandbox.
@@ -431,7 +453,33 @@ func (s *Server) Tick() {
 		sched.Settle(s.prevGrants[d])
 	}
 	s.prevGrants = grants
+
+	// Drive the hardware runlist, if an enforcer is set. This is the part that
+	// binds doorbell workloads. Each connected sandbox becomes one runlist
+	// client keyed by its host pid (the process the driver sees allocate
+	// channels); active sandboxes are held to a timeslice proportional to their
+	// weight, and one idle past the threshold is detached so its time is
+	// reclaimed. A sandbox whose pid is not yet known is skipped -- it will be
+	// picked up once runsc announces it.
+	var enforce []EnforceClient
+	if s.enforcer != nil {
+		for id, sc := range s.conns {
+			pid := sc.pid
+			if p, ok := s.pids[id]; ok && p != 0 {
+				pid = p
+			}
+			if pid == 0 {
+				continue
+			}
+			enforce = append(enforce, EnforceClient{PID: pid, Weight: sc.weight, Idle: idle[id]})
+		}
+	}
+	enforcer := s.enforcer
 	s.mu.Unlock()
+
+	if enforcer != nil {
+		enforcer.apply(enforce)
+	}
 
 	// Send outside the lock: a sandbox that has stopped reading must not hold
 	// up the scheduling of the others.
