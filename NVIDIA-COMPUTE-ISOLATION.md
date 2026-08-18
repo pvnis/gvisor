@@ -249,6 +249,21 @@ quantified, reversible results. The single technical fact under all of it:
 **GSP does not act on a per-object runlist change until the runlist is
 restarted; `RESTART_RUNLIST` is that commit, and it is supported here.**
 
+### Wired into `runsc gpu-scheduler`, end to end
+
+`pkg/gpusched` now has an `Enforcer` that drives this control, and
+`runsc gpu-scheduler --runlist-control=/proc/driver/nvidia/gpusched` turns it on.
+The scheduler holds each active sandbox to a timeslice proportional to its
+weight and detaches one idle past the threshold, committed with the runlist
+restart. Verified with the real binary: two sandboxes weighted 3:1, two
+saturating cuBLAS burns that otherwise share 1:1, divided **76/24 (3.10:1)** —
+the scheduler set `SET_TIMESLICE` 3000/1000 µs and GSP honoured it. This is the
+first time on this branch that a *doorbell* compute workload has been divided by
+weight at all; the Sentry compute gate leaves it at 1:1. Enforcement is
+privileged, so it runs in the host-side scheduler, never a sandbox. It requires
+the ghost-instrumented driver; without `--runlist-control`, only the gate
+enforces, exactly as before.
+
 The prior CORRECTION 2, the "not achievable" lines in CLAUDE.md/GHOST-PLAN, and
 the Reproducing-Ghost section above are superseded by this. The driver control
 (detach/attach/ts + RESTART_RUNLIST via an RM work item) is in the `ogkm-610`
