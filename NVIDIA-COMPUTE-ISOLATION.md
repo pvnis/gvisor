@@ -299,6 +299,62 @@ concurrent GPU tenants and prefer a spatial partition for mutually-untrusting
 compute**, using the temporal gate only where the tenants are not adversarial
 about their submission path.
 
+
+## Is the TPC partition adversarially sound? (2026-08-18, `gpu0-a`, 610.43.02)
+
+The imposed TPC partition is the one Ghost-style primitive that works on GA100.
+Everything measured before was *cooperative* — one well-behaved process per
+tenant. These probes are a tenant trying to break out of its 27-TPC (of 54)
+slice, driver reloaded with `GhostTpcCount=27;GhostDisjoint=1`.
+
+| attack | result | matmul/s |
+| --- | --- | --- |
+| baseline, one context | capped | 963 (vs 1550 full card) |
+| 8 CUDA streams in one context | no escape | 1007 |
+| 4 host threads hammering one context | no escape | 956 aggregate (239×4) |
+| **one tenant, 3 processes** | **no escape** | 294 each, **882 aggregate** |
+
+**Oversubscription inside one context cannot exceed the slice.** Streams and
+threads share the one ctxshare, so they share its 27 TPCs; the cap is a hardware
+property of the partition and does not care how much work is thrown at it.
+
+**Spawning processes does not escape it either — and this is the important
+one.** Each new process creates its own ctxshare, which the hook grants its own
+disjoint slice (dmesg: `granted 27 TPCs 0..26`, `27..53`, `0..26` as the global
+slice counter advances and wraps). But separate ctxshares are separate CUDA
+contexts, and **contexts time-slice** — so three of them covering the whole card
+still only reach 882/s aggregate, *below* the 960 a single slice gives. The very
+property that makes the spatial partition a ceiling rather than concurrency
+(measured earlier: disjoint 27+27 = overlapping 27+27, both ~885) is what
+defends it here: a tenant cannot buy more GPU by fragmenting into contexts,
+because the hardware serialises them regardless of which TPCs each may use.
+
+**Two real caveats, neither an escape today:**
+
+- **The experimental hook keys slices to a global counter, not to the tenant.**
+  A real broker must key the TPC range to the *sandbox* and clamp every
+  ctxshare it opens to that one range; as written, a tenant that opens many
+  ctxshares marches the counter through — and wraps onto other tenants' ranges.
+  That is a fairness/overlap defect, not a throughput escape (time-slicing
+  bounds the aggregate regardless), but it means this hook is a *probe*, not a
+  finished enforcement path. The per-tenant identity needed for it already
+  exists in the tree (`ghostTenantIndex_GHOST`, used for the 0g/0h probes); it
+  simply is not wired into the 0c/0f grant.
+- **MPS is the one vector that could turn this into an escape, and it is not
+  reachable from a default sandbox.** MPS runs multiple contexts *concurrently*
+  instead of time-slicing them; under MPS a tenant's fragmented contexts would
+  run at once and the "ceiling" would leak. MPS needs a control daemon and a
+  pipe directory the sandbox does not have, so it is out of reach here, but a
+  deployment that exposes MPS must partition at the tenant level and forbid a
+  tenant its own MPS control.
+
+**Widening its own partition:** a tenant cannot. The `SET_TPC_PARTITION_TABLE`
+that imposes the slice succeeds only at kernel privilege (the driver hook); the
+same control issued from an unprivileged context returns
+`NV_ERR_INSUFFICIENT_PERMISSIONS` (`0x1b`), and under gVisor the sandbox never
+reaches even that far — the control is not in nvproxy's allowlist, so the ioctl
+is refused in the Sentry before any driver code runs.
+
 ## Per-GPU-class expectation
 
 | die class | examples | MIG | TPC table | detach/timeslice/interleave | practical answer |
