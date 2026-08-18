@@ -15,6 +15,7 @@
 package gpusched
 
 import (
+	"os"
 	"reflect"
 	"testing"
 )
@@ -43,33 +44,38 @@ func TestEnforceProportionalTimeslice(t *testing.T) {
 	}
 }
 
-func TestEnforceIdleDetachedAndReclaimed(t *testing.T) {
-	// Start: both active.
+func TestEnforceIdleGetsMinTimeslice(t *testing.T) {
+	// Two active, weights 1 and 1: both minTimesliceUs.
 	_, st := enforcePlan([]EnforceClient{
-		{PID: 10, Weight: 1},
-		{PID: 20, Weight: 1},
+		{PID: 10, Weight: 1}, {PID: 20, Weight: 1},
 	}, nil)
-	// 20 goes idle -> it is detached, and 10's timeslice does not change (its
-	// share grows because the runlist now has only it).
+	// 20 goes idle -> it is NOT detached; it stays attached with the minimum
+	// timeslice (the GSP hands its empty slice to 10 on its own). Since 20 was
+	// already at minTimesliceUs, nothing changes -> silent.
 	cmds, st := enforcePlan([]EnforceClient{
-		{PID: 10, Weight: 1},
-		{PID: 20, Weight: 1, Idle: true},
+		{PID: 10, Weight: 1}, {PID: 20, Weight: 1, Idle: true},
 	}, st)
-	want := []enforceCmd{{op: "detach", pid: 20}}
-	if !reflect.DeepEqual(cmds, want) {
-		t.Fatalf("idle detach: got %+v, want %+v", cmds, want)
+	if len(cmds) != 0 {
+		t.Fatalf("idle with equal weight should be silent, got %+v", cmds)
 	}
-	// 20 wakes -> it is re-attached and its timeslice re-set.
+	// 20 becomes active again with weight 3 vs 10's weight 1: the ratio among
+	// the two active sandboxes is 3:1, none detached.
 	cmds, _ = enforcePlan([]EnforceClient{
-		{PID: 10, Weight: 1},
-		{PID: 20, Weight: 1},
+		{PID: 10, Weight: 1}, {PID: 20, Weight: 3},
 	}, st)
-	want = []enforceCmd{
-		{op: "attach", pid: 20},
-		{op: "ts", pid: 20, us: minTimesliceUs},
-	}
+	want := []enforceCmd{{op: "ts", pid: 20, us: 3 * minTimesliceUs}}
 	if !reflect.DeepEqual(cmds, want) {
-		t.Fatalf("wake reattach: got %+v, want %+v", cmds, want)
+		t.Fatalf("got %+v, want %+v (20 -> 3x, no detach)", cmds, want)
+	}
+}
+
+func TestEnforceNeverDetaches(t *testing.T) {
+	// Even a long-idle sandbox is never detached -- only re-timesliced.
+	cmds, _ := enforcePlan([]EnforceClient{{PID: 10, Weight: 1, Idle: true}}, nil)
+	for _, c := range cmds {
+		if c.op == "detach" || c.op == "attach" {
+			t.Fatalf("plan must not detach/attach, got %+v", cmds)
+		}
 	}
 }
 
@@ -123,3 +129,28 @@ func TestRunlistEnforcerAppliesAndRemembers(t *testing.T) {
 		t.Fatalf("steady apply should be silent: %v", f.calls)
 	}
 }
+
+func TestPollActiveParsesDriverLines(t *testing.T) {
+	dir := t.TempDir()
+	p := dir + "/gpusched"
+	// The driver's read format: "pid <p> active <0|1>".
+	if err := os.WriteFile(p, []byte("pid 100 active 1\npid 200 active 0\ngarbage\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	e := &ProcfsEnforcer{Path: p}
+	got, err := e.PollActive()
+	if err != nil {
+		t.Fatalf("PollActive: %v", err)
+	}
+	if !got[100] || got[200] {
+		t.Fatalf("parsed %v, want {100:true,200:false}", got)
+	}
+	// Only pids with an "active" line are reported; a pid never mentioned is
+	// absent (the caller treats absent as "keep the previous state").
+	if _, ok := got[999]; ok {
+		t.Fatalf("unexpected pid in %v", got)
+	}
+}
+
+func osWriteFile(p string, b []byte) error { return os.WriteFile(p, b, 0644) }
+func osReadFile(p string) ([]byte, error)  { return os.ReadFile(p) }

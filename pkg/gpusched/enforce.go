@@ -15,9 +15,12 @@
 package gpusched
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/log"
 )
@@ -82,6 +85,51 @@ func (e *ProcfsEnforcer) Detach(pid int) error { return e.write(fmt.Sprintf("det
 // Attach implements Enforcer.
 func (e *ProcfsEnforcer) Attach(pid int) error { return e.write(fmt.Sprintf("attach %d", pid)) }
 
+// An ActivityPoller reports, per host pid, whether the sandbox is currently
+// submitting work to the GPU. It is the trusted alternative to nvidia-smi: the
+// signal is read from each channel's GP_PUT in the driver, so it is doorbell-
+// aware (it sees cuBLAS submission that fault counts miss) and cannot be forged
+// by the sandbox (unlike an in-container kernel counter).
+type ActivityPoller interface {
+	PollActive() (map[int]bool, error)
+}
+
+// PollActive refreshes the driver's activity snapshot and reads it back. It
+// writes "poll" (which makes the driver re-read every tenant's GP_PUT) and then
+// reads the per-pid "active" lines. The snapshot it returns is from the poll
+// issued on the *previous* call, since the driver refreshes asynchronously --
+// one tick of lag, which the scheduler's idle hysteresis already tolerates.
+func (e *ProcfsEnforcer) PollActive() (map[int]bool, error) {
+	p := e.Path
+	if p == "" {
+		p = DefaultRunlistControlPath
+	}
+	// Read the current snapshot first, then ask for a refresh for next time.
+	out := map[int]bool{}
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		// line: "pid <p> active <0|1>"
+		fields := strings.Fields(sc.Text())
+		if len(fields) != 4 || fields[0] != "pid" || fields[2] != "active" {
+			continue
+		}
+		pid, err1 := strconv.Atoi(fields[1])
+		act, err2 := strconv.Atoi(fields[3])
+		if err1 == nil && err2 == nil {
+			out[pid] = act != 0
+		}
+	}
+	f.Close()
+	if err := e.write("poll"); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
 // Timeslice bounds. The ratio between sandboxes is what sets their shares; the
 // absolute values only set how often the GPU context-switches between them --
 // smaller means finer division at the cost of more switching. The minimum-
@@ -110,11 +158,14 @@ type enforceCmd struct {
 // states and the state applied on the previous tick, and returns the commands
 // plus the new applied state. It is pure so it can be tested without a GPU.
 //
-// Active sandboxes are kept on the runlist with a timeslice proportional to
-// their weight. A sandbox idle past the threshold is detached so its time goes
-// to the active ones; a detached sandbox that becomes active again is
-// re-attached. Commands are emitted only where the target differs from what was
-// applied last tick, so a steady state is silent.
+// Every sandbox is held to a runlist timeslice: active ones in proportion to
+// their weight, idle ones to the minimum. It does *not* detach idle sandboxes.
+// It does not need to -- the GSP already skips an idle (empty) TSG and hands its
+// slice to whoever has work, so leaving an idle sandbox attached with a small
+// timeslice is fully work-conserving. Detaching would be worse than useless: a
+// detached sandbox stops advancing its GP_PUT, so the activity signal would
+// read it idle forever and never re-attach it. Commands are emitted only where
+// the timeslice differs from last tick, so a steady state is silent.
 func enforcePlan(clients []EnforceClient, prev map[int]pidState) ([]enforceCmd, map[int]pidState) {
 	// The smallest weight among active sandboxes anchors the timeslice scale.
 	var minW uint64
@@ -130,6 +181,9 @@ func enforcePlan(clients []EnforceClient, prev map[int]pidState) ([]enforceCmd, 
 			minW = w
 		}
 	}
+	if minW == 0 {
+		minW = 1 // everyone idle; scale is irrelevant
+	}
 
 	next := make(map[int]pidState, len(clients))
 	var cmds []enforceCmd
@@ -137,31 +191,23 @@ func enforcePlan(clients []EnforceClient, prev map[int]pidState) ([]enforceCmd, 
 	sort.Slice(clients, func(i, j int) bool { return clients[i].PID < clients[j].PID })
 
 	for _, c := range clients {
-		p := prev[c.PID]
+		var us uint64
 		if c.Idle {
-			if !p.detached {
-				cmds = append(cmds, enforceCmd{op: "detach", pid: c.PID})
-			}
-			next[c.PID] = pidState{detached: true}
-			continue
-		}
-		// Active. Re-attach if it had been detached.
-		if p.detached {
-			cmds = append(cmds, enforceCmd{op: "attach", pid: c.PID})
-		}
-		w := c.Weight
-		if w == 0 {
-			w = 1
-		}
-		us := uint64(minTimesliceUs) * w / minW
-		if us < minTimesliceUs {
 			us = minTimesliceUs
+		} else {
+			w := c.Weight
+			if w == 0 {
+				w = 1
+			}
+			us = uint64(minTimesliceUs) * w / minW
+			if us < minTimesliceUs {
+				us = minTimesliceUs
+			}
+			if us > maxTimesliceUs {
+				us = maxTimesliceUs
+			}
 		}
-		if us > maxTimesliceUs {
-			us = maxTimesliceUs
-		}
-		// Only re-set the timeslice when it changes or after a re-attach.
-		if p.detached || p.timesliceUs != us {
+		if prev[c.PID].timesliceUs != us {
 			cmds = append(cmds, enforceCmd{op: "ts", pid: c.PID, us: us})
 		}
 		next[c.PID] = pidState{timesliceUs: us}

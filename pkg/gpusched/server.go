@@ -80,6 +80,12 @@ type Server struct {
 	// submitting by doorbell (cuBLAS), which the gate cannot touch. nil leaves
 	// enforcement to the gate, as before.
 	enforcer *runlistEnforcer
+
+	// activity, when set, reports which sandboxes are submitting work, read
+	// from the driver (GP_PUT) rather than nvidia-smi. It is set together with
+	// the enforcer when the control supports it, and is the trusted, doorbell-
+	// aware idle signal the sampler cannot be.
+	activity ActivityPoller
 }
 
 // SetSampler makes the scheduler judge sandboxes by what they took from the GPU
@@ -108,9 +114,13 @@ func (s *Server) SetEnforcer(e Enforcer) {
 	defer s.mu.Unlock()
 	if e == nil {
 		s.enforcer = nil
+		s.activity = nil
 		return
 	}
 	s.enforcer = newRunlistEnforcer(e)
+	if ap, ok := e.(ActivityPoller); ok {
+		s.activity = ap
+	}
 }
 
 // serverConn is one connected sandbox.
@@ -343,6 +353,16 @@ func (s *Server) tickLoop() {
 // It is exported so that the scheduling can be driven directly in tests rather
 // than by waiting on a clock.
 func (s *Server) Tick() {
+	// Read the driver's activity snapshot before taking the lock; it is the
+	// trusted, doorbell-aware idle signal, used in place of the fault count and
+	// nvidia-smi below when present.
+	var driverActive map[int]bool
+	if s.activity != nil {
+		if a, err := s.activity.PollActive(); err == nil {
+			driverActive = a
+		}
+	}
+
 	s.mu.Lock()
 	s.reconcileLocked()
 
@@ -372,11 +392,19 @@ func (s *Server) Tick() {
 	idle := make(map[ID]bool, len(s.conns))
 	for id, sc := range s.conns {
 		active := sc.submissions.Swap(0) > 0
-		if !active && measured != nil {
-			pid := sc.pid
-			if p, ok := s.pids[id]; ok {
-				pid = p
+		pid := sc.pid
+		if p, ok := s.pids[id]; ok {
+			pid = p
+		}
+		// The driver's GP_PUT signal sees doorbell submission that the fault
+		// count misses and cannot be forged; OR it in, so a sandbox is active if
+		// either says so. Fall back to nvidia-smi only when the driver signal is
+		// absent.
+		if driverActive != nil {
+			if a, ok := driverActive[pid]; ok && a {
+				active = true
 			}
+		} else if !active && measured != nil {
 			for _, d := range sc.devices {
 				if u, ok := measured.Of(d, pid); ok && u > 0 {
 					active = true
