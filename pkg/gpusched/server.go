@@ -472,6 +472,15 @@ func (s *Server) Tick() {
 			}
 		}
 		if g, ok := narrowest(grants, sc); ok {
+			// When the hardware runlist is doing the division, the compute gate
+			// must stand down: if it revokes a sandbox's submission mappings
+			// outside a window, the sandbox stops submitting, its GPFIFO drains,
+			// and the driver reads it idle -- which flaps the runlist timeslice
+			// and dilutes the division. Send a full-period window so the gate
+			// never revokes; the runlist alone enforces the share.
+			if s.enforcer != nil {
+				g = Grant{Period: g.Period, Allowance: g.Period, Phase: 0}
+			}
 			windows[id] = g
 		}
 		conns[id] = sc
