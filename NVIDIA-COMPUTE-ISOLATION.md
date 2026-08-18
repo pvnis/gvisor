@@ -42,10 +42,68 @@ The correct, narrow statement is: *the specific controls we issued
 (GPFIFO_SCHEDULE-disable, SET_TIMESLICE-without-runlist-resubmit,
 SET_INTERLEAVE_LEVEL) produced no division; Ghost's runlist-manipulation
 primitives (DetachTSG/AttachTSG, SetTimeslice-via-active-runlist) were not
-tested, and the paper reports they work on this class of hardware.* The reproduction
-is in progress on 575.57.08; the spatial-partition, memory-quota and adversarial
-results in this document are unaffected. The sections below are left as
-originally written, with this correction governing their temporal conclusions.
+tested, and the paper reports they work on this class of hardware.* **The reproduction is now done and positive** (next section): on 575.57.08,
+Ghost's real primitive — `FifoDisableChannels` with a preempt — stalls a
+saturating tenant completely while its neighbour takes the whole GPU. So the
+temporal lever *is* real on this A100; our earlier "inert" was driving the wrong
+control. The spatial-partition, memory-quota and adversarial results in this
+document are unaffected. The sections further below are left as originally
+written, with this correction governing their temporal conclusions.
+
+
+## Reproducing Ghost's real primitive: runlist detach + preempt WORKS on the A100 (2026-08-18, `gpu0-a`)
+
+After obtaining the Ghost paper (CORRECTION at top), we ported the hooks to
+Ghost's exact driver — **open modules 575.57.08**, A100, GSP — and implemented
+the primitive we had been missing. Ghost's `DetachTSG` is not
+`GPFIFO_SCHEDULE(disable)` (which sets `bOnlyDisableScheduling=TRUE` and only
+removes a TSG from *future* scheduling, taking effect when the channel idles —
+so a saturating workload sails through, which is exactly our old `0b` result).
+The real primitive is **`NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` with
+`bOnlyDisableScheduling=FALSE`**, which forces a **preempt** — it evicts the
+running kernels immediately. New hook `0i` originates it at kernel privilege
+(via `pGpu->hInternalClient/hInternalSubdevice`) on a tenant's channels.
+
+**Result — the temporal lever is real, and our earlier "inert" was a
+wrong-primitive artifact:**
+
+| 575.57.08, two saturating cuBLAS tenants, whole card | tenant 0 | tenant 1 | aggregate |
+| --- | --- | --- | --- |
+| no preempt (control) | 710.9 | 710.5 | 1421 (1:1 time-share) |
+| **`GhostPreempt=1` → detach+preempt tenant 1** | **1565.5** | **stalled — zero matmuls** | 1565 (tenant 0 has the whole device) |
+
+With the preempt primitive driving it, tenant 1's channels were disabled and its
+running kernels evicted; it made **no compute progress at all** (not one sample),
+while tenant 0 expanded to the **entire GPU** — 1565 matmul/s, up from the 711 it
+gets sharing 1:1, and equal to the ~1586 it gets running solo. The `0i` control returned `NV_OK` on tenant 1's 4–8 channels
+and re-fired on every `GPFIFO_SCHEDULE`, holding the victim down.
+
+**This confirms the paper.** On the same GSP, same die, same driver class where
+our earlier probes measured "every temporal lever inert," Ghost's actual
+mechanism — runlist manipulation via `FifoDisableChannels`-with-preempt — binds
+a saturating doorbell workload completely. The failure to reproduce was ours:
+we drove `GPFIFO_SCHEDULE(disable)` (schedule-off, idle-only) and `SET_TIMESLICE`
+on the TSG object without a runlist rewrite, neither of which forces a preempt.
+The correct primitive does.
+
+**What this changes for the branch.** A driver-resident (trusted-host) broker
+*can* enforce a temporal compute share against an adversarial tenant on this
+A100 — the thing the whole compute-isolation investigation had concluded was
+impossible here. It requires kernel privilege (the control is kernel-only), so
+it belongs in a trusted host component — `runsc gpu-scheduler` or a driver hook —
+not the unprivileged Sentry, consistent with the governing constraint. The next
+steps are to (1) drive it as a *scheduler* (toggle detach/attach per window and
+apply proportional timeslices via the active runlist, rather than a permanent
+one-way stall), and (2) confirm `SetTimeslice`-via-active-runlist gives a
+proportional (not just binary) dial.
+
+**Caveats.** The `0i` test is a *one-way* stall (permanent detach), which proves
+the preempt sticks but is not yet the work-conserving elastic scheduler Ghost
+describes — that needs the attach/detach toggle and the timeslice dial wired to
+a period. And this is measured on 575.57.08 specifically; the same primitive
+should now be re-run on 610 to confirm it also works on the deployed driver
+(the mechanism is version-stable, but it was our own version-bracketing that
+misled us once already).
 
 ## TL;DR
 

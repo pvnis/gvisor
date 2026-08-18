@@ -670,9 +670,15 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
      (`DetachTSG`/`AttachTSG`; `SetTimeslice` applied via the *active* runlist),
      which we never tested: our `GPFIFO_SCHEDULE(disable)` acts only on idle and
      our `SET_TIMESLICE` never resubmitted the runlist. So "temporal levers are
-     inert on the A100" describes our probe, not the firmware. Reproduction on
-     575.57.08 with the real primitives is in progress. Spatial + memory +
-     adversarial results below stand.
+     inert on the A100" describes our probe, not the firmware. **Reproduction done and positive**: on 575.57.08 the real
+     primitive — `FifoDisableChannels` with a forced preempt
+     (`bOnlyDisableScheduling=FALSE`), originated at kernel privilege (hook
+     `0i` in the `ogkm-575` tree) — stalled a saturating cuBLAS tenant to zero
+     while its neighbour took the whole GPU (1565 matmul/s vs 711 when
+     sharing). So a *driver-resident* temporal broker can bind an adversarial
+     doorbell workload on this A100; it needs kernel privilege, so it belongs
+     in a trusted host component (the scheduler / a driver hook), not the
+     Sentry. Spatial + memory + adversarial results below stand.
    - **The 5070's spatial negative was a mis-read and is void.** `0x57` is
      `NV_ERR_OBJECT_NOT_FOUND`, not `NOT_SUPPORTED` (`0x56`); the control had
      been issued from inside the ctxshare's own constructor, where GSP cannot
