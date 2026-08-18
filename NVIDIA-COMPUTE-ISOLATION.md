@@ -249,6 +249,32 @@ quantified, reversible results. The single technical fact under all of it:
 **GSP does not act on a per-object runlist change until the runlist is
 restarted; `RESTART_RUNLIST` is that commit, and it is supported here.**
 
+### Through the full Kubernetes + vCluster stack (adversarial)
+
+The runlist scheduler was then run through the real path: the ghost driver, k3s,
+HAMi, `runsc gpu-scheduler --runlist-control`, and two **cuBLAS (doorbell)** pods
+deployed from separate vCluster tenants -- the workload the compute gate cannot
+divide (measured 1:1). Two findings:
+
+- **The mechanism binds a real gVisor doorbell pod.** Setting the two pods'
+  timeslices 6:1 by hand through the control divided their throughput **6.33:1**
+  (86%/14%), with 4 channel groups each and no dilution -- a saturating cuBLAS
+  tenant inside a real sandbox, held to a weighted share the gate leaves at 1:1.
+- **The gate must stand down, and it now does.** When both the gate (mapping
+  revocation) and the runlist ran, the gate revoked a sandbox's mappings outside
+  its window, the GPFIFO drained to `PUT==GET`, the channel-state signal read it
+  idle, and the timeslice flapped. The server now sends a full-period window
+  whenever the enforcer is set, so the runlist alone divides.
+
+**One plumbing gap remains in the *automatic* path.** With the scheduler driving
+it, only one of the two co-scheduled sandboxes was enforced: under KVM the pid
+`runsc` announces for a sandbox did not match the tgid the driver records that
+sandbox's channels under, so the other sandbox's timeslice commands hit a dead
+pid. Its weight was still known (the enforced pod's slice flapped 3000<->1000 as
+the mis-plumbed peer's connection came and went), so the division landed at
+1.47:1 instead of 3:1. Aligning the announced pid with the channel-owner tgid is
+the next fix; the mechanism itself is proven (6.33:1 by hand on the same pods).
+
 ### Wired into `runsc gpu-scheduler`, end to end
 
 `pkg/gpusched` now has an `Enforcer` that drives this control, and
