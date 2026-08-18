@@ -200,6 +200,105 @@ simpler answer on this hardware; the TPC table matters where MIG's granularity
 (7 fixed instances, requires GPU reset, no memory-quota flexibility) does not
 fit, or where shares must change without touching the device.
 
+
+## Through the full Kubernetes stack: multi-tenant sharing, memory, and an adversarial tenant (2026-08-18, `gpu0-a`)
+
+Everything above was measured bare-metal with native processes. This section is
+the same GA100 driving **real gVisor sandboxes** through k3s + HAMi +
+`runsc gpu-scheduler` + the `gpu-quota-webhook`, two vClusters available as
+tenants. Workloads: `matmul` = the saturating cuBLAS loop (doorbell submission,
+the gate cannot touch it); `launch` = a tight `a+b` kernel-launch loop (each
+launch re-enters through a path the gate *can* revoke). Rates are the median of
+the samples taken inside a 45 s window after a 25 s settle. Solo baselines on
+this stack: launch **120 443/s**, matmul **1562/s**.
+
+### Time-sharing divides correctly, and stays fair further than AMD does
+
+| tenants | weights | workload | per-tenant | Jain | aggregate |
+| --- | --- | --- | --- | --- | --- |
+| 2 | 50/50 | matmul | 712 / 711 | 1.0000 | 1424 (91% of solo) |
+| 3 | equal | matmul | 474 / 474 / 474 | 1.0000 | 1421 |
+| 2 | 50/50 | launch | 47 514 / 47 097 | 1.0000 | 94 610 (79%) |
+| 3 | equal | launch | 25 562 / 27 820 / 25 466 | 0.9983 | 78 847 |
+| 4 | equal | launch | 20 082 / 19 887 / 19 848 / 19 920 | 1.0000 | 79 737 |
+
+Equal shares are exactly fair, and — unlike AMD's Navi 32, which goes bimodal
+past three tenants — **NVIDIA's time-slicing stays fair through four** (Jain
+1.0000 at four launch tenants). The matmul aggregate is ~1420 regardless of
+tenant count: cuBLAS contexts time-slice among themselves, so N tenants each
+get 1/N and the total is conserved. The launch aggregate falls to ~79% under
+the gate (the price of revoking and restoring submission mappings each period).
+
+### Weighted shares work, and overshoot toward the heavy tenant
+
+| tenants | weights | requested | measured | aggregate |
+| --- | --- | --- | --- | --- |
+| 2 | 75/25 | 3.00:1 | 82 435 / 22 108 = **3.73:1** | 104 542 (87%) |
+| 3 | 60/30/10 | 6:3:1 | 60 677 / 27 942 / 8 013 = **7.57:3.49:1** | 96 632 |
+
+The division is real — without the scheduler two equal tenants split 1:1 — and
+proportional, but the heaviest tenant takes somewhat *more* than its weight,
+the same approximate-dial behaviour AMD's CU masks show. Only the `launch`
+workload is divided; see the adversarial section for what `matmul` does.
+
+### Work-conserving
+
+One busy `launch` tenant beside one registered-but-idle tenant kept **120 585/s
+— 100% of solo**. The idle tenant drops to its 5 ms floor and its neighbour
+expands to the whole period; a tenant pays nothing for a neighbour that is not
+asking.
+
+### Memory quotas hold under concurrency
+
+Three sandboxes allocating at once, quotas 4 / 2 / 1 GiB, each in 64 MiB steps
+until refused:
+
+| quota | stopped at | `total` it saw | after freeing half |
+| --- | --- | --- | --- |
+| 4096 MiB | 3648 | 4096 | free → 1823 |
+| 2048 MiB | 1600 | 2048 | free → 799 |
+| 1024 MiB | 576 | 1024 | free → 287 |
+
+Each capped at its own ceiling (the ~420 MiB shortfall is torch's CUDA context,
+charged to the sandbox), each saw only its own `total` — never the device's
+81 920 MiB — and freed correctly. No cross-talk.
+
+### An adversarial tenant: memory and privilege hold, doorbell compute does not
+
+A hostile pod requesting a 1 GiB / weight-20 slice but annotating itself for
+80 GB / weight 100, with `CUDA_DISABLE_CONTROL=true` set, running a probe kit:
+
+| the attack | result |
+| --- | --- |
+| annotate itself the whole card + max weight | rewritten to 1 GiB / weight 20 at admission by the webhook |
+| allocate past the quota | capped at 512 MiB of its 1 GiB, `CUDA_ERROR_OUT_OF_MEMORY` |
+| `CUDA_DISABLE_CONTROL=true`, check `ld.so.preload` | preload absent; `mem_get_info` still the 1 GiB quota — the Sentry limit is independent of any in-container library |
+| observe neighbours (`nvidia-smi`, `--query-compute-apps`, `pmon`) | sees **only its own** process and its own 1 GiB `total`; never a neighbour, never 81 920 MiB |
+| `nvidia-smi -r` (GPU reset) | refused, "not supported" |
+| `nvidia-smi -lgc` (lock clocks) | refused, "no permission" |
+
+The one boundary that does **not** hold is the compute *share* against a
+doorbell workload — the documented Volta+ gate limitation, confirmed here as an
+a **weight-25** attacker running cuBLAS beside a **weight-75** victim also
+running cuBLAS measured **720 / 720 — 1:1, not 3:1**. The scheduler granted the
+attacker a 25 ms window and the victim 75 ms (logged in both Sentries), and the
+attacker took 50% of the GPU anyway. Its memory quota still held throughout;
+what it escaped was the compute *share*, and only by choosing a submission path
+the gate cannot revoke.
+
+**The reading.** Every isolation this branch claims to enforce held against a
+tenant actively trying to break it — memory quota, quota visibility, annotation
+escalation, in-container-library standdown, and privileged device controls. The
+compute *share* is the one that does not hold against an adversary on Volta+,
+and it fails open (the attacker gains, it is not throttled to nothing): a tenant
+that wants more than its weight submits through cuBLAS and gets an equal split
+instead. The defenses that do work against this are spatial and hardware-backed
+— the imposed TPC partition (a hard rate cap, below) or MIG — not the temporal
+gate. This is why the branch's position is that a scheduler should **cap
+concurrent GPU tenants and prefer a spatial partition for mutually-untrusting
+compute**, using the temporal gate only where the tenants are not adversarial
+about their submission path.
+
 ## Per-GPU-class expectation
 
 | die class | examples | MIG | TPC table | detach/timeslice/interleave | practical answer |
