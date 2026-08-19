@@ -249,6 +249,56 @@ quantified, reversible results. The single technical fact under all of it:
 **GSP does not act on a per-object runlist change until the runlist is
 restarted; `RESTART_RUNLIST` is that commit, and it is supported here.**
 
+## CORRECTION 5 (2026-08-19): the temporal scheduler works on CONSUMER Blackwell too (RTX 5070 / GB205)
+
+Every "the temporal levers are genuinely ineffective on GB205" line below is
+**wrong for the same reason the A100 ones were** — the probe was missing the
+`RESTART_RUNLIST` commit, and the spatial "NOT_SUPPORTED" was the `0x57`
+mis-read from the ctxshare constructor. Re-run on sensai's **RTX 5070 (GB205,
+driver 610.43.02, open modules, GSP)** with the corrected hooks — deferred call
+site, `SET_TIMESLICE`/`DISABLE_CHANNELS` each committed with `RESTART_RUNLIST` —
+the runlist scheduler works essentially as on the GA100. Measured with 2–3
+concurrent cuBLAS tenants under gVisor (pids keyed on the Sentry, where
+`osGetCurrentProcess` lands under KVM):
+
+- **Weighted timeslice (the prize) — POSITIVE.** `ts 3000/1000` + restart on two
+  saturating tenants that share 1:1 (220.7/220.7) → **330/110 = 3.00:1**, total
+  conserved (440), every RM call `NV_OK`. `SET_TIMESLICE` alone did nothing; the
+  restart is the whole difference, exactly as on GA100.
+- **Idle-yield of an attached-but-idle TSG — POSITIVE, and this is the
+  design-decisive one.** With the two tenants at 330/110, `kill -STOP` on one
+  (context alive, submission frozen, *not* detached) → the other expanded
+  **330 → 457 (= solo)**; `kill -CONT` restored 330/110. So GB205's GSP hands an
+  idle attached TSG's slice to whoever has work, on its own. **The gpu0-a
+  scheduler design — stable weighted timeslices, never detach, let GSP reclaim —
+  runs unchanged on consumer; no detach-based reclamation is needed.**
+- **Eviction — POSITIVE.** `DISABLE_CHANNELS`(bDisable) + restart froze one
+  tenant and the survivor jumped to solo; re-enable restored the 3:1 split.
+- **N-tenant — POSITIVE.** Equal (`ts 2000` ×3) → 145.9/145.6/145.6 = 1:1:1;
+  weighted 3000/2000/1000 → 219.6/146.0/71.7 = **3.06:2.04:1.00**, both
+  conserved (~437). Generalizes past two.
+- **The dial is linear then compresses, as on the A100.** 2:1 → 2.03:1,
+  6:1 → 6.15:1, 16:1 → **13.3:1** (GA100 gave 16:1 → 14:1). Useful linear range
+  to ~6:1; it compresses past that. All conserved.
+- **The GP_PUT≠GP_GET activity read is not an app-stall signal, and must not be
+  trusted to reclaim.** During the `kill -STOP` above, `poll` still reported the
+  stalled tenant **`active 1`**: idle-yield means its queued work is never
+  consumed, so `GP_PUT` sits frozen *ahead* of `GP_GET` and reads as pending.
+  This is exactly why the enforcer computes timeslices from **fixed configured
+  weights, independent of the activity read** (CORRECTION 4), and lets GSP do
+  the reclaiming — a scheduler that rescaled on this signal would misread a
+  yielded tenant as busy. The read remains valid for what it is used for:
+  telling a tenant that has *never* submitted from one that is competing.
+
+**Bottom line: cuBLAS is splittable by weight on consumer Blackwell, not only on
+the datacenter die.** The runlist scheduler — weighted timeslice, idle-yield,
+N-tenant, evict/restore — is a property of the GSP runlist firmware, present on
+both GA100 and GB205, and the same `runsc gpu-scheduler` binary drives both.
+This means the compute gate is *not* the only consumer fallback after all;
+where the ghost-instrumented driver can be loaded, consumer cards get real
+temporal division. (Spatial `SET_TPC_PARTITION_TABLE` on GB205 is being
+re-probed separately — re-insmod per width — and will be recorded when it lands.)
+
 ### Through the full Kubernetes + vCluster stack (adversarial)
 
 The runlist scheduler was then run through the real path: the ghost driver, k3s,
@@ -395,8 +445,8 @@ tree; the node is restored to clean 610 + the k8s stack.
 | --- | --- | --- | --- | --- |
 | **Compute gate** (revoke command-buffer mappings so the next submit faults) | Sentry | fault in the Sentry | **fails for doorbell** — cuBLAS/graph replay faults ~0/period; enforces only frequently-faulting kernel loops | not re-tested; same mechanism, same doorbell submission |
 | **Scheduler window / `pkg/gpusched`** (weighted, work-conserving) | Sentry | the compute gate | correct windows; **no enforcement** for doorbell (the gate can't) | same |
-| **Static TSG timeslice** (`NVA06C_CTRL_CMD_SET_TIMESLICE`) | Sentry/driver | GSP runlist | no division — but set on the TSG object *without resubmitting the runlist*; **not** Ghost's SetTimeslice-via-active-runlist (see CORRECTION) | no division — 8000 vs 500 µs, both `NV_OK`, both read back, 708.9/706.7 = 1:1; runlist never rewritten, so untested as Ghost drives it |
-| **Channel-group disable** (`GPFIFO_SCHEDULE(disable)`) | Sentry/driver | GSP runlist | `NV_OK` but takes effect only on idle — a saturating workload runs at full rate; **this is not Ghost's DetachTSG** (runlist-entry removal), see CORRECTION | same — burn keeps its full 1547 matmul/s; the true runlist-detach RPC was not driven |
+| **TSG timeslice + `RESTART_RUNLIST`** (`NVA06C_CTRL_CMD_SET_TIMESLICE` committed via the active runlist) | driver (kernel priv) | GSP runlist | **works — 3.00:1** (ts 3000/1000, conserved), idle-yield + N-tenant + evict/restore all positive (CORRECTION 5). Earlier "no division" was `SET_TIMESLICE` uncommitted | **works — 16:1 ts → 14:1**, work-conserving (CORRECTION 3). Earlier "no division" was the same missing restart |
+| **Channel-group disable + `RESTART_RUNLIST`** (`FIFO_DISABLE_CHANNELS` committed) | driver (kernel priv) | GSP runlist | **evicts a running tenant** and restores cleanly (CORRECTION 5). Bare `GPFIFO_SCHEDULE(disable)` acts only on idle — that was the wrong primitive | **evicts** 710→1551 for the survivor, restores (CORRECTION 3) |
 | **Interleave level** (`SET_INTERLEAVE_LEVEL`, LOW/MED/HIGH priority) | Sentry/driver | GSP runlist | **admin-gated** (`0x1b`) from the Sentry; efficacy untested | **inert** — SET HIGH vs LOW both `NV_OK` at kernel priv (no privilege wall), GET returns NOT_SUPPORTED, division 708.1/706.0 = 1:1 |
 | **Static TPC partition table** (`NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE`) | Sentry/driver | GPU hardware (WDU) | `0x57` at kernel priv **from the constructor call site — that is OBJECT_NOT_FOUND, so this is not a verdict**; re-probe needed | **`NV_OK` and enforced** — 13/27/40/54 TPCs → 502/960/1244/1550 matmul/s |
 | **CWD watermark** (`NV9067_CTRL_CMD_SET_CWD_WATERMARK`, per-subcontext CUDA Work Distributor throttle) | Sentry/driver | GPU hardware (WDU) | `0x57` from the same wrong call site; re-probe needed | **`NV_OK`, reads back MIN, no measurable effect** — 1547.5 matmul/s, unchanged. It throttles subcontexts *within* one context; separate tenants are separate contexts |
@@ -446,10 +496,14 @@ modules and added hooks that originate the controls at kernel privilege.
 - **0d — CWD watermark**: same hook, same `0x57`, same correction.
 
 What still stands from Phase 0: the broker unlocks kernel privilege (every
-`0x1b` disappears), and the *temporal* levers are genuinely ineffective on
-GB205 — that was judged by throughput, not by a status code, which is why it
-survived. What does not stand: "the spatial controls are absent from this die."
-That was a status code read wrong, from the wrong call site.
+`0x1b` disappears). What does **not** stand, and is corrected above: (a) "the
+spatial controls are absent from this die" — a status code read wrong, from the
+wrong call site; and (b) **"the temporal levers are genuinely ineffective on
+GB205."** That verdict was judged by throughput, which felt safe — but the
+throughput was measured with `SET_TIMESLICE` *uncommitted*, the same missing
+`RESTART_RUNLIST` that made the A100 look inert. Re-run with the restart commit,
+the 5070 divides cuBLAS **3.00:1** and work-conserves — see CORRECTION 5. A
+throughput-based negative is only as good as the primitive it drove.
 
 Ghost ("Breaking the Tradeoff", OSDI-class, tested on A100) was assumed to work
 because datacenter GSP honors detach/timeslice. **The A100 measurements below
@@ -968,18 +1022,45 @@ is the opposite of what `GHOST-PLAN.md` was written to expect:
 ## The honest bottom line
 
 Robust *compute* isolation for arbitrary CUDA on NVIDIA is a property of the
-**GPU die class**, not of gVisor, privilege, or cleverness — and on the
-datacenter die it is a *spatial* property, not the temporal one everyone
-assumes. On the A100 an imposed TPC partition is real, hardware-enforced, and
-reachable only from the driver; every runlist-scheduling lever is accepted and
-ignored, exactly as on consumer Blackwell. What that buys is a hard ceiling and
-a rough proportional dial at ~40% aggregate cost, because separate contexts
-still time-slice — not the concurrent, work-conserving sharing AMD's CU masks
-give. MIG remains the stronger answer where its granularity fits.
+**GSP runlist firmware**, reachable only at kernel privilege — not of gVisor,
+and not (as this section long claimed) beyond reach. The earlier verdict here —
+"temporal levers are accepted and ignored; only a spatial TPC partition works,
+and only on the datacenter die" — was wrong on every count, and wrong the same
+way twice: a runlist change the probe never *committed*. With the one companion
+RPC it was missing (`RESTART_RUNLIST`), a **driver-resident, work-conserving,
+weighted time-slicer divides even a saturating doorbell workload (cuBLAS) — on
+the A100 *and* on the consumer RTX 5070** (CORRECTIONS 3–5). It is genuinely
+work-conserving (an idle tenant's slice goes to whoever has work, via GSP's own
+idle-yield), holds across N tenants, evicts and restores, and keeps a roughly
+linear weight dial to ~6:1. That is strictly better than the spatial TPC
+partition, which also works on the A100 but only as a hard ceiling at ~40%
+aggregate cost (separate contexts still time-slice within their slice). MIG
+remains the strongest hardware answer where its granularity fits.
 
-For untrusting tenants on hardware without MIG or a working TPC table, the
-honest options are unchanged: memory-quota isolation (works everywhere), a
-cooperative green-context tier (semi-trusted only), or capping concurrent GPU
-tenants. **And the consumer/pro dies deserve a second look**: the probe that
-declared the spatial control absent on GB205 asked from a call site where the
-A100 gives the same answer while supporting the feature.
+The one hard constraint is unchanged and is the whole point: the runlist
+controls need **kernel privilege**, so they live in a trusted host component
+(`runsc gpu-scheduler`, or a driver hook), never in the Sentry — consistent
+with the governing constraint and with Ghost's own architecture. What each tier
+buys, corrected:
+
+- **Memory-quota isolation** — works everywhere, every workload, no special
+  driver. The one guarantee that never depends on the die.
+- **Runlist time-slicer** (`SET_TIMESLICE`/`DISABLE_CHANNELS` + `RESTART_RUNLIST`)
+  — weighted, work-conserving division of *any* workload including doorbell
+  cuBLAS, on both GA100 and GB205; needs the ghost-instrumented driver and
+  kernel privilege. This is the result that changed the picture.
+- **Compute gate** (Sentry, stock driver) — binds kernel-launch/command-buffer
+  workloads by weight but not doorbell; the fallback where the ghost driver
+  cannot be loaded.
+- **Green context / TPC partition** — a hard spatial ceiling (cooperative for
+  green context; adversarially sound but ~40% cost for the imposed partition).
+
+The methodological lesson stands sharper than any single result: **a
+throughput-based negative is only as trustworthy as the primitive it drove.**
+The temporal levers were declared inert three times — on the A100 and on two
+consumer/pro dies — each time from a real measurement, each time because the
+probe was one RPC short of the thing it meant to test. What settled it was
+driving the *complete* primitive and reading the throughput, not the status
+code. The remaining open item is honest and narrow: the *spatial* TPC partition
+on GB205/GA102/GB202, whose old negative was a `0x57` mis-read from the wrong
+call site, still needs a clean re-probe from the deferred site.

@@ -13,11 +13,17 @@ containers, enforced in the gVisor Sentry (never inside the container). **Memory
 quota works everywhere.** *Compute* isolation is the hard part. Work submission
 on Volta+ never enters the kernel (mapped pushbuffer + doorbell), so the Sentry
 cannot meter it; the only imposable levers are RM controls, and whether they do
-anything is a property of the GPU die and its GSP firmware. On the **A100
-(GA100)** the spatial control works and every temporal one is inert. On the
-**consumer RTX 5070 (GB205)** the temporal ones are inert too, and its spatial
-negative turned out to be a mis-read status code (below) — so consumer/pro dies
-are an open question again.
+anything is a property of the GPU die and its GSP firmware. **UPDATE
+2026-08-19 — the "temporal is inert" framing throughout this file is obsolete;
+see `../NVIDIA-COMPUTE-ISOLATION.md` CORRECTIONS 3–5.** The temporal runlist
+lever *works*, on both the **A100 (GA100)** and the **consumer RTX 5070
+(GB205)**, once `SET_TIMESLICE`/`DISABLE_CHANNELS` is committed with
+`RESTART_RUNLIST`: weighted (3.00:1), work-conserving, N-tenant, evict/restore.
+Every earlier "inert" here was that missing commit, and the 5070 spatial
+negative was a `0x57` mis-read from the wrong call site. What remains genuinely
+open is only the *spatial* TPC partition on the consumer/pro dies, re-probed
+from the deferred call site. Read the procedure below with that correction in
+mind — it is still the right playbook, and it is what produced the reversal.
 
 ## Update, 2026-08-18: we drove the WRONG temporal primitive (corrected against the Ghost paper)
 
