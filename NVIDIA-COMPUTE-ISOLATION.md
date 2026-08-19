@@ -266,55 +266,72 @@ divide (measured 1:1). Two findings:
   idle, and the timeslice flapped. The server now sends a full-period window
   whenever the enforcer is set, so the runlist alone divides.
 
-**One plumbing gap remains in the *automatic* path, and it is
-platform-independent -- a `runsc` pid-announcement bug, not a platform artifact.**
-Only one of the two co-scheduled sandboxes is auto-enforced: the scheduler sets
-timeslices on one pid (which flaps 3000<->1000 as its peer comes and goes in the
-client set), while the other pod -- active in the driver's channel-state read --
-is never touched and keeps GSP's default timeslice (~2000us), so the division
-lands at 3000:default ~= 1.5:1 instead of 3:1.
+### CORRECTION 4 (2026-08-19): the automatic path now delivers 3.10:1 — it took three fixes, not one
 
-The mechanism is not at fault: setting the two pods' timeslices 3000:1000 *by
-hand* through the control gives **exactly 3.00:1** (and 6000:1000 -> 6.40:1), on
-the same pods, both platforms. What is wrong is that one sandbox's channel-owner
-pid does not reach the scheduler's enforce list.
+The automatic path was stuck at **1.47:1** for a 3:1 request while a hand-set
+3000:1000 gave 3.10:1. This was first read as a single `runsc` pid-announcement
+bug. It was three distinct bugs, each hiding the next; all are now fixed and the
+**automatic** path measures **3.10:1** (victim 1067, attacker 344 matmul/s),
+aggregate **1410** ≈ the 1412 the two share unenforced — i.e. work-conserving at
+near-zero cost, matching the hand-set mechanism. Verified end to end on `gpu0-a`
+(GA100, systrap, cap-10 HAMi sharing, two cuBLAS pods, no manual intervention).
 
-**Both platforms were tried and behave identically.** The node ran
-`--platform=systrap` (NVIDIA does not need KVM the way AMD's KFD does -- cuBLAS,
-nvproxy and the scheduler all work on systrap), where a sandbox is a Sentry plus
-a tree of stub processes; and `--platform=kvm`, where a sandbox is a single
-process and the driver records exactly one clean pid per sandbox. **KVM's single-
-process model did not fix the division** -- still 1.47:1 -- which rules out
-systrap's multi-process model as the cause and points squarely at how `runsc`
-announces a sandbox's pid to the scheduler under Kubernetes (the GPU container's
-pid via `StartSubcontainer`). Aligning the announced pid with the driver's
-channel-owner pid is the fix; the mechanism and the monitoring are proven.
+1. **The pid could miss the enforce set — and could be lost after arriving.** A
+   sandbox's channel-owner pid reaches the scheduler only through
+   `announceToGPUScheduler` (`runsc/sandbox/sandbox.go`), a one-shot side
+   connection separate from the persistent weight connection, with no retry.
+   Worse, the scheduler's `deregisterLocked` deleted `s.pids`/`s.devNames` when
+   the persistent connection dropped — but those come from the one-shot
+   announcement that never repeats, so any transient drop lost the pid for good.
+   Fixes: retry the announcement (5 attempts), and **do not** delete the
+   announced pid/devices on disconnect (they are stable sandbox properties; a
+   stale entry is harmless since the enforce loop reads `s.pids` only for
+   connected sandboxes).
 
-The specific weak point is in `runsc/sandbox/sandbox.go`: a sandbox's pid reaches
-the scheduler only through `announceToGPUScheduler`, a **one-shot, best-effort**
-side connection (dial with a 2 s timeout, send `Hello{PID, AnnounceOnly}`,
-close), separate from the persistent connection that carries the weight and is
-never retried on failure. The weight (persistent connection) and the pid
-(one-shot announcement) can therefore diverge: a sandbox whose announcement is
-lost is known by weight -- so it still competes and affects the division -- but
-its channel-owner pid never enters the enforce set, so the runlist commands for
-it are never issued. Folding the pid into the persistent connection (or retrying
-the announcement) is the fix.
+2. **The timeslice was coupled to the noisy idle signal.** Even with both pids
+   enforced the division stayed ~1.47:1, because `enforcePlan` anchored the
+   timeslice scale on the smallest weight *among currently-active* clients and
+   pinned idle ones to the floor. A saturating cuBLAS tenant drains its GPFIFO
+   between kernels often enough to sample momentarily idle, so the larger
+   tenant's slice flapped 3000<->1000 µs continuously and time-averaged toward
+   the floor. Fix: compute the timeslice from the **fixed configured weights of
+   every registered sandbox**, independent of the idle signal. Work-conservation
+   needs no rescale — GSP already skips an idle (empty) TSG and hands its slice
+   to whoever has work.
+
+3. **Enforcement was edge-triggered and fired too early.** `enforcePlan` emits a
+   command only on change, so the plan was written **once**, ~3 s into the pod's
+   life, while the tenant was still importing torch and had **no cuBLAS TSG
+   yet** (it read idle, no channels). The driver set the timeslice on nothing;
+   the real compute TSG appeared a moment later at the driver default and was
+   never re-bound — which is exactly how a correctly-computed 3000:1000 plan
+   measured 1:1 (706/706, the unenforced baseline). Fix: **re-assert the full
+   plan every ~2 s** (level-triggered), re-binding any TSG the workload created
+   since the last write. Genuine changes are still logged; the periodic
+   re-issue is silent.
+
+**Platform-independent.** Both `--platform=systrap` (a Sentry plus stub-process
+tree) and `--platform=kvm` (one process per sandbox) were tried and behaved
+identically at each stage, ruling out the process model as a cause. NVIDIA does
+not need KVM the way AMD's KFD does — cuBLAS, nvproxy and the scheduler all work
+on systrap.
 
 ### Wired into `runsc gpu-scheduler`, end to end
 
 `pkg/gpusched` now has an `Enforcer` that drives this control, and
 `runsc gpu-scheduler --runlist-control=/proc/driver/nvidia/gpusched` turns it on.
-The scheduler holds each active sandbox to a timeslice proportional to its
-weight and detaches one idle past the threshold, committed with the runlist
-restart. Verified with the real binary: two sandboxes weighted 3:1, two
-saturating cuBLAS burns that otherwise share 1:1, divided **76/24 (3.10:1)** —
-the scheduler set `SET_TIMESLICE` 3000/1000 µs and GSP honoured it. This is the
-first time on this branch that a *doorbell* compute workload has been divided by
-weight at all; the Sentry compute gate leaves it at 1:1. Enforcement is
-privileged, so it runs in the host-side scheduler, never a sandbox. It requires
-the ghost-instrumented driver; without `--runlist-control`, only the gate
-enforces, exactly as before.
+The scheduler holds every registered sandbox to a timeslice proportional to its
+configured weight — never detaching, never rescaling on the idle signal —
+re-asserting the full plan every ~2 s so a late-created cuBLAS TSG is bound, each
+write committed with the runlist restart; GSP work-conserves by skipping empty
+TSGs on its own. Verified with the real binary, end to end and fully automatic:
+two sandboxes weighted 3:1, two saturating cuBLAS burns that otherwise share
+1:1, divided **1067/344 (3.10:1)**, aggregate 1410 ≈ the 1412 they share
+unenforced. This is the first time on this branch that a *doorbell* compute
+workload has been divided by weight at all; the Sentry compute gate leaves it at
+1:1. Enforcement is privileged, so it runs in the host-side scheduler, never a
+sandbox. It requires the ghost-instrumented driver; without `--runlist-control`,
+only the gate enforces, exactly as before.
 
 The prior CORRECTION 2, the "not achievable" lines in CLAUDE.md/GHOST-PLAN, and
 the Reproducing-Ghost section above are superseded by this. The driver control

@@ -158,21 +158,33 @@ type enforceCmd struct {
 // states and the state applied on the previous tick, and returns the commands
 // plus the new applied state. It is pure so it can be tested without a GPU.
 //
-// Every sandbox is held to a runlist timeslice: active ones in proportion to
-// their weight, idle ones to the minimum. It does *not* detach idle sandboxes.
-// It does not need to -- the GSP already skips an idle (empty) TSG and hands its
-// slice to whoever has work, so leaving an idle sandbox attached with a small
-// timeslice is fully work-conserving. Detaching would be worse than useless: a
-// detached sandbox stops advancing its GP_PUT, so the activity signal would
-// read it idle forever and never re-attach it. Commands are emitted only where
-// the timeslice differs from last tick, so a steady state is silent.
+// Every sandbox is held to a runlist timeslice in proportion to its weight,
+// computed from the configured weights alone. It does *not* detach idle
+// sandboxes, and it does *not* rescale timeslices when a sandbox reads idle.
+// It does not need to -- the GSP already skips an idle (empty) TSG and hands
+// its slice to whoever has work, so leaving every sandbox attached with a
+// stable proportional timeslice is fully work-conserving. Detaching would be
+// worse than useless: a detached sandbox stops advancing its GP_PUT, so the
+// activity signal would read it idle forever and never re-attach it. Commands
+// are emitted only where the timeslice differs from last tick, so a steady
+// state is silent.
+//
+// The timeslice is deliberately independent of the idle signal. An earlier
+// version anchored the scale on the smallest weight *among active sandboxes*
+// and pinned idle ones to the floor, so a neighbour reading idle for a single
+// sample raised the anchor and collapsed a larger tenant's slice. A busy
+// cuBLAS tenant drains its GPFIFO between kernels often enough to sample as
+// momentarily idle, so this flapped continuously: a 3:1 request measured
+// 1.47:1 as the larger tenant's slice oscillated between its full share and
+// the floor, even though the mechanism holds a hand-set 3:1 at 3.10:1. Scaling
+// on the fixed configured weights of every registered sandbox removes the
+// coupling entirely; work-conservation is left to the GSP, where it belongs.
 func enforcePlan(clients []EnforceClient, prev map[int]pidState) ([]enforceCmd, map[int]pidState) {
-	// The smallest weight among active sandboxes anchors the timeslice scale.
+	// The smallest configured weight -- over every registered sandbox, active
+	// or idle -- anchors the timeslice scale, so a sandbox's slice is a stable
+	// function of the weights and never lurches on a neighbour's activity blip.
 	var minW uint64
 	for _, c := range clients {
-		if c.Idle {
-			continue
-		}
 		w := c.Weight
 		if w == 0 {
 			w = 1
@@ -182,7 +194,7 @@ func enforcePlan(clients []EnforceClient, prev map[int]pidState) ([]enforceCmd, 
 		}
 	}
 	if minW == 0 {
-		minW = 1 // everyone idle; scale is irrelevant
+		minW = 1
 	}
 
 	next := make(map[int]pidState, len(clients))
@@ -191,21 +203,16 @@ func enforcePlan(clients []EnforceClient, prev map[int]pidState) ([]enforceCmd, 
 	sort.Slice(clients, func(i, j int) bool { return clients[i].PID < clients[j].PID })
 
 	for _, c := range clients {
-		var us uint64
-		if c.Idle {
+		w := c.Weight
+		if w == 0 {
+			w = 1
+		}
+		us := uint64(minTimesliceUs) * w / minW
+		if us < minTimesliceUs {
 			us = minTimesliceUs
-		} else {
-			w := c.Weight
-			if w == 0 {
-				w = 1
-			}
-			us = uint64(minTimesliceUs) * w / minW
-			if us < minTimesliceUs {
-				us = minTimesliceUs
-			}
-			if us > maxTimesliceUs {
-				us = maxTimesliceUs
-			}
+		}
+		if us > maxTimesliceUs {
+			us = maxTimesliceUs
 		}
 		if prev[c.PID].timesliceUs != us {
 			cmds = append(cmds, enforceCmd{op: "ts", pid: c.PID, us: us})
@@ -224,18 +231,50 @@ type pidState struct {
 // runlistEnforcer applies enforcePlan through an Enforcer, remembering what it
 // applied so it only issues commands on change.
 type runlistEnforcer struct {
-	e    Enforcer
-	prev map[int]pidState
+	e     Enforcer
+	prev  map[int]pidState
+	ticks int
 }
 
 func newRunlistEnforcer(e Enforcer) *runlistEnforcer {
 	return &runlistEnforcer{e: e, prev: map[int]pidState{}}
 }
 
+// reassertEveryTicks is how often the enforcer re-issues every timeslice even
+// when nothing changed. A timeslice is set on the channel groups a process has
+// *at the time it is written*, but a CUDA workload creates its real compute
+// TSG lazily -- a container that has only just started is still importing its
+// runtime and has no GPFIFO yet, so an edge-triggered write lands on nothing
+// (or on a transient warmup context) and the cuBLAS TSG that appears a moment
+// later runs at the driver default. That is exactly how a correctly-computed
+// 3:1 plan measured 1:1: the plan was written once, three seconds in, while
+// the tenant read idle with no channels, and never re-asserted. Re-issuing the
+// full plan on a slow cadence catches those late TSGs without restarting the
+// runlist so often that the restarts themselves cost throughput. At a 100ms
+// period this is roughly every two seconds.
+const reassertEveryTicks = 20
+
 // apply issues the commands for the given clients and records the new state.
 func (r *runlistEnforcer) apply(clients []EnforceClient) {
-	cmds, next := enforcePlan(clients, r.prev)
-	for _, c := range cmds {
+	r.ticks++
+
+	// Genuine changes since the last tick -- a client joining or leaving, or a
+	// weight change -- are what is logged, so a steady division is quiet.
+	changed, next := enforcePlan(clients, r.prev)
+	if len(changed) > 0 {
+		log.Infof("gpusched: runlist enforce: %d clients %+v -> %d commands %+v", len(clients), clients, len(changed), changed)
+	}
+
+	// What to actually write to the driver: the genuine changes, or -- on the
+	// slow re-assert cadence -- every timeslice, computed against an empty
+	// prior so the plan re-emits all of them. That re-binds any TSG the
+	// workload created since the last write, which an edge-triggered plan would
+	// otherwise leave at the driver default. The re-issue is not logged.
+	toWrite := changed
+	if r.ticks%reassertEveryTicks == 0 {
+		toWrite, _ = enforcePlan(clients, nil)
+	}
+	for _, c := range toWrite {
 		var err error
 		switch c.op {
 		case "detach":

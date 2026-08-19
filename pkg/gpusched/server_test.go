@@ -464,3 +464,51 @@ func TestServerToleratesAMissedReport(t *testing.T) {
 		t.Errorf("after one missed report b was cut to %.0f%%, want about half", got*100)
 	}
 }
+
+// TestServerRetainsPIDAcrossReconnect verifies that a sandbox's host pid,
+// announced once out of band by runsc, is not forgotten when the sandbox's
+// persistent connection drops and reconnects. The pid is what the runlist
+// enforcer keys on, and the announcement is never re-sent, so losing it on a
+// transient drop would leave the sandbox scheduled by weight but never enforced
+// -- the exact gap that held an automatic two-tenant division to ~1.5:1
+// instead of the mechanism's proven ~3:1.
+func TestServerRetainsPIDAcrossReconnect(t *testing.T) {
+	s, connect := testServer(t)
+
+	// runsc announces the sandbox's host pid out of band.
+	connect(t, Hello{ID: "sb", PID: 4242, AnnounceOnly: true})
+	for i := 0; i < 200; i++ {
+		if s.pidFor("sb") == 4242 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := s.pidFor("sb"); got != 4242 {
+		t.Fatalf("after announcement pid = %d, want 4242", got)
+	}
+
+	// The Sentry's persistent connection (no pid; it cannot see its host pid)
+	// registers, then drops.
+	c := connect(t, Hello{ID: "sb", Weight: 100})
+	waitForClients(t, s, 1)
+	c.Close()
+	for i := 0; i < 200; i++ {
+		if s.Len() == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The announced pid must survive the disconnect, so a reconnecting sandbox
+	// is still enforceable.
+	if got := s.pidFor("sb"); got != 4242 {
+		t.Fatalf("pid lost on disconnect: got %d, want 4242", got)
+	}
+
+	// It reconnects and is enforceable again with the retained pid.
+	connect(t, Hello{ID: "sb", Weight: 100})
+	waitForClients(t, s, 1)
+	if got := s.pidFor("sb"); got != 4242 {
+		t.Fatalf("after reconnect pid = %d, want 4242", got)
+	}
+}

@@ -2673,19 +2673,41 @@ func (s *Sandbox) GetNetworkConfig() (*boot.CreateLinksAndRoutesArgs, error) {
 // device, which falls back to competing with every sandbox whose device is
 // unknown. Both are smaller shares rather than larger ones, so this is logged
 // rather than being allowed to stop the sandbox from running.
+//
+// It carries the one fact the sandbox can never supply itself -- the host pid
+// the GPU driver records its channels under -- and it is sent on a connection
+// of its own rather than the one the Sentry holds, because the pid is known
+// only here in runsc. That makes it the single point at which the pid can be
+// lost, and losing it leaves the sandbox scheduled by weight but never held to
+// its window on the runlist, so the send is retried a few times against a
+// scheduler that is briefly not yet accepting rather than given up on the
+// first refused dial.
 func announceToGPUScheduler(socket, id string, pid int, devices []string) {
-	conn, err := net.DialTimeout("unix", socket, 2*time.Second)
-	if err != nil {
-		log.Warningf("Not reporting sandbox %q to the GPU scheduler; it will be scheduled without measuring what it uses and without knowing which GPU it is on: %v", id, err)
-		return
+	const attempts = 5
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			// A short, fixed backoff: the scheduler is a local service that is
+			// either up or coming up, so a handful of tries over a fraction of
+			// a second covers a startup race without delaying the sandbox.
+			time.Sleep(100 * time.Millisecond)
+		}
+		conn, err := net.DialTimeout("unix", socket, 2*time.Second)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		err = gpusched.NewConn(conn).SendHello(gpusched.Hello{
+			ID:           id,
+			PID:          pid,
+			Devices:      devices,
+			AnnounceOnly: true,
+		})
+		conn.Close()
+		if err == nil {
+			return
+		}
+		lastErr = err
 	}
-	defer conn.Close()
-	if err := gpusched.NewConn(conn).SendHello(gpusched.Hello{
-		ID:           id,
-		PID:          pid,
-		Devices:      devices,
-		AnnounceOnly: true,
-	}); err != nil {
-		log.Warningf("Reporting sandbox %q to the GPU scheduler: %v", id, err)
-	}
+	log.Warningf("Not reporting sandbox %q to the GPU scheduler after %d attempts; it will be scheduled without measuring what it uses and without knowing which GPU it is on: %v", id, attempts, lastErr)
 }

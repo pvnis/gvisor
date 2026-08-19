@@ -627,14 +627,22 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
    cannot *enforce* them against a doorbell-submission workload (cuBLAS) — see
    `SECURITY-FINDINGS.md`, where three mechanisms (command-buffer revocation,
    TSG preempt/unschedule, doorbell/USERMODE revocation) are each measured to
-   fail. A `pkg/gpusched/server.go` change that uses the sampler for *activity
-   detection* (not the divergent debt path) is in the tree and fixes the
-   scheduling half. **Reproduced on GA100 through the full Kubernetes stack
-   (2026-08-18, `gpu0-a`)**: two vCluster tenants at weights 75/25 were granted
-   `75ms`/`25ms` windows and still measured 706/706 matmul/s under cuBLAS,
-   while a plain kernel-launch loop under the identical weights measured
-   81,099/22,270 launches/s (3.64:1). The workload, not the GPU family alone,
-   decides whether the gate binds. See `A100-CLUSTER.md`.
+   fail. The gate's *scheduling* half — knowing which sandbox is active — is
+   fixed by the channel-state signal (GP_PUT/GP_GET) the ghost driver exposes,
+   not the sampler. **The gate cannot bind cuBLAS, but the runlist enforcer
+   can, and the automatic path now works end to end (2026-08-19, `gpu0-a`,
+   GA100).** `runsc gpu-scheduler --runlist-control` drives per-TSG timeslices
+   over the ghost hook; two cuBLAS pods weighted 3:1 that share 1:1 under the
+   gate divide **1067/344 = 3.10:1**, aggregate 1410 ≈ 1412 unenforced
+   (work-conserving), fully automatic. Getting there took three fixes past the
+   mechanism itself — a lost/never-retried pid announcement, a timeslice coupled
+   to the noisy idle signal (flapped 3000↔1000 µs), and edge-triggered writes
+   that fired before the cuBLAS TSG existed — all in `pkg/gpusched` +
+   `runsc/sandbox/sandbox.go`; see `NVIDIA-COMPUTE-ISOLATION.md` "CORRECTION 4".
+   Earlier the same gate measured 706/706 matmul/s under cuBLAS while a plain
+   kernel-launch loop under identical weights measured 81,099/22,270 (3.64:1):
+   the workload, not the GPU family alone, decides whether the *gate* binds —
+   the runlist enforcer binds both. See `A100-CLUSTER.md`.
 3. **nvproxy must handle multiple NVIDIA GPU architectures, with runtime family
    detection.** One driver ABI spans Turing→Blackwell, and behaviour differs by
    generation — e.g. cuBLAS on a *Blackwell* GPU allocates a *Hopper* USERMODE

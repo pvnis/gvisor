@@ -86,6 +86,11 @@ type Server struct {
 	// the enforcer when the control supports it, and is the trusted, doorbell-
 	// aware idle signal the sampler cannot be.
 	activity ActivityPoller
+
+	// warnedNoPID remembers which connected sandboxes have already been warned
+	// about for having no known host pid, so the warning is logged once per
+	// sandbox rather than every tick. Cleared when a pid becomes known.
+	warnedNoPID map[ID]bool
 }
 
 // SetSampler makes the scheduler judge sandboxes by what they took from the GPU
@@ -246,8 +251,16 @@ func (s *Server) handle(nc net.Conn) {
 		if s.conns[sc.id] == sc {
 			delete(s.conns, sc.id)
 			s.deregisterLocked(sc)
-			delete(s.pids, sc.id)
-			delete(s.devNames, sc.id)
+			// s.pids and s.devNames are deliberately NOT deleted here. They come
+			// from a separate, one-shot announcement (announceToGPUScheduler in
+			// runsc) that is never re-sent, so deleting them when this connection
+			// drops would lose a sandbox's pid for good if it ever reconnected --
+			// which left it known by weight but never enforced on the runlist,
+			// the one pid the driver records its channels under missing from the
+			// enforce set. They are stable properties of the sandbox; a stale
+			// entry (a pid with no live connection) is harmless, since the
+			// enforcement loop reads s.pids only for sandboxes in s.conns, and a
+			// restarted sandbox re-announces and overwrites it.
 		}
 		s.mu.Unlock()
 	}()
@@ -506,8 +519,16 @@ func (s *Server) Tick() {
 				pid = p
 			}
 			if pid == 0 {
+				if s.warnedNoPID[id] != true {
+					log.Warningf("gpusched: sandbox %q connected with weight %d but no host pid known (conn pid %d, announced %d); it cannot be enforced on the runlist until runsc announces its pid", id, sc.weight, sc.pid, s.pids[id])
+					if s.warnedNoPID == nil {
+						s.warnedNoPID = map[ID]bool{}
+					}
+					s.warnedNoPID[id] = true
+				}
 				continue
 			}
+			delete(s.warnedNoPID, id)
 			enforce = append(enforce, EnforceClient{PID: pid, Weight: sc.weight, Idle: idle[id]})
 		}
 	}
@@ -567,4 +588,12 @@ func (s *Server) Devices() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.scheds)
+}
+
+// pidFor returns the host pid recorded for a sandbox, or 0 if none is known.
+// It exists for tests; the pid is otherwise read only under s.mu on the tick.
+func (s *Server) pidFor(id ID) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pids[id]
 }

@@ -44,28 +44,36 @@ func TestEnforceProportionalTimeslice(t *testing.T) {
 	}
 }
 
-func TestEnforceIdleGetsMinTimeslice(t *testing.T) {
-	// Two active, weights 1 and 1: both minTimesliceUs.
-	_, st := enforcePlan([]EnforceClient{
-		{PID: 10, Weight: 1}, {PID: 20, Weight: 1},
-	}, nil)
-	// 20 goes idle -> it is NOT detached; it stays attached with the minimum
-	// timeslice (the GSP hands its empty slice to 10 on its own). Since 20 was
-	// already at minTimesliceUs, nothing changes -> silent.
+func TestEnforceTimesliceIndependentOfIdle(t *testing.T) {
+	// Weights 3 and 1: the larger gets 3x, the smaller the floor. This is the
+	// steady division that must be held.
 	cmds, st := enforcePlan([]EnforceClient{
-		{PID: 10, Weight: 1}, {PID: 20, Weight: 1, Idle: true},
+		{PID: 10, Weight: 3}, {PID: 20, Weight: 1},
+	}, nil)
+	want := []enforceCmd{
+		{op: "ts", pid: 10, us: 3 * minTimesliceUs},
+		{op: "ts", pid: 20, us: minTimesliceUs},
+	}
+	if !reflect.DeepEqual(cmds, want) {
+		t.Fatalf("initial plan got %+v, want %+v", cmds, want)
+	}
+	// 20 reads idle for a sample. Because the timeslice is a function of the
+	// configured weights and not of the idle signal, NOTHING changes -- the
+	// larger tenant keeps its 3x slice rather than collapsing to the floor,
+	// which is the whole point: a busy tenant's neighbour blipping idle must
+	// not rescale it. The GSP hands 20's empty slice to 10 on its own.
+	cmds, st = enforcePlan([]EnforceClient{
+		{PID: 10, Weight: 3}, {PID: 20, Weight: 1, Idle: true},
 	}, st)
 	if len(cmds) != 0 {
-		t.Fatalf("idle with equal weight should be silent, got %+v", cmds)
+		t.Fatalf("a neighbour reading idle must not change any timeslice, got %+v", cmds)
 	}
-	// 20 becomes active again with weight 3 vs 10's weight 1: the ratio among
-	// the two active sandboxes is 3:1, none detached.
+	// And 20 coming back active is likewise silent: its slice never moved.
 	cmds, _ = enforcePlan([]EnforceClient{
-		{PID: 10, Weight: 1}, {PID: 20, Weight: 3},
+		{PID: 10, Weight: 3}, {PID: 20, Weight: 1},
 	}, st)
-	want := []enforceCmd{{op: "ts", pid: 20, us: 3 * minTimesliceUs}}
-	if !reflect.DeepEqual(cmds, want) {
-		t.Fatalf("got %+v, want %+v (20 -> 3x, no detach)", cmds, want)
+	if len(cmds) != 0 {
+		t.Fatalf("idle->active with unchanged weights must be silent, got %+v", cmds)
 	}
 }
 
@@ -127,6 +135,28 @@ func TestRunlistEnforcerAppliesAndRemembers(t *testing.T) {
 	r.apply([]EnforceClient{{PID: 10, Weight: 3}, {PID: 20, Weight: 1}})
 	if len(f.calls) != 0 {
 		t.Fatalf("steady apply should be silent: %v", f.calls)
+	}
+}
+
+func TestRunlistEnforcerReassertsPeriodically(t *testing.T) {
+	f := &fakeEnforcer{}
+	r := newRunlistEnforcer(f)
+	// First apply issues the two timeslices.
+	r.apply([]EnforceClient{{PID: 10, Weight: 3}, {PID: 20, Weight: 1}})
+	// Steady ticks until just before the re-assert boundary are silent.
+	for i := 0; i < reassertEveryTicks-2; i++ {
+		f.calls = nil
+		r.apply([]EnforceClient{{PID: 10, Weight: 3}, {PID: 20, Weight: 1}})
+		if len(f.calls) != 0 {
+			t.Fatalf("tick %d before re-assert should be silent: %v", i, f.calls)
+		}
+	}
+	// The re-assert tick re-issues every timeslice even though nothing changed,
+	// so a TSG the workload created since the last write is re-bound.
+	f.calls = nil
+	r.apply([]EnforceClient{{PID: 10, Weight: 3}, {PID: 20, Weight: 1}})
+	if len(f.calls) != 2 {
+		t.Fatalf("re-assert tick should re-issue both timeslices, got %v", f.calls)
 	}
 }
 
