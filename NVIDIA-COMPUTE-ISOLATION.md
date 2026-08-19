@@ -290,14 +290,34 @@ concurrent cuBLAS tenants under gVisor (pids keyed on the Sentry, where
   yielded tenant as busy. The read remains valid for what it is used for:
   telling a tenant that has *never* submitted from one that is competing.
 
-**Bottom line: cuBLAS is splittable by weight on consumer Blackwell, not only on
-the datacenter die.** The runlist scheduler — weighted timeslice, idle-yield,
-N-tenant, evict/restore — is a property of the GSP runlist firmware, present on
-both GA100 and GB205, and the same `runsc gpu-scheduler` binary drives both.
-This means the compute gate is *not* the only consumer fallback after all;
-where the ghost-instrumented driver can be loaded, consumer cards get real
-temporal division. (Spatial `SET_TPC_PARTITION_TABLE` on GB205 is being
-re-probed separately — re-insmod per width — and will be recorded when it lands.)
+**And the SPATIAL partition works on GB205 too, from the deferred site.**
+`SET_TPC_PARTITION_TABLE` on the **primary compute ctxshare** (`0x5c000014`,
+`SETMODE=0x0`), `GHOST_TOTAL_TPC=24`, `GhostTpcCount=N;GhostDisjoint=1`,
+re-insmod per width, single cuBLAS tenant:
+
+- 13/24 TPCs → "granted 13 TPCs 0..12", `SETTBL=0x0` → **272.0 matmul/s**
+- 18/24 TPCs → "granted 18 TPCs 0..17", `SETTBL=0x0` → **372.1 matmul/s**
+- 24/24 (full) → ~458 (= solo baseline)
+
+~20 matmul/s per TPC, roughly linear (20.9 / 20.7 / 19.1 per TPC — a slight
+per-TPC clock boost as the slice shrinks, AMD-like). So the AMD-CU-mask analog
+is imposable on consumer Blackwell; the old `0x57` was purely
+`OBJECT_NOT_FOUND` from the constructor call site, never `NOT_SUPPORTED`.
+**Caveat for a real broker:** the control succeeds on the primary compute
+ctxshare; the secondary torch contexts (`caf000xx`) return `SETMODE=0x56` /
+`SETTBL=0x57`, but those are not the compute context and the matmul throughput
+confirms the primary is actually confined — a per-sandbox broker keys the
+partition to the compute ctxshare, not to every ctxshare a process creates.
+
+**Bottom line: cuBLAS is splittable on consumer Blackwell by BOTH mechanisms,
+not only on the datacenter die** — temporally (weighted timeslice + idle-yield +
+N-tenant + evict/restore, work-conserving) and spatially (an imposed TPC
+partition, a hard proportional dial). Both are GSP/hardware properties present
+on GA100 and GB205 alike, reachable only at kernel privilege, and the same
+`runsc gpu-scheduler` binary drives the temporal path on both. The compute gate
+is *not* the only consumer fallback after all; where the ghost-instrumented
+driver can be loaded, consumer cards get real compute division. The entire
+"consumer Blackwell can't do compute isolation" conclusion is reversed.
 
 ### Through the full Kubernetes + vCluster stack (adversarial)
 
@@ -448,7 +468,7 @@ tree; the node is restored to clean 610 + the k8s stack.
 | **TSG timeslice + `RESTART_RUNLIST`** (`NVA06C_CTRL_CMD_SET_TIMESLICE` committed via the active runlist) | driver (kernel priv) | GSP runlist | **works — 3.00:1** (ts 3000/1000, conserved), idle-yield + N-tenant + evict/restore all positive (CORRECTION 5). Earlier "no division" was `SET_TIMESLICE` uncommitted | **works — 16:1 ts → 14:1**, work-conserving (CORRECTION 3). Earlier "no division" was the same missing restart |
 | **Channel-group disable + `RESTART_RUNLIST`** (`FIFO_DISABLE_CHANNELS` committed) | driver (kernel priv) | GSP runlist | **evicts a running tenant** and restores cleanly (CORRECTION 5). Bare `GPFIFO_SCHEDULE(disable)` acts only on idle — that was the wrong primitive | **evicts** 710→1551 for the survivor, restores (CORRECTION 3) |
 | **Interleave level** (`SET_INTERLEAVE_LEVEL`, LOW/MED/HIGH priority) | Sentry/driver | GSP runlist | **admin-gated** (`0x1b`) from the Sentry; efficacy untested | **inert** — SET HIGH vs LOW both `NV_OK` at kernel priv (no privilege wall), GET returns NOT_SUPPORTED, division 708.1/706.0 = 1:1 |
-| **Static TPC partition table** (`NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE`) | Sentry/driver | GPU hardware (WDU) | `0x57` at kernel priv **from the constructor call site — that is OBJECT_NOT_FOUND, so this is not a verdict**; re-probe needed | **`NV_OK` and enforced** — 13/27/40/54 TPCs → 502/960/1244/1550 matmul/s |
+| **Static TPC partition table** (`NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE`) | driver (kernel priv) | GPU hardware (WDU) | **`NV_OK` and enforced from the deferred site** — 13/18/24 TPCs → 272/372/458 matmul/s (CORRECTION 5). The old `0x57` was OBJECT_NOT_FOUND from the constructor, not a verdict | **`NV_OK` and enforced** — 13/27/40/54 TPCs → 502/960/1244/1550 matmul/s |
 | **CWD watermark** (`NV9067_CTRL_CMD_SET_CWD_WATERMARK`, per-subcontext CUDA Work Distributor throttle) | Sentry/driver | GPU hardware (WDU) | `0x57` from the same wrong call site; re-probe needed | **`NV_OK`, reads back MIN, no measurable effect** — 1547.5 matmul/s, unchanged. It throttles subcontexts *within* one context; separate tenants are separate contexts |
 | **Green context** (`cuGreenCtxCreate` + per-kernel TMD TPC mask) | userspace CUDA | GPU hardware (WDU) | **works and isolates**, but cooperative — the mask is in the TMD, written by userspace, below the ioctl boundary; a hostile tenant just doesn't use it | not re-tested |
 | **MIG** | firmware/HW | hardware partition | **absent** on GB205 | **present** — `1g.10gb`×7 … `7g.80gb`, currently disabled |
@@ -1061,6 +1081,9 @@ The temporal levers were declared inert three times — on the A100 and on two
 consumer/pro dies — each time from a real measurement, each time because the
 probe was one RPC short of the thing it meant to test. What settled it was
 driving the *complete* primitive and reading the throughput, not the status
-code. The remaining open item is honest and narrow: the *spatial* TPC partition
-on GB205/GA102/GB202, whose old negative was a `0x57` mis-read from the wrong
-call site, still needs a clean re-probe from the deferred site.
+code. GB205 has now been cleared on both axes — temporal (CORRECTION 5) and
+spatial (`SET_TPC_PARTITION_TABLE` 13/18/24 → 272/372/458 matmul/s from the
+deferred site). The only dies still carrying an unretested `0x57`-from-the-wrong-
+site negative are the **pro parts (GA102 A6000, GB202 6000 Pro)**; both deserve
+the same clean re-probe from the deferred call site before any negative about
+them is believed.
