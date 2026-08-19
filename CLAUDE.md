@@ -394,6 +394,171 @@ or 28, never 27. Native ROCr does the opposite with such a mask: it silently
 ignores it and runs on the whole device, which matters when comparing against
 native.
 
+### Time-slicing AMD from userspace: it works, with no driver patch
+
+Asked whether AMD could get the temporal division nvproxy now has, and whether
+it would need a patched driver as NVIDIA did. **No driver patch is needed.**
+Two userspace levers were measured: `UPDATE_QUEUE`'s `queue_percentage`, which
+is free but wedges the GPU as soon as a second process is present, and
+`DBG_TRAP SUSPEND_QUEUES`, which is stable, accurate, and — on a
+memory-bandwidth-bound workload — **costs 0.003%**. Measured on sens1;
+`~/amdtest/QSLICE-FINDINGS.md` is the full record, `./qslice.sh` reproduces it,
+`src/qslice_wrap.c` is the instrument.
+
+`AMDKFD_IOC_UPDATE_QUEUE` carries `queue_percentage`. Setting it to 0
+deactivates a queue and unmaps it from the runlist; 100 restores it. It is an
+ordinary ioctl on `/dev/kfd` that amdproxy already forwards and already
+allowlists in seccomp, and the Sentry already issues its own ioctls on that fd
+(`setQueueCUMask`, `destroyQueue`). So the asymmetry with NVIDIA is real: there,
+the only lever that bound cuBLAS was runlist manipulation at kernel privilege,
+and the idle signal needed a driver hook. Here the queue lifecycle stays in the
+kernel behind ioctls the Sentry interprets.
+
+**It divides accurately.** Throughput follows the duty cycle (100% -> 11971,
+50% -> 5165, 25% -> 2651 iters/s against 12046 solo). Two tenants at 75/25 with
+end-to-end phases measured **3.05:1 and 3.06:1** against 3:1 requested; 50/50
+gave Jain 1.0000. Toggle costs a median 194 us, p99 ~900 us, and efficiency is
+flat from a 10 ms to a 500 ms period. **`vecadd` stays `RESULT CORRECT` while
+being sliced at 25%** — CWSR saves and restores in-flight waves, so AMD can
+preempt mid-kernel, which the NVIDIA gate can never do.
+
+**But a sliced process wedges the GPU whenever another process is also using
+it.** 9 of 10 runs failed with one sliced tenant beside one *unsliced* peer;
+7 of 9 with two sliced tenants; **0 of 9** for the unsliced control, **0 of 6**
+for a single sliced tenant alone including a 60 s sustained run, and **0 of 3**
+with the interposer loaded but never suspending. So it is the suspension, it
+needs only one suspending process, and it needs no contention for the toggle.
+The signature is a **shader** page fault first (`Faulty UTCL2 client ID: SQC`,
+`PERMISSION_FAULTS: 0xb`), then `MES failed to respond to msg=REMOVE_QUEUE`,
+then a mode1 reset with VRAM lost. It is intermittent — 75/25 passed 3 of 3 —
+so a short demo can look healthy. A *longer* period made it worse, so this is
+not a toggle-rate problem.
+
+Leading hypothesis, **not confirmed**: deactivation releases the queue's VMID,
+a second process reuses it, and CWSR-restored waves then resolve per-VMID state
+(scratch, given the SQC client and ROCr's `SET_SCRATCH_BACKING_VA`) through the
+wrong aperture. Settling it needs `kfd_device_queue_manager.c`, and no kernel
+source for 7.0.0-28 is installed on sens1.
+
+**The second lever works: `KFD_IOC_DBG_TRAP_SUSPEND_QUEUES` / `RESUME_QUEUES`
+(op 6/7).** It removes the wedge entirely and divides just as accurately — but
+it costs 43%.
+
+| configuration | `pct` lever | `dbg` lever |
+| --- | --- | --- |
+| one sliced + one unsliced peer | 9/10 failed | **0/3 failed** |
+| two sliced tenants, 50/50 | 7/9 failed | **0/5 failed**, Jain 1.0000 |
+| weighted 75/25 | — | **3.04:1 / 3.05:1** against 3:1 asked |
+| `vecadd` while sliced | correct | correct |
+
+Zero driver faults across every `dbg` run. Suspend costs a median 455 us and
+resume 479 us (a queue's *first* suspend costs 12 ms, the initial CWSR path),
+so at a 100 ms period the slicing itself is ~1% — and aggregate throughput is
+**99.8% of the debug-enabled ceiling**.
+
+**The session's cost is workload-shaped, and `gpuburn` is the wrong
+instrument** — this corrects an earlier reading of a flat 43%. With the session
+open and *no suspensions at all*:
+
+| workload | session off | session on | cost |
+| --- | --- | --- | --- |
+| `gpuburn` (ALU-bound, register-heavy) | 11902-12004 iters/s | 6790-6904 | **-43%** |
+| `memburn` (bandwidth-bound) | 337.34 GB/s | 337.33 | **-0.003%** |
+
+Both measured *within one process*, toggling the session on and off partway
+through the run, so clocks and init cannot explain the step; gpuburn went
+12004 -> 6895 -> 12004, perfectly reversible.
+
+**It costs occupancy, not throughput.** During the debug phase the clock is
+*higher* (2721 vs ~2680 MHz) and the device still reads 100% busy, but power
+falls from ~191 W to ~141 W. Fewer waves are resident, so only kernels that
+need many of them to hide latency pay — and `gpuburn` is built to be exactly
+that, making it the most pessimistic instrument available. `memburn`
+(`src/memburn.hip`, added for this) saturates the bus with far fewer waves and
+does not notice.
+
+**That is the case that matters.** This branch already measured LLM decode as
+memory-bandwidth-bound — the reason disjoint CU masks failed to isolate three
+vLLM tenants. For bandwidth-bound work, slicing even *beats* uncontrolled
+sharing: two sliced `memburn` tenants aggregate 328.7/329.1/328.6 GB/s with
+Jain 1.0000, against 245.1/251.7/307.1 for two unsliced ones — more total
+bandwidth, and steady to 0.2% where contention swings 25%. Untested: LLM
+prefill, which is GEMM-shaped and compute-bound and may pay some occupancy
+cost; more than two tenants; and opening the session only while contended, so a
+lone tenant pays nothing.
+
+So this partitions exactly what CU masks could not, and it is work-conserving,
+which masks are not.
+
+**Measured on the real workload (2026-08-19): two vLLM tenants, memory sliced,
+compute shared.** Qwen2.5-0.5B-Instruct in each of two containers, 0.35 of the
+device each (both got a 222,384-token KV cache), compute sliced by the `dbg`
+lever. Native containers, **not gVisor** — the slicer is still an `LD_PRELOAD`
+interposer, so this measures the mechanism, not an enforcement.
+
+| configuration | aggregate | ratio |
+| --- | --- | --- |
+| one tenant alone | 1368 tok/s | — |
+| two tenants, unsliced | **1430 / 1475 tok/s** | 1.06-1.09:1, Jain 0.998 |
+| two tenants, sliced 50/50 | 971-1117 tok/s | 1.00:1 |
+| two tenants, sliced **75/25** | 1054 tok/s | **3.27 / 3.25 : 1** |
+
+**Weighted division works and is precise** — 3.25:1 for a 3:1 request,
+per-tenant rates repeatable to 0.3%, zero driver faults. **It costs ~28% of
+aggregate.** Unsliced the tenants already split 1.06:1, so what slicing adds is
+not fairness but a *deliberate, enforceable, unequal* split, which nothing else
+in the AMD path can do.
+
+**And that is the opposite sign to `memburn`, which gained 34%.** One vLLM
+tenant alone reaches 1368 tok/s while two together reach 1430-1475: neither
+saturates the GPU, so they interleave and fill each other's gaps, and slicing
+destroys that overlap. `memburn`'s tenants both saturated the bus and
+interfered, so serializing them helped. **The rule: time-slicing pays when
+tenants contend for a saturated resource and costs when they complement each
+other.** Shortening the period 100 ms -> 20 ms did not help, so it is not decode
+latency granularity. Worth re-measuring with a model large enough that one
+tenant saturates the device, where the trade should invert.
+
+One thing this run also showed, favouring the existing design: starting both
+vLLM tenants at once made the second fail with
+`Available KV cache memory: -0.26 GiB`, because `--gpu-memory-utilization` is a
+fraction of the *whole device* profiled at startup. They must be started
+sequentially. amdproxy's per-sandbox quota has no such race — each sandbox sees
+only its own ceiling. `~/amdtest/vllm-tenant.sh` + `vllm-bench.py` reproduce all
+of this.
+
+**The non-obvious blocker was `EC_QUEUE_NEW`.** `SUSPEND_QUEUES` reported every
+queue INVALID indefinitely, while `GET_QUEUE_SNAPSHOT` showed KFD holding
+exactly the ids being passed — with `exception_status = 0x40000000`, bit 30,
+which under `KFD_EC_MASK(ecode) = 1 << (ecode-1)` is code 31, `EC_QUEUE_NEW`.
+Passing that bit in the suspend call's own `exception_mask` does *not* clear
+it; the exception must first be consumed by calling `QUERY_DEBUG_EVENT` until
+it answers `EAGAIN`. Nothing in the ioctl's documentation says so, and without
+it nothing is ever suspended, silently.
+
+**`TRAP_ENABLE` works self-targeted** — the kernel skips its
+`EPERM ... not PTRACE_ATTACHED` check when the target is the caller, so no
+ptrace attach and no separate debugger process are needed. That is the same
+shape the Sentry is in, since it is itself the KFD process for the sandbox.
+`dbg_fd` wants a pollable fd; an `eventfd` works. `RUNTIME_ENABLE` must have
+succeeded first, which ROCr does during init well before creating a queue.
+
+gVisor models none of this today: `DBG_TRAP` is denied outright, with no struct
+and no op enum in `pkg/abi/amdgpu`.
+
+Three traps worth keeping:
+- **`strace` cannot symbolize `CREATE_QUEUE` on this host.** ABI 1.22 grew the
+  struct to 96 bytes (`0xc0604b02`); strace knows only the 88-byte
+  `0xc0584b02` and prints a raw number, so a symbolic trace shows
+  `DESTROY_QUEUE` with no matching create. Use `strace -X raw`.
+- **A hand-rolled KFD queue is impractical.** ROCr passes a **24.7 MB**
+  `ctx_save_restore_address` with `ctl_stack_size` 24576; KFD validates these
+  against ASIC-specific sizes and refused every smaller plausible area with
+  `EINVAL`. Interpose a real ROCm process instead.
+- **A queue at `queue_percentage 0` cannot be destroyed** — the driver answers
+  `-EIO`. Anything driving this must restore the queue to active before
+  allowing a destroy, holding a lock across it so nothing re-suspends first.
+
 ## AMD: what concurrent sharing actually delivers
 
 Measured on sens1's Navi 32 with `gpuburn` (ALU-bound) and the harnesses in
