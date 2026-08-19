@@ -322,15 +322,47 @@ times.
 Both within ~4%. The primitive is per-channel-group and composes additively, so
 "weight" as issued is a *per-process* quantity, not a per-tenant one.
 
-**Scope of the claim.** This tests the driver primitive driven one `ts` per pid,
-which is how `/proc/driver/nvidia/gpusched` exposes it. It does **not** show that
-`runsc gpu-scheduler --runlist-control` is exploitable: that path announces a
-sandbox's pids and could divide the tenant's weight across its TSGs before
-issuing them. It was not running on this box and is untested here. What is
-established is that the underlying lever gives no per-tenant guarantee on its
-own, so any scheduler above it must enumerate every TSG a sandbox owns and
-divide — and must keep doing so as the sandbox forks, or the guarantee lapses
-the moment a tenant starts a second process.
+**CONFIRMED ON THE INTEGRATED PATH (same day).** The above drove the driver
+primitive directly, so it was recorded as not yet showing `runsc gpu-scheduler
+--runlist-control` exploitable. It is. Re-run through the full production stack —
+`runsc gpu-scheduler --runlist-control=/proc/driver/nvidia/gpusched
+--measure-usage=false`, weights derived by the quota webhook from HAMi's
+`nvidia.com/gpucores`, cuBLAS SGEMM in gVisor sandboxes on k3s:
+
+| | burn-a (w=75, 1 proc) | burn-b (w=25) | aggregate | A:B |
+| --- | --- | --- | --- | --- |
+| honest | 126.8 | 40.7 | 167.5 | **3.12:1** (3:1 requested — correct) |
+| **burn-b packs 4 procs** | **70.5** | **90.9** (4 × 22.7) | 161.4 | **0.78:1** |
+
+**The tenant holding one third of the weight ended up with more throughput than
+its victim**, by running four processes in its own pod. Aggregate conserved
+within 3.6%.
+
+The scheduler does exactly what it was built to do and it is still not enough:
+the honest case lands on 3.12:1, and `enforcePlan` computes `minTimesliceUs * w /
+minW` **per sandbox pid** with no division by TSG count. dmesg shows the
+consequence directly — one sandbox pid receiving `SET_TIMESLICE = 1000 us` on
+**six distinct channel groups**, each getting the tenant's full slice. Under
+gVisor every sandboxed process shares the Sentry's host pid, so a tenant forking
+inside its own pod adds TSGs without adding pids, and the scheduler never sees
+the multiplication.
+
+The same per-TSG model predicts both stacks:
+
+| | A budget | B budget | predicted A:B | measured |
+| --- | --- | --- | --- | --- |
+| native, honest | 1 x 1000 | 1 x 3000 | 0.333 | 0.32 |
+| native, packed | 4 x 1000 | 1 x 3000 | 1.333 | 1.28 |
+| integrated, honest | 1 x 3000 | 1 x 1000 | 3.00 | 3.12 |
+| **integrated, packed** | 1 x 3000 | 4 x 1000 | **0.75** | **0.78** |
+
+**Fix direction.** Per-TSG timeslice must be `tenant_weight / n_TSGs(tenant)`,
+recomputed as TSGs appear and vanish. This is strictly harder than the gate's
+problem: the set is dynamic and attacker-controlled, so a one-shot announcement
+at sandbox start cannot hold it — the same shape as the "one-shot best-effort pid
+announcement, no retry" gap in NVIDIA-COMPUTE-ISOLATION.md. The driver already
+knows every TSG per pid (it iterates them to apply `ts`), so the count is
+available where the division would have to happen.
 
 **Fix direction.** Per-TSG timeslice must be `tenant_weight / n_TSGs(tenant)`,
 recomputed on TSG creation and teardown. Note this is strictly harder than the
