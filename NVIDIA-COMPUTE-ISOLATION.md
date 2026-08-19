@@ -290,6 +290,17 @@ announces a sandbox's pid to the scheduler under Kubernetes (the GPU container's
 pid via `StartSubcontainer`). Aligning the announced pid with the driver's
 channel-owner pid is the fix; the mechanism and the monitoring are proven.
 
+The specific weak point is in `runsc/sandbox/sandbox.go`: a sandbox's pid reaches
+the scheduler only through `announceToGPUScheduler`, a **one-shot, best-effort**
+side connection (dial with a 2 s timeout, send `Hello{PID, AnnounceOnly}`,
+close), separate from the persistent connection that carries the weight and is
+never retried on failure. The weight (persistent connection) and the pid
+(one-shot announcement) can therefore diverge: a sandbox whose announcement is
+lost is known by weight -- so it still competes and affects the division -- but
+its channel-owner pid never enters the enforce set, so the runlist commands for
+it are never issued. Folding the pid into the persistent connection (or retrying
+the announcement) is the fix.
+
 ### Wired into `runsc gpu-scheduler`, end to end
 
 `pkg/gpusched` now has an `Enforcer` that drives this control, and
