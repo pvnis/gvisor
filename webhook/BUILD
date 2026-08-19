@@ -24,7 +24,10 @@ pkg_tar(
     name = "files",
     srcs = [":webhook"],
     extension = "tgz",
-    strip_prefix = "/webhook",
+    # go_binary puts its output in a "<name>_" directory, so the binary is at
+    # webhook/webhook_/webhook and that whole prefix has to come off for the
+    # image's ENTRYPOINT of /webhook to resolve.
+    strip_prefix = "/webhook/webhook_",
 )
 
 go_binary(

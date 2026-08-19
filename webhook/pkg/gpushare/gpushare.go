@@ -34,7 +34,8 @@
 package gpushare
 
 import (
-	"fmt"
+	"strconv"
+	"strings"
 
 	"gvisor.dev/gvisor/pkg/log"
 	v1 "k8s.io/api/core/v1"
@@ -63,6 +64,21 @@ const (
 	// subject to the same ceiling as MemoryLimitAnnotation.
 	WeightAnnotation = "dev.gvisor.flag.nvproxy-gpu-weight"
 
+	// AMDMemoryResourceName is the extended resource by which a container
+	// requests AMD GPU memory. Despite the name, the AMD device plugin
+	// advertises and accounts VRAM in fixed-size *units*, not in mebibytes: a
+	// ~12 GiB card advertises about 23. See mibPerAMDUnit.
+	AMDMemoryResourceName = "amd.com/gpu-vram-mib"
+
+	// AMDMemoryLimitAnnotation is amdproxy's counterpart to
+	// MemoryLimitAnnotation, and is subject to the same ceiling.
+	AMDMemoryLimitAnnotation = "dev.gvisor.flag.amdproxy-gpu-memory-limit"
+
+	// mibPerAMDUnit is the size of one unit of AMDMemoryResourceName. It must
+	// match the AMD device plugin's --slice-mib, whose default this is;
+	// reading it as mebibytes would under-count a pod's quota 512-fold.
+	mibPerAMDUnit = 512
+
 	// bytesPerMiB converts the memory resource's units to the annotation's.
 	bytesPerMiB = 1 << 20
 )
@@ -74,12 +90,6 @@ const (
 // is the pod's peak demand: containers run together and their requests add up,
 // while init containers run before them and only their largest matters.
 func InjectMemoryLimit(pod *v1.Pod) {
-	// An explicit annotation is the pod author's own statement of the limit,
-	// which may be deliberately lower than the request. Leave it alone.
-	if _, ok := pod.Annotations[MemoryLimitAnnotation]; ok {
-		return
-	}
-
 	peak := peakRequest(pod, MemoryResourceName)
 	if peak <= 0 {
 		// No container asked for GPU memory, so there is nothing to enforce.
@@ -89,8 +99,26 @@ func InjectMemoryLimit(pod *v1.Pod) {
 
 	// The resource counts mebibytes, and cannot express a total large enough to
 	// overflow this.
-	setAnnotation(pod, MemoryLimitAnnotation, fmt.Sprintf("%d", peak*bytesPerMiB))
+	setAnnotation(pod, MemoryLimitAnnotation, narrow(pod, MemoryLimitAnnotation, peak*bytesPerMiB))
 	log.Debugf("Injected GPU memory limit of %d MiB from %q requests", peak, MemoryResourceName)
+}
+
+// InjectAMDMemoryLimit is InjectMemoryLimit for amdproxy.
+//
+// The only difference is the unit: AMDMemoryResourceName counts fixed-size
+// slices of VRAM rather than mebibytes, so the request is scaled by
+// mibPerAMDUnit before it becomes a number of bytes.
+func InjectAMDMemoryLimit(pod *v1.Pod) {
+	peak := peakRequest(pod, AMDMemoryResourceName)
+	if peak <= 0 {
+		return
+	}
+
+	// A device's worth of 512 MiB units is a few tens, so this is nowhere near
+	// overflowing an int64.
+	limit := peak * mibPerAMDUnit * bytesPerMiB
+	setAnnotation(pod, AMDMemoryLimitAnnotation, narrow(pod, AMDMemoryLimitAnnotation, limit))
+	log.Debugf("Injected AMD GPU memory limit of %d MiB from %q requests", peak*mibPerAMDUnit, AMDMemoryResourceName)
 }
 
 // InjectWeight has runsc give the pod the share of GPU compute it was
@@ -111,10 +139,6 @@ func InjectMemoryLimit(pod *v1.Pod) {
 // takes the weight configured on the runtime, so it competes on equal terms
 // with the other unannotated pods rather than being starved by them.
 func InjectWeight(pod *v1.Pod) {
-	if _, ok := pod.Annotations[WeightAnnotation]; ok {
-		return
-	}
-
 	// Containers of a pod share one sandbox, and so one window on the GPU, so
 	// what they ask for adds up in the same way as their memory.
 	peak := peakRequest(pod, CoresResourceName)
@@ -128,8 +152,26 @@ func InjectWeight(pod *v1.Pod) {
 		peak = 100
 	}
 
-	setAnnotation(pod, WeightAnnotation, fmt.Sprintf("%d", peak))
+	setAnnotation(pod, WeightAnnotation, narrow(pod, WeightAnnotation, peak))
 	log.Debugf("Injected GPU weight of %d from %q requests", peak, CoresResourceName)
+}
+
+// narrow returns the value to write for an annotation the pod may already have
+// set itself, as a decimal string.
+//
+// A pod lowering its own limit restricts only itself and costs nobody else
+// anything, so such a value is kept. Raising it is refused by overwriting,
+// because the pod spec is typically written by the very workload being limited
+// -- inside a vCluster, by a tenant with full control of it. This is the same
+// narrow-only rule runsc applies to flag overrides, applied one layer earlier.
+//
+// Zero does not count as lower: runsc reads 0 as *no limit*, so a pod
+// annotating 0 is asking for the whole device rather than for none of it.
+func narrow(pod *v1.Pod, key string, computed int64) string {
+	if n, err := strconv.ParseInt(strings.TrimSpace(pod.Annotations[key]), 10, 64); err == nil && n > 0 && n < computed {
+		return strconv.FormatInt(n, 10)
+	}
+	return strconv.FormatInt(computed, 10)
 }
 
 // peakRequest returns the most of a resource a pod needs at one time, in the

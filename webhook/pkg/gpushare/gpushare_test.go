@@ -103,14 +103,147 @@ func TestInjectGPUMemoryLimit(t *testing.T) {
 	}
 }
 
-// TestInjectGPUMemoryLimitKeepsExplicit tests that a limit already stated on
-// the pod is left alone, since it may deliberately be lower than the request.
-func TestInjectGPUMemoryLimitKeepsExplicit(t *testing.T) {
+// TestInjectGPUMemoryLimitKeepsLower tests that a limit already stated on the
+// pod is left alone when it is below what the request derives, since it
+// restricts only the pod that stated it.
+func TestInjectGPUMemoryLimitKeepsLower(t *testing.T) {
 	pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{gpuContainer(4096)}}}
 	pod.Annotations = map[string]string{MemoryLimitAnnotation: "123"}
 	InjectMemoryLimit(&pod)
 	if got := pod.Annotations[MemoryLimitAnnotation]; got != "123" {
 		t.Errorf("annotation = %q, want it left at %q", got, "123")
+	}
+}
+
+// TestInjectGPUMemoryLimitNarrowsHigher tests the case the clamp exists for: a
+// pod that writes itself a larger limit than it was scheduled against. The pod
+// spec is usually written by the workload being limited, so a limit it can
+// raise is not a limit.
+func TestInjectGPUMemoryLimitNarrowsHigher(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		stated   string
+		wantKept bool
+	}{
+		{name: "raises", stated: "8589934592"},
+		// 0 reaches runsc as "no limit", so it asks for the whole device
+		// rather than for none of it, and must not be read as lower.
+		{name: "zero", stated: "0"},
+		{name: "negative", stated: "-1"},
+		{name: "unparseable", stated: "lots"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{gpuContainer(1024)}}}
+			pod.Annotations = map[string]string{MemoryLimitAnnotation: test.stated}
+			InjectMemoryLimit(&pod)
+			if got, want := pod.Annotations[MemoryLimitAnnotation], "1073741824"; got != want {
+				t.Errorf("annotation = %q, want it narrowed to %q", got, want)
+			}
+		})
+	}
+}
+
+// amdContainer returns a container requesting units units of AMD GPU memory as
+// a limit, or requesting none if units is 0.
+func amdContainer(units int64) v1.Container {
+	var c v1.Container
+	if units > 0 {
+		c.Resources.Limits = v1.ResourceList{
+			AMDMemoryResourceName: *resource.NewQuantity(units, resource.DecimalSI),
+		}
+	}
+	return c
+}
+
+func TestInjectAMDMemoryLimit(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		pod        v1.Pod
+		wantLimit  string
+		wantAbsent bool
+	}{
+		{
+			// The resource counts 512 MiB units, so 4 of them is 2 GiB. Reading
+			// it as mebibytes -- which its name invites -- would hand the pod
+			// 4 MiB and it would fail to start.
+			name:      "units are 512 MiB, not MiB",
+			pod:       v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{amdContainer(4)}}},
+			wantLimit: "2147483648",
+		},
+		{
+			name:      "containers sum",
+			pod:       v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{amdContainer(4), amdContainer(4)}}},
+			wantLimit: "4294967296",
+		},
+		{
+			name: "large init container sets peak",
+			pod: v1.Pod{Spec: v1.PodSpec{
+				InitContainers: []v1.Container{amdContainer(8)},
+				Containers:     []v1.Container{amdContainer(2)},
+			}},
+			wantLimit: "4294967296",
+		},
+		{
+			name:       "no gpu request",
+			pod:        v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{amdContainer(0)}}},
+			wantAbsent: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := test.pod
+			InjectAMDMemoryLimit(&pod)
+			got, ok := pod.Annotations[AMDMemoryLimitAnnotation]
+			if test.wantAbsent {
+				if ok {
+					t.Errorf("annotation = %q, want absent", got)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("annotation absent, want %q", test.wantLimit)
+			}
+			if got != test.wantLimit {
+				t.Errorf("annotation = %q, want %q", got, test.wantLimit)
+			}
+		})
+	}
+}
+
+// TestInjectAMDMemoryLimitNarrows tests both directions of the clamp on the
+// AMD annotation: a pod requesting 1 GiB keeps a smaller limit it states
+// itself, and has a larger one narrowed back to what it was scheduled against.
+func TestInjectAMDMemoryLimitNarrows(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		stated string
+		want   string
+	}{
+		{name: "keeps lower", stated: "536870912", want: "536870912"},
+		{name: "narrows higher", stated: "8589934592", want: "1073741824"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{amdContainer(2)}}}
+			pod.Annotations = map[string]string{AMDMemoryLimitAnnotation: test.stated}
+			InjectAMDMemoryLimit(&pod)
+			if got := pod.Annotations[AMDMemoryLimitAnnotation]; got != test.want {
+				t.Errorf("annotation = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// TestVendorsAreIndependent tests that a pod asking one vendor for memory does
+// not acquire the other vendor's limit, since each is enforced by its own
+// proxy and an unasked-for limit would stop a pod that never requested one.
+func TestVendorsAreIndependent(t *testing.T) {
+	pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{amdContainer(4)}}}
+	InjectMemoryLimit(&pod)
+	InjectAMDMemoryLimit(&pod)
+	if got, ok := pod.Annotations[MemoryLimitAnnotation]; ok {
+		t.Errorf("nvproxy annotation = %q, want absent for a pod asking only AMD for memory", got)
+	}
+	if _, ok := pod.Annotations[AMDMemoryLimitAnnotation]; !ok {
+		t.Error("amdproxy annotation absent")
 	}
 }
 
@@ -203,14 +336,27 @@ func TestInjectWeight(t *testing.T) {
 	}
 }
 
-// TestInjectWeightKeepsExplicit tests that a weight the pod states itself is
-// left alone, since it may deliberately be lower than the request.
-func TestInjectWeightKeepsExplicit(t *testing.T) {
-	pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{coresContainer(80)}}}
-	pod.Annotations = map[string]string{WeightAnnotation: "5"}
-	InjectWeight(&pod)
-	if got := pod.Annotations[WeightAnnotation]; got != "5" {
-		t.Errorf("annotation = %q, want it left at %q", got, "5")
+// TestInjectWeightNarrows tests that a weight the pod states itself is kept
+// when it is lower than the request derives and overwritten when it is higher.
+// A pod that could raise its own weight would take a larger share of a
+// contended GPU than it was scheduled for.
+func TestInjectWeightNarrows(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		stated string
+		want   string
+	}{
+		{name: "keeps lower", stated: "5", want: "5"},
+		{name: "narrows higher", stated: "500", want: "30"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{coresContainer(30)}}}
+			pod.Annotations = map[string]string{WeightAnnotation: test.stated}
+			InjectWeight(&pod)
+			if got := pod.Annotations[WeightAnnotation]; got != test.want {
+				t.Errorf("annotation = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

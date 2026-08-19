@@ -26,8 +26,8 @@ import (
 	"github.com/mattbaird/jsonpatch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/webhook/pkg/gpushare"
-	admv1beta1 "k8s.io/api/admission/v1beta1"
-	admregv1beta1 "k8s.io/api/admissionregistration/v1beta1"
+	admv1 "k8s.io/api/admission/v1"
+	admregv1 "k8s.io/api/admissionregistration/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -51,41 +51,48 @@ const (
 // take effect on pods in the namespaces selected by `podNsSelector`. If `podNsSelector`
 // is empty, the webhook will take effect on all pods.
 func CreateConfiguration(clientset kubeclientset.Interface, selector *metav1.LabelSelector) error {
-	fail := admregv1beta1.Fail
+	fail := admregv1.Fail
+	// Mutating the pod under admission is not a side effect, since it is the
+	// object being admitted rather than anything outside the request; a dry-run
+	// admission therefore needs no special handling. Both of these fields are
+	// required in v1 and had defaults in v1beta1.
+	none := admregv1.SideEffectClassNone
 
-	config := &admregv1beta1.MutatingWebhookConfiguration{
+	config := &admregv1.MutatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: Name,
 		},
-		Webhooks: []admregv1beta1.MutatingWebhook{
+		Webhooks: []admregv1.MutatingWebhook{
 			{
 				Name: fullName,
-				ClientConfig: admregv1beta1.WebhookClientConfig{
-					Service: &admregv1beta1.ServiceReference{
+				ClientConfig: admregv1.WebhookClientConfig{
+					Service: &admregv1.ServiceReference{
 						Name:      Name,
 						Namespace: serviceNamespace,
 					},
 					CABundle: caCert,
 				},
-				Rules: []admregv1beta1.RuleWithOperations{
+				Rules: []admregv1.RuleWithOperations{
 					{
-						Operations: []admregv1beta1.OperationType{
-							admregv1beta1.Create,
+						Operations: []admregv1.OperationType{
+							admregv1.Create,
 						},
-						Rule: admregv1beta1.Rule{
+						Rule: admregv1.Rule{
 							APIGroups:   []string{"*"},
 							APIVersions: []string{"*"},
 							Resources:   []string{"pods"},
 						},
 					},
 				},
-				FailurePolicy:     &fail,
-				NamespaceSelector: selector,
+				FailurePolicy:           &fail,
+				SideEffects:             &none,
+				AdmissionReviewVersions: []string{"v1"},
+				NamespaceSelector:       selector,
 			},
 		},
 	}
 	log.Infof("Creating MutatingWebhookConfiguration %q", config.Name)
-	if _, err := clientset.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Create(context.TODO(), config, metav1.CreateOptions{}); err != nil {
+	if _, err := clientset.AdmissionregistrationV1().MutatingWebhookConfigurations().Create(context.TODO(), config, metav1.CreateOptions{}); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("failed to create MutatingWebhookConfiguration %q: %s", config.Name, err)
 		}
@@ -108,7 +115,7 @@ func GetTLSConfig() *tls.Config {
 
 // Admit performs admission checks and mutations on Pods.
 func Admit(writer http.ResponseWriter, req *http.Request) {
-	review := &admv1beta1.AdmissionReview{}
+	review := &admv1.AdmissionReview{}
 	if err := json.NewDecoder(req.Body).Decode(review); err != nil {
 		log.Infof("Failed with error (%v) to decode Admit request: %+v", err, *req)
 		writer.WriteHeader(http.StatusBadRequest)
@@ -120,7 +127,8 @@ func Admit(writer http.ResponseWriter, req *http.Request) {
 	review.Response, err = admitPod(review.Request)
 	if err != nil {
 		log.Warningf("admitPod failed: %v", err)
-		review.Response = &admv1beta1.AdmissionResponse{
+		review.Response = &admv1.AdmissionResponse{
+			UID: review.Request.UID,
 			Result: &metav1.Status{
 				Reason:  metav1.StatusReasonInvalid,
 				Message: err.Error(),
@@ -129,6 +137,10 @@ func Admit(writer http.ResponseWriter, req *http.Request) {
 		sendResponse(writer, review)
 		return
 	}
+
+	// v1 requires the response to name the request it answers, and rejects the
+	// whole review if it does not. v1beta1 let this be empty.
+	review.Response.UID = review.Request.UID
 
 	log.Debugf("Processed admission review: %+v", review)
 	sendResponse(writer, review)
@@ -146,7 +158,7 @@ func sendResponse(writer http.ResponseWriter, response any) {
 	writer.Write(b)
 }
 
-func admitPod(req *admv1beta1.AdmissionRequest) (*admv1beta1.AdmissionResponse, error) {
+func admitPod(req *admv1.AdmissionRequest) (*admv1.AdmissionResponse, error) {
 	// Verify that the request is indeed a Pod.
 	resource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
 	if req.Resource != resource {
@@ -168,8 +180,8 @@ func admitPod(req *admv1beta1.AdmissionRequest) (*admv1beta1.AdmissionResponse, 
 	}
 
 	log.Debugf("Patched pod %s/%s (generateName: %s): %+v", pod.Namespace, pod.Name, pod.GenerateName, podCopy)
-	patchType := admv1beta1.PatchTypeJSONPatch
-	return &admv1beta1.AdmissionResponse{
+	patchType := admv1.PatchTypeJSONPatch
+	return &admv1.AdmissionResponse{
 		Allowed:   true,
 		Patch:     patch,
 		PatchType: &patchType,
@@ -183,6 +195,7 @@ func updatePod(pod *v1.Pod) {
 	// Have runsc enforce whatever share of a GPU the pod was scheduled
 	// against, and stand down the limiter that runs inside the container.
 	gpushare.InjectMemoryLimit(pod)
+	gpushare.InjectAMDMemoryLimit(pod)
 	gpushare.InjectWeight(pod)
 	gpushare.StandDownHAMi(pod)
 
