@@ -266,14 +266,21 @@ divide (measured 1:1). Two findings:
   idle, and the timeslice flapped. The server now sends a full-period window
   whenever the enforcer is set, so the runlist alone divides.
 
-**One plumbing gap remains in the *automatic* path.** With the scheduler driving
-it, only one of the two co-scheduled sandboxes was enforced: under KVM the pid
-`runsc` announces for a sandbox did not match the tgid the driver records that
-sandbox's channels under, so the other sandbox's timeslice commands hit a dead
-pid. Its weight was still known (the enforced pod's slice flapped 3000<->1000 as
-the mis-plumbed peer's connection came and went), so the division landed at
-1.47:1 instead of 3:1. Aligning the announced pid with the channel-owner tgid is
-the next fix; the mechanism itself is proven (6.33:1 by hand on the same pods).
+**One plumbing gap remains in the *automatic* path, and it is a
+systrap-specific pid-identity problem.** The node runs `--platform=systrap`
+(not KVM -- NVIDIA does not need KVM the way AMD's KFD does; see below), so a
+sandbox is not one process but a Sentry plus a tree of stub processes. Only one
+of the two co-scheduled sandboxes was auto-enforced: the pid `runsc` announces
+for a sandbox did not match the tgid the driver records that sandbox's channels
+under, so the other's timeslice commands hit a dead pid. Its weight was still
+known (the enforced pod's slice flapped 3000<->1000 as the mis-plumbed peer's
+connection came and went), so the division landed at 1.47:1 instead of 3:1. The
+mechanism itself is proven (6.33:1 by hand on the same pods); what is unresolved
+is the sandbox->pid mapping under systrap's multi-process model. Under KVM a
+sandbox is a single process, so the announced pid and the channel-owner tgid
+coincide -- which would make the scheduler's pid plumbing trivial, at the cost of
+the heavier platform. Aligning the two under systrap (or announcing every
+channel-owning pid a sandbox holds) is the next fix.
 
 ### Wired into `runsc gpu-scheduler`, end to end
 
