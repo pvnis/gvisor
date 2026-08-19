@@ -7,6 +7,30 @@ deliberately-unprivileged gVisor Sentry cannot. Driver clone is at
 from the deployed proprietary **610.43.02**). Reference paper: Ghost, "Breaking
 the Tradeoff: Elastic and Isolated GPU Sharing" (see memory `ghost-gvm`).
 
+## !!! REVERSED (2026-08-19): both primitives WORK on consumer Blackwell — Phase 0 below is VOID !!!
+
+The Phase 0 negatives below were **method errors**, caught by the A100 agents and
+re-measured on sensai's RTX 5070 (GB205):
+- The spatial "NOT_SUPPORTED" was a **status-code misread**: `0x57` is
+  `NV_ERR_OBJECT_NOT_FOUND`, not `NV_ERR_NOT_SUPPORTED` (`0x56`). The controls were
+  issued from *inside* `kctxshareapiConstruct_IMPL`, before the ctxshare was
+  registered with GSP (they're `ROUTE_TO_PHYSICAL`), so GSP couldn't find the
+  object. **Re-issued from the DEFERRED site (`GpFifoSchedule`),
+  `SET_TPC_PARTITION_TABLE = 0x0` and imposes a real TPC dial** — 13/24→272,
+  18/24→372, 24/24→458 matmul/s (~20/TPC).
+- The temporal "inert" results were **missing the `NVA06F_CTRL_CMD_RESTART_RUNLIST`
+  commit RPC**. With it: `SET_TIMESLICE` 3000/1000 → **3.00:1** (conserved),
+  idle-yield works (STOP an attached tenant → the other expands to solo, so the
+  timeslice-only scheduler needs no detach logic), 3-tenant 3:2:1, dial linear to
+  ~6:1. `detach`/`attach` evict/restore cleanly.
+
+**So consumer Blackwell (GB205) DOES do work-conserving weighted time-division AND
+imposable spatial TPC partitioning for untrusting gVisor tenants.** Ghost's design
+runs unchanged; `pkg/gpusched` is the temporal policy; `smpart_unsafe.go` is the
+spatial one (now reachable from the driver at the deferred site). The authoritative
+writeup is `NVIDIA-COMPUTE-ISOLATION.md` CORRECTION 5 (owned by the a100-bcn
+session). Everything from here down is the superseded record.
+
 ## CORRECTION (2026-08-18): we drove the wrong primitive; the temporal lever is not disproven
 
 We obtained the Ghost paper ("Breaking the Tradeoff: Elastic and Isolated GPU
@@ -38,9 +62,9 @@ time-slicer gives 71/29 for a 3:1 request, aggregate 1612 matmul/s, and full
 GPU to a lone tenant. **Phase 2-temporal has a working runtime primitive**;
 porting `pkg/gpusched` to drive detach/attach + timeslice via a driver control
 is the concrete next step.
-The consumer/pro (GB205/GA102/GB202) spatial re-probe is still separately open.
+The pro/DC (GA102/GB202) spatial re-probe is still separately open.
 
-## PHASE 0 RESULTS (2026-08-14): the temporal primitive is dead on consumer Blackwell; the spatial verdict was mis-read (see the A100 section below)
+## PHASE 0 RESULTS (2026-08-14, SUPERSEDED): thought both primitives were dead on consumer Blackwell
 
 Executed on the RTX 5070 after swapping to the open 610.43.02 driver and adding
 hooks that originate the controls at kernel privilege (the whole point of the
