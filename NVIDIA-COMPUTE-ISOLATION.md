@@ -1087,3 +1087,48 @@ deferred site). The only dies still carrying an unretested `0x57`-from-the-wrong
 site negative are the **pro parts (GA102 A6000, GB202 6000 Pro)**; both deserve
 the same clean re-probe from the deferred call site before any negative about
 them is believed.
+
+### The RTX A6000 (GA102) was probed — and the run is VOID
+
+Run on `vm-nv-dmd1` (2026-08-17) **before CORRECTION 5 was known**, using the
+committed `driver-hooks.patch` as it then stood — i.e. originating 0c/0d from
+inside `kctxshareapiConstruct_IMPL`, and 0b without the `RESTART_RUNLIST`
+companion. It reported:
+
+| probe | result | why it is void |
+| --- | --- | --- |
+| 0c `SET_TPC_PARTITION_TABLE` (21 of 42 TPCs) | `0x57`, burn 783 vs 773 solo | `0x57` from the constructor is `OBJECT_NOT_FOUND`, not a verdict — CORRECTION 5 |
+| 0d `SET_CWD_WATERMARK(MIN)` | `0x57`, readback 0 | same wrong call site |
+| 0b TSG force-detach | `NV_OK` on 3 TSGs, burn 773.4 vs 773 solo | no `RESTART_RUNLIST`, so the change was never committed — CORRECTION 3 |
+
+It was written up as "the A6000 matches the 5070, so pro dies do not unlock
+compute isolation, and MIG/SMC capability is the predictor." **Every part of
+that is withdrawn.** The status codes said nothing about the die, and the
+unchanged throughput is exactly what an un-applied control produces — it was
+read as evidence of absence when it was evidence of nothing. The MIG/SMC axis
+it proposed is refuted outright by GB205, which has no MIG and *does* honour
+the partition from the deferred site.
+
+**What does stand from that run**, and is worth not re-deriving:
+
+- **Hardware**: full GA102, **84 SMs = 42 TPCs**, sm_86, 46068 MiB, ECC on,
+  `MIG M.: N/A`. Half-partition test size is therefore 21 TPCs.
+- **Solo baseline, stock driver: 773 matmul/s** (770.1–774.2, ±0.3%) with
+  `ghost-experiment/burn.py`. Tight enough that a 21-TPC partition (~386) could
+  not hide, so the re-probe has a ready reference point.
+- **The open 610.43.02 build matches this box**: the apt candidate
+  (`nvidia-headless-610-open`) is exactly the tag the hooks were written
+  against, so firmware and modules agree with no version hunting.
+- **A stale-module trap that produces a false negative.** `rmmod nvidia` fails
+  while `nvidia_modeset` ← `nvidia_drm` still reference it, and `insmod` then
+  reports **"File exists" while the previous module stays resident** — so the
+  run silently measures the *old* build. For 0b that yields a full-rate burn,
+  indistinguishable from a genuine negative. `a6000-3-detach.sh` now unloads
+  `nvidia_drm`/`nvidia_modeset` first, hard-aborts if `nvidia` is still loaded,
+  and counts `GHOST 0b` dmesg lines — zero lines means the hook is not in the
+  loaded module and the rate must not be interpreted.
+
+So the A6000 row in the table above stays **UNKNOWN**. `ghost-experiment/a6000-{1,2,3}-*.sh`
+carry the machine setup, driver swap and baseline and can be reused as-is; only
+the hook's call site needs to move to the deferred one before the numbers mean
+anything.
