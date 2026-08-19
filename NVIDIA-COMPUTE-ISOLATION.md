@@ -266,21 +266,29 @@ divide (measured 1:1). Two findings:
   idle, and the timeslice flapped. The server now sends a full-period window
   whenever the enforcer is set, so the runlist alone divides.
 
-**One plumbing gap remains in the *automatic* path, and it is a
-systrap-specific pid-identity problem.** The node runs `--platform=systrap`
-(not KVM -- NVIDIA does not need KVM the way AMD's KFD does; see below), so a
-sandbox is not one process but a Sentry plus a tree of stub processes. Only one
-of the two co-scheduled sandboxes was auto-enforced: the pid `runsc` announces
-for a sandbox did not match the tgid the driver records that sandbox's channels
-under, so the other's timeslice commands hit a dead pid. Its weight was still
-known (the enforced pod's slice flapped 3000<->1000 as the mis-plumbed peer's
-connection came and went), so the division landed at 1.47:1 instead of 3:1. The
-mechanism itself is proven (6.33:1 by hand on the same pods); what is unresolved
-is the sandbox->pid mapping under systrap's multi-process model. Under KVM a
-sandbox is a single process, so the announced pid and the channel-owner tgid
-coincide -- which would make the scheduler's pid plumbing trivial, at the cost of
-the heavier platform. Aligning the two under systrap (or announcing every
-channel-owning pid a sandbox holds) is the next fix.
+**One plumbing gap remains in the *automatic* path, and it is
+platform-independent -- a `runsc` pid-announcement bug, not a platform artifact.**
+Only one of the two co-scheduled sandboxes is auto-enforced: the scheduler sets
+timeslices on one pid (which flaps 3000<->1000 as its peer comes and goes in the
+client set), while the other pod -- active in the driver's channel-state read --
+is never touched and keeps GSP's default timeslice (~2000us), so the division
+lands at 3000:default ~= 1.5:1 instead of 3:1.
+
+The mechanism is not at fault: setting the two pods' timeslices 3000:1000 *by
+hand* through the control gives **exactly 3.00:1** (and 6000:1000 -> 6.40:1), on
+the same pods, both platforms. What is wrong is that one sandbox's channel-owner
+pid does not reach the scheduler's enforce list.
+
+**Both platforms were tried and behave identically.** The node ran
+`--platform=systrap` (NVIDIA does not need KVM the way AMD's KFD does -- cuBLAS,
+nvproxy and the scheduler all work on systrap), where a sandbox is a Sentry plus
+a tree of stub processes; and `--platform=kvm`, where a sandbox is a single
+process and the driver records exactly one clean pid per sandbox. **KVM's single-
+process model did not fix the division** -- still 1.47:1 -- which rules out
+systrap's multi-process model as the cause and points squarely at how `runsc`
+announces a sandbox's pid to the scheduler under Kubernetes (the GPU container's
+pid via `StartSubcontainer`). Aligning the announced pid with the driver's
+channel-owner pid is the fix; the mechanism and the monitoring are proven.
 
 ### Wired into `runsc gpu-scheduler`, end to end
 
