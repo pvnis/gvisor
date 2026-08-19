@@ -291,6 +291,54 @@ when the real fix lands.
 Not weight-multiplication by pod count — two separate weight-25 pods did not
 double the share (291→312, not →582).
 
+### V4. The runlist enforcer is defeated by process packing — the V1 attack carries over (2026-08-19, A6000/GA102)
+
+**The mechanism that replaced the compute gate has the same class of hole.** The
+runlist timeslice binds a *channel group*, not a tenant, so a tenant that forks
+N processes gets N timeslices and multiplies its share linearly.
+
+Measured natively on `vm-nv-dmd1` (RTX A6000, GHOST driver, weights driven
+through `/proc/driver/nvidia/gpusched` as `ts <pid> <us>`; attacker A at 1000 µs,
+victim B at 3000 µs — a deliberate 1:3 disadvantage):
+
+| A's configuration | A total | B | aggregate | A:B |
+| --- | --- | --- | --- | --- |
+| honest, 1 process | 175.9 | 548.6 | 724.5 | 0.32:1 |
+| **A packs 4 processes** | **389.7** | **304.7** | 694.4 | **1.28:1** |
+
+**A gains 122%, B loses 44%, aggregate conserved within 4.2%** — theft, not
+gap-filling, and the same signature as V1 (145→312 while peers fell to 62).
+A tenant handed one third of the GPU took *more than its victim* by forking four
+times.
+
+**Root cause, and it is exact rather than inferred.** Share tracks
+`(number of TSGs) x (timeslice per TSG)`:
+
+| case | A budget | B budget | predicted A:B | measured |
+| --- | --- | --- | --- | --- |
+| honest | 1 x 1000 µs | 1 x 3000 µs | 0.333 | 0.32 |
+| packed | 4 x 1000 µs | 1 x 3000 µs | 1.333 | 1.28 |
+
+Both within ~4%. The primitive is per-channel-group and composes additively, so
+"weight" as issued is a *per-process* quantity, not a per-tenant one.
+
+**Scope of the claim.** This tests the driver primitive driven one `ts` per pid,
+which is how `/proc/driver/nvidia/gpusched` exposes it. It does **not** show that
+`runsc gpu-scheduler --runlist-control` is exploitable: that path announces a
+sandbox's pids and could divide the tenant's weight across its TSGs before
+issuing them. It was not running on this box and is untested here. What is
+established is that the underlying lever gives no per-tenant guarantee on its
+own, so any scheduler above it must enumerate every TSG a sandbox owns and
+divide — and must keep doing so as the sandbox forks, or the guarantee lapses
+the moment a tenant starts a second process.
+
+**Fix direction.** Per-TSG timeslice must be `tenant_weight / n_TSGs(tenant)`,
+recomputed on TSG creation and teardown. Note this is strictly harder than the
+gate's problem: the set of a tenant's TSGs is dynamic and attacker-controlled,
+so a one-shot announcement at sandbox start is not enough — exactly the
+"one-shot best-effort pid announcement, no retry" gap already recorded for the
+automatic path in NVIDIA-COMPUTE-ISOLATION.md.
+
 ## OPEN — low severity
 
 ### V3. GPU power-draw side-channel (disclosure, low)
@@ -306,6 +354,35 @@ NVML/smi rewrite the same way memory already is.
 Two `runsc gpu-scheduler` daemons were bound to the same socket path
 `/run/runsc-gpu-scheduler.sock`; the newer holds all client connections, the
 older is orphaned. Harmless here but worth a single-instance guard.
+
+## HELD — re-verified on the A6000 + GHOST driver (2026-08-19)
+
+Re-run of the tenant-side attacks on `vm-nv-dmd1` (GA102, GHOST driver, k3s +
+Cilium + HAMi + 3 vCluster tenants), launched from inside `tenant-nv-a` holding
+only its own API token. **7 passed, 0 failed, 0 inconclusive** —
+`ghost-experiment/adversarial-2-tenant.sh`.
+
+- **Quota escalation refused.** Pod requested `nvidia.com/gpumem: 1024` and
+  self-annotated `nvproxy-gpu-memory-limit: 42949672960` (40 GiB) from inside its
+  own vCluster, where it is cluster admin. Host pod carried `1073741824`, and the
+  sandbox saw **1024 MiB**. The 46068 MiB device size never appeared.
+- **Sandbox escape via `runtimeClassName: nvidia` refused.** The pod asked for
+  the host's runc+nvidia handler; the syncer overwrote it, the host pod shows
+  `runtimeClassName: gvisor`, and the container reported `4.19.0-gvisor`. This is
+  the escape `values/tenant.yaml` calls load-bearing, exercised directly.
+- **`/proc/driver/nvidia/gpusched` is NOT visible inside the sandbox.** This is
+  the surface the GHOST driver adds: the control is root-only via `NV_IS_SUSER`,
+  and a container routinely runs as root, so had gVisor's synthetic procfs
+  exposed it, one tenant could `detach` another's channels — a cross-tenant DoS.
+  It does not, so the lever stays host-side where it belongs. Worth re-checking
+  on any driver that adds a new `/proc/driver/nvidia/*` entry.
+- **No peer visibility** — `nvidia-smi` inside the sandbox listed no processes
+  and an empty `--query-compute-apps`.
+
+Note the shape of the day's results: **every containment boundary held, and the
+break was in the compute *share*** (V4 above). Isolation and fairness are
+failing independently, and a clean isolation result says nothing about whether a
+tenant can steal throughput.
 
 ## HELD — verified contained (2026-08-13)
 Every other surface held; recording so they are not re-litigated without cause.
