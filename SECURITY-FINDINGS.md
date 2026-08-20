@@ -462,16 +462,39 @@ which is the entire bug.
   deciding participation from that signal alone would never re-admit it. The
   scheduler detached it, so the scheduler knows better.
 
-**Aggregate cost is 136.2 vs the timeslice scheme's 167.5, and the cause is not
-settled.** Two candidates, not separated: the ~2.7 detach/attach per second
-(each forces a runlist restart), or the loss of *overlap* — solo A measures
-139.3, i.e. the two-tenant credit aggregate is about equal to one tenant alone,
-which is what you would expect if enforcing a share serializes tenants that were
-previously filling each other's gaps. This branch has already recorded that
-shape on the AMD side: time-slicing pays when tenants contend for a saturated
-resource and costs when they complement each other. Deciding it needs solo
-measured under the timeslice scheme too, which was never taken. Widening the
-dead band (fewer, longer dwells) is the obvious lever on the churn half.
+**The aggregate question is now settled, and it is not overhead.** Solo was
+measured both ways, which is what the earlier note said was missing:
+
+| | rate | vs solo |
+| --- | --- | --- |
+| solo, no scheduler at all | 139.4 | baseline |
+| **solo, credit scheduler** | **139.3** | **99.93%** |
+| two tenants, credit | 136.2 | 98% |
+| two tenants, timeslice scheme | 167.5 | **120%** |
+
+- **A lone tenant pays nothing** — 0.07%, and the driver logged zero detaches,
+  so the lone-tenant guard holds in production as well as in the unit test.
+- **The 167.5 was never a ceiling the credit scheme fell short of.** It is
+  *above* what one tenant achieves alone: two cuBLAS tenants interleave and fill
+  each other's gaps, because a single 4096³ SGEMM stream does not saturate an
+  A6000. Credit scheduling serializes them and gives that overlap bonus up,
+  landing at 98% of solo — near-perfect conservation of the single-tenant rate.
+
+So the trade is explicit: **~20% of an overlap bonus, in exchange for a share
+that cannot be stolen.** That is the rule this branch already recorded on the
+AMD side — time-slicing pays when tenants contend for a saturated resource and
+costs when they complement each other; here they complement each other. A
+tenant that genuinely saturates the device (a real LLM, a larger GEMM) should
+show a smaller bonus and so a smaller cost, and that is worth measuring before
+generalizing from one microbenchmark.
+
+**Operational note: the scheduler is a hard dependency, fail-closed.** With
+`nvproxy-gpu-scheduler-socket` set in the runsc config, a GPU pod cannot start
+at all while `runsc-gpu-scheduler` is down — sandbox creation fails with
+`connecting to the GPU scheduler ... connect: connection refused`. Defensible
+for a quota mechanism, but it makes that service a single point of failure for
+every GPU pod on the node, and it is not documented elsewhere. Found while
+taking the baseline above.
 
 **Superseded fix direction.** Follow the paper, not the divide: keep a
 large timeslice and enforce shares by credit accounting at container
