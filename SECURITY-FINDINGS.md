@@ -356,7 +356,84 @@ The same per-TSG model predicts both stacks:
 | integrated, honest | 1 x 3000 | 1 x 1000 | 3.00 | 3.12 |
 | **integrated, packed** | 1 x 3000 | 4 x 1000 | **0.75** | **0.78** |
 
-**Fix direction.** Per-TSG timeslice must be `tenant_weight / n_TSGs(tenant)`,
+**FIX ATTEMPTED AND MEASURED (2026-08-19) — it works on fairness and is
+disqualified on cost.** The driver's `ts <pid> <us>` was changed to mean a
+*tenant budget*, divided across the pid's channel groups
+(`tsPerGroup = arg / nGroups`, floored at `GHOST_MIN_TS_US`):
+
+| | A (w=75) | B (w=25) | aggregate | A:B |
+| --- | --- | --- | --- | --- |
+| honest, no fix | 126.8 | 40.7 | 167.5 | 3.12:1 |
+| **honest, with fix** | 73.3 | 23.5 | **96.8** | **3.12:1** |
+| packed x4, no fix | 70.5 | 90.9 | 161.4 | 0.78:1 |
+| **packed x4, with fix** | 42.3 | 33.6 | **75.9** | **1.26:1** |
+
+- **The ratio is preserved exactly when honest** (3.12:1 either way), so the
+  division is correct.
+- **The attack is blunted but not stopped**: 0.78 -> 1.26. The attacker no longer
+  *beats* its victim, but still takes far more than the 1:3 it was granted.
+- **It costs 42% of aggregate throughput even with nobody attacking** (167.5 ->
+  96.8). Shrinking the quantum to divide the share multiplies context switching.
+  That alone disqualifies it as a production fix.
+
+**Why it does not fully close: the floor binds.** dmesg from the run:
+
+    pid ... budget 3000 us over  6 TSG(s) -> 500 us each
+    pid ... budget 1000 us over 15 TSG(s) -> 128 us each (CLAMPED at floor)
+
+**Correction to the model above: TSG count is NOT process count.** A *single*-
+process pod already owns **6** channel groups; the 4-process attacker owns
+**15**. CUDA creates several TSGs per context, so "one process, one TSG" was
+wrong — the earlier per-TSG arithmetic happened to predict well only because TSG
+count scaled roughly with process count. With 15 groups the attacker's 1000 us
+budget divides to 66 us, is clamped up to 128, and it recovers
+15 x 128 = 1920 us against A's 6 x 500 = 3000 us — predicting 1.56:1 against
+1.26:1 measured.
+
+**What GVM actually does, and why it does not have this problem.** The paper
+("GVM: OS-Level GPU Virtualization", Berkeley/UCLA — note our older references
+called it "Ghost / Breaking the Tradeoff", a stale title) never encodes weight in
+the timeslice value:
+
+> Each container has a weight that encodes its target share. GVM uses a
+> lightweight weighted round-robin scheme: containers accumulate credit in
+> proportion to their weight, and any container with positive credit is
+> scheduled for a bounded timeslice; the time used is then deducted from its
+> credit.
+
+Weight drives **credit accrual per container**; the timeslice is only a bounded
+quantum for one turn; consumed time is **charged back to the container**. A
+container with 15 TSGs burns its shared credit 15x faster and gains nothing, and
+because the quantum stays large there is no context-switch tax. Their threat
+model covers this directly: *"Tenants are treated as mutually untrusted
+user-space processes."* Their isolation unit is explicit: *"Each GPU container
+... corresponds to one tenant (or tenant group). Kernels or streams within a
+container are not isolated or tracked separately."*
+
+**But the released GVM code does not implement that scheduler.** In
+`ovg-project/gvm-nvidia-driver-modules`, the debugfs surface is
+`compute.priority` / `compute.freeze` / `memory.*` — there is no weight, and no
+credit anywhere. `gvm_process_compute_priority_write` resolves a **pid** to its
+va_spaces and calls `uvm_debugfs_api_set_timeslice(va_space,
+GVM_MAX_TIMESLICE_US >> priority)`, and that helper iterates **every** GR channel
+group in the va_space writing the same value. That is the same shape as ours:
+share encoded as a per-TSG timeslice, keyed per process, with nothing aggregating
+across a tenant's processes. **So V4 plausibly applies to GVM-as-released too**,
+and the credit scheduler that would prevent it appears only in the paper. Not
+verified against their hardware — stated as a code reading, not a measurement.
+
+**Correct fix direction (revised).** Follow the paper, not the divide: keep a
+large timeslice and enforce shares by credit accounting at container
+granularity, using detach/attach when credit is exhausted rather than shrinking
+the quantum. gVisor makes the container identity *easier* than GVM's per-pid
+model: every sandboxed process already shares one Sentry host pid, so a tenant is
+unambiguous — the thing that made the attack invisible is the same thing that
+makes the correct accounting natural. The missing input is consumed GPU time per
+tenant; `--measure-usage`'s `nvidia-smi pmon` sampler is the wrong source (it is
+already recorded as defective), but the driver's GP_GET/GP_PUT channel-state
+signal is trusted and doorbell-aware and is a better basis.
+
+**Superseded fix direction.** Per-TSG timeslice = `tenant_weight / n_TSGs(tenant)`,
 recomputed as TSGs appear and vanish. This is strictly harder than the gate's
 problem: the set is dynamic and attacker-controlled, so a one-shot announcement
 at sandbox start cannot hold it — the same shape as the "one-shot best-effort pid
