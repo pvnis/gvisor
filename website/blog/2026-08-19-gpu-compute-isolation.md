@@ -116,9 +116,9 @@ doorbell workload cannot dodge them the way it dodged the mapping gate.
 So enforcement moves out of the Sentry's mapping revocation and into a
 **driver-resident broker**: a small extension to the host's open kernel modules
 that issues these scheduling controls on each sandbox's objects. This is the
-shape that Ghost ("Breaking the Tradeoff: Elastic and Isolated GPU Sharing")
-independently arrived at on the A100 — a privileged, driver-level resource
-broker — and it satisfies the
+shape that GVM ("OS-Level GPU Virtualization for Mixing Interactive and Batch
+Workloads", Berkeley/UCLA) independently arrived at on the A100 — a privileged,
+driver-level resource broker — and it satisfies the
 governing constraint of this whole project even more firmly than the Sentry gate
 did: the thing doing the limiting is now in the host kernel, not merely outside
 the container but in a different privilege domain entirely. Under gVisor's KVM
@@ -191,6 +191,23 @@ hardware. Both axes work on a consumer card with no MIG at all.
 
 ## What is honestly true, and what is not yet
 
+- **The weighted division is not adversary-proof yet — a tenant can steal share
+  by packing processes.** The measurements above are with honest tenants, one
+  process each. The scheduler assigns a timeslice per *sandbox*, and under gVisor
+  every process in a sandbox shares one host identity — so a tenant that forks
+  N processes multiplies its channel groups without the scheduler seeing it, and
+  takes more than its weight. Measured on the integrated stack: a weight-25
+  tenant running four processes beat its weight-75 victim **0.78:1**, against the
+  3.12:1 the honest weights produce. The naive fix — divide a tenant's timeslice
+  across its channel groups — costs ~42% of aggregate throughput to context
+  switching and only *blunts* the attack. The correct design is the one GVM's
+  paper actually specifies: credit accounting at tenant granularity with a large
+  quantum, charging back consumed GPU time; the one-Sentry-process-per-sandbox
+  property that *hid* the attack is what makes that accounting unambiguous — but
+  it is not built yet. So the temporal axis divides a GPU correctly between
+  *cooperative* tenants today; closing it against *adversarial* ones is open
+  work. (Memory-quota and network isolation held throughout — the break was
+  purely in the share.)
 - **This is a driver-resident broker, not a drop-in `nvproxy` flag.** It is a
   prototype extending the open kernel modules, deployed on the host. The
   enforcement axis is proven on hardware; the productization — `nvproxy` setting
@@ -206,11 +223,15 @@ hardware. Both axes work on a consumer card with no MIG at all.
   frequently, the Sentry mapping gate still works with no driver changes; the
   broker handles the doorbell case the gate could not. They are not competing
   answers.
-- **This is measured on one GPU.** The same battery is being run on pro and
-  datacenter dies (RTX A6000, A100, RTX 6000 Pro Blackwell). We are deliberately
-  **not** predicting those results from the die class — predicting from the die
-  class is precisely the mistake that cost us here. Each GPU gets measured, with
-  the status codes read correctly and the controls issued from the right place.
+- **The die-class battery is still filling in.** The temporal axis has now been
+  confirmed on a second die — the RTX A6000 (Ampere GA102), same 3:1 division and
+  work-conserving reclaim as the 5070 — after an earlier A6000 run was retracted
+  as a method error (the same three we made on the 5070). The A6000 spatial sweep
+  and the datacenter/pro parts (A100, RTX 6000 Pro Blackwell) are still to run. We
+  are deliberately **not** predicting those from the die class — predicting from
+  the die class is precisely the mistake that cost us here. Each GPU gets
+  measured, with the status codes read correctly and the controls issued from the
+  right place.
 - **Memory-quota isolation is unaffected and unchanged.** It was always a
   separate, solved problem — admit-before-forward accounting with
   `cuMemGetInfo`/NVML rewritten — and it works on every GPU regardless of any of
