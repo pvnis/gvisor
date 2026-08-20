@@ -4,8 +4,12 @@ Plan for building a privileged, driver-level GPU resource broker — the thing t
 branch's whole investigation concluded is *necessary* to enforce what the
 deliberately-unprivileged gVisor Sentry cannot. Driver clone is at
 `/home/dmd/open-gpu-kernel-modules` (open modules **610.57.04**, a minor delta
-from the deployed proprietary **610.43.02**). Reference paper: Ghost, "Breaking
-the Tradeoff: Elastic and Isolated GPU Sharing" (see memory `ghost-gvm`).
+from the deployed proprietary **610.43.02**). Reference paper: **GVM,
+"OS-Level GPU Virtualization for Mixing Interactive and Batch Workloads"**
+(Berkeley/UCLA) — this doc calls it "Ghost" throughout as an internal codename,
+which predates reading the PDF; the title "Breaking the Tradeoff / Ghost" used
+in the older sections below is wrong. Released driver:
+`ovg-project/gvm-nvidia-driver-modules`. See memory `ghost-gvm`.
 
 ## !!! REVERSED (2026-08-19): both primitives WORK on consumer Blackwell — Phase 0 below is VOID !!!
 
