@@ -91,7 +91,15 @@ func (e *ProcfsEnforcer) Attach(pid int) error { return e.write(fmt.Sprintf("att
 // aware (it sees cuBLAS submission that fault counts miss) and cannot be forged
 // by the sandbox (unlike an in-container kernel counter).
 type ActivityPoller interface {
-	PollActive() (map[int]bool, error)
+	PollActive() (map[int]TenantState, error)
+}
+
+// TenantState is what the driver reports about one tenant.
+type TenantState struct {
+	// Active is whether any of its channel groups advanced GP_PUT.
+	Active bool
+	// TSGs is how many channel groups it owns.
+	TSGs int
 }
 
 // PollActive refreshes the driver's activity snapshot and reads it back. It
@@ -99,29 +107,39 @@ type ActivityPoller interface {
 // reads the per-pid "active" lines. The snapshot it returns is from the poll
 // issued on the *previous* call, since the driver refreshes asynchronously --
 // one tick of lag, which the scheduler's idle hysteresis already tolerates.
-func (e *ProcfsEnforcer) PollActive() (map[int]bool, error) {
+func (e *ProcfsEnforcer) PollActive() (map[int]TenantState, error) {
 	p := e.Path
 	if p == "" {
 		p = DefaultRunlistControlPath
 	}
 	// Read the current snapshot first, then ask for a refresh for next time.
-	out := map[int]bool{}
+	out := map[int]TenantState{}
 	f, err := os.Open(p)
 	if err != nil {
 		return nil, err
 	}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		// line: "pid <p> active <0|1>"
+		// line: "pid <p> active <0|1> [tsgs <n>]". The trailing count is
+		// accepted but not required, so a scheduler built against a driver that
+		// predates it still parses (it then charges every tenant alike, which
+		// is the V4 behaviour -- degraded, not broken).
 		fields := strings.Fields(sc.Text())
-		if len(fields) != 4 || fields[0] != "pid" || fields[2] != "active" {
+		if len(fields) < 4 || fields[0] != "pid" || fields[2] != "active" {
 			continue
 		}
 		pid, err1 := strconv.Atoi(fields[1])
 		act, err2 := strconv.Atoi(fields[3])
-		if err1 == nil && err2 == nil {
-			out[pid] = act != 0
+		if err1 != nil || err2 != nil {
+			continue
 		}
+		ts := TenantState{Active: act != 0}
+		if len(fields) >= 6 && fields[4] == "tsgs" {
+			if n, err := strconv.Atoi(fields[5]); err == nil {
+				ts.TSGs = n
+			}
+		}
+		out[pid] = ts
 	}
 	f.Close()
 	if err := e.write("poll"); err != nil {
@@ -145,6 +163,11 @@ type EnforceClient struct {
 	PID    int
 	Weight uint64
 	Idle   bool
+	// TSGs is how many channel groups this tenant owns. With one uniform
+	// quantum per group it is proportional to the share the tenant actually
+	// takes, so the credit planner charges by it -- without this a tenant that
+	// forks extra processes is under-charged, which is V4.
+	TSGs int
 }
 
 // enforceCmd is one command to issue to the driver.
@@ -231,13 +254,16 @@ type pidState struct {
 // runlistEnforcer applies enforcePlan through an Enforcer, remembering what it
 // applied so it only issues commands on change.
 type runlistEnforcer struct {
-	e     Enforcer
-	prev  map[int]pidState
-	ticks int
+	e      Enforcer
+	prev   map[int]pidState
+	ticks  int
+	credit *creditPlanner
+	// periodUs is the tick length the credit accounting advances by.
+	periodUs float64
 }
 
 func newRunlistEnforcer(e Enforcer) *runlistEnforcer {
-	return &runlistEnforcer{e: e, prev: map[int]pidState{}}
+	return &runlistEnforcer{e: e, prev: map[int]pidState{}, credit: newCreditPlanner(defaultCreditParams())}
 }
 
 // reassertEveryTicks is how often the enforcer re-issues every timeslice even
@@ -257,6 +283,40 @@ const reassertEveryTicks = 20
 // apply issues the commands for the given clients and records the new state.
 func (r *runlistEnforcer) apply(clients []EnforceClient) {
 	r.ticks++
+
+	// Credit-based division (SECURITY-FINDINGS.md V4). Weight sets how fast a
+	// tenant accrues credit; every tenant runs at the same large quantum; the
+	// share actually consumed is charged back. This is what makes packing
+	// pointless -- a tenant's extra channel groups draw on the same account --
+	// and it avoids the 42% aggregate cost of dividing the quantum instead.
+	if r.credit != nil {
+		p := r.periodUs
+		if p <= 0 {
+			p = float64(DefaultPeriod.Microseconds())
+		}
+		if r.ticks%reassertEveryTicks == 0 {
+			r.credit.forgetWritten()
+		}
+		cmds := r.credit.plan(clients, p)
+		if len(cmds) > 0 {
+			log.Infof("gpusched: credit enforce: %d clients %+v -> %d commands %+v", len(clients), clients, len(cmds), cmds)
+		}
+		for _, c := range cmds {
+			var err error
+			switch c.op {
+			case "detach":
+				err = r.e.Detach(c.pid)
+			case "attach":
+				err = r.e.Attach(c.pid)
+			case "ts":
+				err = r.e.SetTimeslice(c.pid, c.us)
+			}
+			if err != nil {
+				log.Warningf("gpusched: runlist %s pid=%d: %v", c.op, c.pid, err)
+			}
+		}
+		return
+	}
 
 	// Genuine changes since the last tick -- a client joining or leaving, or a
 	// weight change -- are what is logged, so a steady division is quiet.

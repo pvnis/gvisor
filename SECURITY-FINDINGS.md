@@ -422,7 +422,58 @@ across a tenant's processes. **So V4 plausibly applies to GVM-as-released too**,
 and the credit scheduler that would prevent it appears only in the paper. Not
 verified against their hardware — stated as a code reading, not a measurement.
 
-**Correct fix direction (revised).** Follow the paper, not the divide: keep a
+**FIXED (2026-08-19) — credit scheduling, measured on the integrated stack.**
+Implemented GVM's scheme in `pkg/gpusched/credit.go`: weight drives *credit
+accrual per tenant* (per Sentry pid), every tenant runs at one uniform large
+quantum, and the share actually consumed is charged back; a tenant that
+overdraws past a dead band is detached from the runlist and re-attached when it
+recovers. The driver now also reports each pid's channel-group count
+(`pid <p> active <0|1> tsgs <n>`) so the charge is weighted by the share a
+tenant genuinely takes — without that the packed attacker is under-charged,
+which is the entire bug.
+
+| | A (w=75, 1 proc) | B (w=25) | aggregate | A:B |
+| --- | --- | --- | --- | --- |
+| timeslice scheme, honest | 126.8 | 40.7 | 167.5 | 3.12:1 |
+| timeslice scheme, **B packs 4** | 70.5 | 90.9 | 161.4 | **0.78:1** ← theft |
+| divide-by-N, honest | 73.3 | 23.5 | 96.8 | 3.12:1 |
+| **credit, honest** | 100.9 | 35.3 | 136.2 | **2.86:1** |
+| **credit, B packs 4** | 93.9 | 41.4 | 135.3 | **2.27:1** |
+
+- **Packing is neutralized.** 0.78:1 → **2.27:1**. The attacker fell from 90.9 to
+  41.4 while still running four processes and holding 15 TSGs against the
+  victim's 6. It keeps a small edge (31% of the device against a granted 25%),
+  so this is blunted rather than perfect, but the theft — taking *more* than a
+  peer weighted 3x higher — is gone.
+- **Honest division still correct**: 2.86:1 against 3:1 requested.
+- **Work-conserving**: with the peer removed, A expands 93.9 → **139.3**.
+- **Unit tests** cover accrual, TSG-weighted charge-back, the cap, exhaustion →
+  detach, recovery → attach, the lone-tenant case, and steady-state quiet
+  (`pkg/gpusched/credit_test.go`).
+
+**Two design points that are load-bearing, both found by measurement:**
+
+- **A dead band is required.** Detaching on `credit <= 0` makes tenants that are
+  getting exactly their share flap on and off every tick, churning the runlist
+  for no division at all. The first implementation did this and only 20 of 50
+  steady ticks were silent.
+- **A detached tenant must still count as wanting to run.** Detaching stops its
+  GP_PUT advancing, so the driver's activity signal reads it idle forever;
+  deciding participation from that signal alone would never re-admit it. The
+  scheduler detached it, so the scheduler knows better.
+
+**Aggregate cost is 136.2 vs the timeslice scheme's 167.5, and the cause is not
+settled.** Two candidates, not separated: the ~2.7 detach/attach per second
+(each forces a runlist restart), or the loss of *overlap* — solo A measures
+139.3, i.e. the two-tenant credit aggregate is about equal to one tenant alone,
+which is what you would expect if enforcing a share serializes tenants that were
+previously filling each other's gaps. This branch has already recorded that
+shape on the AMD side: time-slicing pays when tenants contend for a saturated
+resource and costs when they complement each other. Deciding it needs solo
+measured under the timeslice scheme too, which was never taken. Widening the
+dead band (fewer, longer dwells) is the obvious lever on the churn half.
+
+**Superseded fix direction.** Follow the paper, not the divide: keep a
 large timeslice and enforce shares by credit accounting at container
 granularity, using detach/attach when credit is exhausted rather than shrinking
 the quantum. gVisor makes the container identity *easier* than GVM's per-pid

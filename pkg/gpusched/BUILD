@@ -8,6 +8,7 @@ package(
 go_library(
     name = "gpusched",
     srcs = [
+        "credit.go",
         "device.go",
         "enforce.go",
         "gpusched.go",
@@ -24,6 +25,7 @@ go_test(
     name = "gpusched_test",
     size = "small",
     srcs = [
+        "credit_test.go",
         "device_test.go",
         "enforce_test.go",
         "gpusched_test.go",
