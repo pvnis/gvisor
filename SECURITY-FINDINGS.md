@@ -488,6 +488,48 @@ tenant that genuinely saturates the device (a real LLM, a larger GEMM) should
 show a smaller bonus and so a smaller cost, and that is worth measuring before
 generalizing from one microbenchmark.
 
+**Confirmed on a second die — RTX 5070 (Blackwell GB205), 2026-08-20.** Same
+credit scheduler, same harness (cuBLAS SGEMM in gVisor pods on k3s, weights via
+annotation), driver rebuilt with the tsgs-report patch and confirmed loaded by
+the *functional* check (`pid … active 1 tsgs 3`), not srcversion.
+
+| | A (w75) | B (w25) | agg | A:B |
+| --- | --- | --- | --- | --- |
+| (a) solo, no scheduler | — | — | 171.4 | baseline |
+| (b) solo, credit scheduler | — | — | 173.3 | no measurable cost |
+| (c) two honest, 1 proc each | 131.4 | 40.0 | 171.4 | **3.29:1** |
+| (d) B packs 4 procs | 125.7 | 45.7 | 171.4 | **2.75:1** |
+
+- **Packing neutralized on Blackwell too.** The attacker's single Sentry pid held
+  **12 TSGs** (4 procs × 3) against the victim's 3, yet gained only ~14%
+  (B 40.0 → 45.7) while the victim held (A 131 → 126). Honest 3.29:1 → packed
+  2.75:1, versus the timeslice scheme's 0.78:1 theft. Credit binds the tenant.
+- **A lone tenant pays nothing** — (b) is within +1.1% of (a), i.e. noise, not a
+  speedup; read it as "no measurable cost," never as a rate above 100%.
+- **The overlap-bonus prediction above is confirmed.** On the 5070 one tenant
+  saturates the device, so there is no interleave slack: (c) agg 171.4 == (a)
+  baseline 171.4, and credit scheduling costs **~0%** here, where on the A6000 it
+  gave up ~20% of a bonus. The cost is die- and workload-shaped exactly as
+  predicted.
+- **The residual edge is the overlap bonus, not TSG under-charging — do not start
+  a fix there.** It moves *inversely* to the TSG ratio: A6000 attacker 15 vs 6
+  TSGs (ratio 2.5) → B took 30.6% vs a granted 25% (+5.6pp); 5070 12 vs 3
+  (ratio 4.0) → B took 26.7% (+1.7pp). A *bigger* TSG advantage extracted a
+  *smaller* edge, so under-counting the packer's instantaneous share cannot be
+  it. The edge instead tracks agg(c)/solo(a) across dies (A6000 1.20, 5070 1.00),
+  i.e. the slack a detached packer's freed capacity leaves that the survivor
+  cannot fully absorb. Prediction: a saturating workload on the A6000 (larger
+  GEMM, a real model) should shrink its edge toward the 5070's.
+- **TSG-per-context is a per-die constant — read the `tsgs` field, do not model
+  it from process count.** The 5070 is linear (1 proc → 3, 4 procs → 12); the
+  A6000 is not (6, then 15, not 24). A credit-burn model keyed on process count
+  breaks on GA102.
+- **Harness trap (recorded so no one repeats it):** per-process `rate=` lines are
+  instantaneous rates and must **not** be summed — doing so scales with how many
+  lines landed in the window (it read 33× high once). Measure completed work:
+  200 matmuls per line × lines ÷ window, which is correct for any process count
+  and so is the right measure precisely because packing changes the count.
+
 **Operational note: the scheduler is a hard dependency, fail-closed.** With
 `nvproxy-gpu-scheduler-socket` set in the runsc config, a GPU pod cannot start
 at all while `runsc-gpu-scheduler` is down — sandbox creation fails with
