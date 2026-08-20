@@ -32,6 +32,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubeclientset "k8s.io/client-go/kubernetes"
+	admregclientv1 "k8s.io/client-go/kubernetes/typed/admissionregistration/v1"
+	"k8s.io/client-go/util/retry"
 )
 
 const (
@@ -51,6 +53,15 @@ const (
 // take effect on pods in the namespaces selected by `podNsSelector`. If `podNsSelector`
 // is empty, the webhook will take effect on all pods.
 func CreateConfiguration(clientset kubeclientset.Interface, selector *metav1.LabelSelector) error {
+	// Failing closed is a security property here, not just an availability
+	// preference. This webhook is what derives a pod's GPU quota from the
+	// request the scheduler admitted; a pod that gets past admission without
+	// being mutated carries no dev.gvisor.flag.*-gpu-memory-limit and so runs
+	// at the node-wide ceiling configured on the runtime, which is the whole
+	// device. Under Ignore that is exactly what an unreachable webhook would
+	// produce, and silently. Do not relax this to SideEffectClassNone's usual
+	// companion, admregv1.Ignore, without replacing the guarantee some other
+	// way.
 	fail := admregv1.Fail
 	// Mutating the pod under admission is not a side effect, since it is the
 	// object being admitted rather than anything outside the request; a dry-run
@@ -92,11 +103,44 @@ func CreateConfiguration(clientset kubeclientset.Interface, selector *metav1.Lab
 		},
 	}
 	log.Infof("Creating MutatingWebhookConfiguration %q", config.Name)
-	if _, err := clientset.AdmissionregistrationV1().MutatingWebhookConfigurations().Create(context.TODO(), config, metav1.CreateOptions{}); err != nil {
+	configs := clientset.AdmissionregistrationV1().MutatingWebhookConfigurations()
+	if _, err := configs.Create(context.TODO(), config, metav1.CreateOptions{}); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("failed to create MutatingWebhookConfiguration %q: %s", config.Name, err)
 		}
-		log.Infof("MutatingWebhookConfiguration %q already exists; use the existing one", config.Name)
+		// The configuration outlives this process, but the CA does not: the
+		// certificates are generated afresh every time the webhook starts, so
+		// a configuration left over from a previous run names a CA that no
+		// longer signs anything. The apiserver then refuses to call the
+		// webhook at all -- and because it fails closed, every pod in a
+		// selected namespace is refused with an x509 error until someone
+		// deletes the configuration by hand. Adopt it instead.
+		log.Infof("MutatingWebhookConfiguration %q already exists; updating it", config.Name)
+		if err := updateConfiguration(configs, config); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// updateConfiguration rewrites an existing MutatingWebhookConfiguration to
+// match config, retrying on the conflict another writer can cause.
+func updateConfiguration(configs admregclientv1.MutatingWebhookConfigurationInterface, config *admregv1.MutatingWebhookConfiguration) error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		existing, err := configs.Get(context.TODO(), config.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		// Take the whole webhook list rather than only the CABundle, so that a
+		// configuration written by an older build is brought up to date in
+		// every field at once. ResourceVersion has to be carried over for the
+		// update to be accepted.
+		existing.Webhooks = config.Webhooks
+		_, err = configs.Update(context.TODO(), existing, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update MutatingWebhookConfiguration %q: %s", config.Name, err)
 	}
 	return nil
 }

@@ -31,9 +31,13 @@ kind: ClusterRole
 metadata:
   name: gvisor-injection-admission-webhook
 rules:
+# get and update are needed as well as create: the certificates are generated
+# afresh on every start, so a configuration surviving from an earlier run names
+# a CA that no longer signs anything and has to be rewritten rather than left
+# alone.
 - apiGroups: [ admissionregistration.k8s.io ]
   resources: [ mutatingwebhookconfigurations ]
-  verbs: [ create ]
+  verbs: [ create, get, update ]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
