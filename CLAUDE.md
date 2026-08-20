@@ -62,7 +62,7 @@ it before touching either node's Kubernetes setup.
 | ROCm | — | **7.2** | 7.1 |
 | `gpu_id` | — | **63860** (changes on reboot) | 40786 |
 | `/dev/kfd` major | — | **234** (dynamic) | **511** (dynamic) |
-| docker | **no** (containerd only) | yes | yes |
+| docker | **yes** (via `sudo`; containerd for k8s) | yes | yes |
 | kubernetes | **k3s control-plane**, Cilium, HAMi, vCluster | **k3s agent** + AMD device plugin | **yes, with the AMD device plugin** |
 | `sudo` | passwordless | passwordless | **passwordless (`(ALL) NOPASSWD: ALL`)** |
 
@@ -732,7 +732,23 @@ once and has no re-register loop, so after `systemctl restart k3s` the pod stays
 sits `Pending` with `Insufficient amd.com/gpu-vram-mib`. Delete the plugin pod to
 re-register.
 
-Two smaller ones, both of which cost real time:
+**The quota webhook's `failurePolicy: Fail` is a security property, not an
+availability preference.** The in-tree `webhook/pkg/gpushare` derives a pod's GPU
+quota from the request the scheduler admitted, so a pod admitted *without* being
+mutated carries no `dev.gvisor.flag.*-gpu-memory-limit` and runs at the node-wide
+ceiling — the whole device. Registered with `Fail`, an unreachable webhook blocks
+pod creation (fails closed, loudly — verified: `x509` error, pod `NotFound`);
+relaxed to `Ignore` (the common default) it becomes a **silent quota escape**.
+Keep it `Fail`. The webhook mints a fresh CA on every start and reconciles the
+`MutatingWebhookConfiguration`'s `caBundle` to match (so a restart no longer
+wedges admission), which needs `get`+`update` on `mutatingwebhookconfigurations`
+in its ClusterRole. It also needs `--port=8443` (defaults to 0), and an *empty*
+`--pod-namespace-labels` selector is rejected by the apiserver — label the target
+namespaces explicitly. The in-tree webhook is now two-vendor and narrow-only
+(clamps a higher self-annotation down); the standalone `gpu-quota-webhook` is
+retired.
+
+Three smaller ones, each of which cost real time:
 - `/var/log/pods/<pod>/gvisor.log` is the **user** log — compat events only.
   Sentry warnings go to `/var/log/runsc/`, and if that directory has no recent
   `*.boot.txt`, debug logging never reached runsc at all.
@@ -742,6 +758,13 @@ Two smaller ones, both of which cost real time:
   failure but arrives *after* the sandbox has already enumerated the GPU.
   `AMD_LOG_LEVEL=4` plus `LD_DEBUG=libs` in the pod env named it in one run.
   Compare both stores before believing any K8s-only bug.
+- **`docker save`/`docker push` silently emit blob-less stubs when docker uses the
+  containerd image store** — an ~8.5K tar, then `content digest … not found` on
+  `k3s ctr images import`, even though `docker info` shows `Storage Driver:
+  overlayfs`. The image is real (`docker image inspect` shows its true size); the
+  export just omits the layers. Route it into k3s another way: extract the binary
+  with `docker cp` and mount it into a stock image, or push through a throwaway
+  local registry. Cost real time on sensai.
 
 ## Context worth having
 
@@ -808,6 +831,21 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
    kernel-launch loop under identical weights measured 81,099/22,270 (3.64:1):
    the workload, not the GPU family alone, decides whether the *gate* binds —
    the runlist enforcer binds both. See `A100-CLUSTER.md`.
+   **But the per-TSG-timeslice runlist enforcer is defeated by process packing
+   (SECURITY-FINDINGS.md V4).** A low-weight tenant that forks N processes
+   multiplies its channel groups (TSGs) and steals share, because under gVisor
+   every sandboxed process shares one Sentry host pid, so the multiplication is
+   invisible to a per-pid timeslice. **Fixed by the credit scheduler**
+   (`pkg/gpusched/credit.go`): weight drives per-*tenant* credit accrual, one
+   large uniform quantum, whole-tenant detach/attach when credit is exhausted —
+   packing can't help because a tenant's TSGs share one credit pool and detach
+   together. Needs the driver `tsgs`-report patch so charge-back is TSG-weighted.
+   Measured to close packing on **both GA102 (A6000) and GB205 (RTX 5070)**:
+   honest ~3:1 holds, packed 4 procs goes 2.27–2.75:1 (blunted, not perfect; the
+   residual tracks the *overlap bonus*, not a scheduler bug — it moves inversely
+   to the TSG ratio), and a lone tenant pays nothing. Enable with
+   `runsc gpu-scheduler --runlist-control=/proc/driver/nvidia/gpusched`; note the
+   scheduler is then a fail-closed SPOF (a GPU pod won't start while it's down).
 3. **nvproxy must handle multiple NVIDIA GPU architectures, with runtime family
    detection.** One driver ABI spans Turing→Blackwell, and behaviour differs by
    generation — e.g. cuBLAS on a *Blackwell* GPU allocates a *Hopper* USERMODE

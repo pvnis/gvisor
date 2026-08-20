@@ -121,13 +121,33 @@ unit listening on the socket the runsc config names
 ```ini
 # /etc/systemd/system/runsc-gpu-scheduler.service
 [Service]
-ExecStart=/usr/local/bin/runsc gpu-scheduler --socket /run/runsc-gpu-scheduler.sock
+ExecStart=/usr/local/bin/runsc gpu-scheduler --socket /run/runsc-gpu-scheduler.sock \
+    --measure-usage=false --runlist-control=/proc/driver/nvidia/gpusched
 Restart=always
 ```
 
 `--measure-usage` defaults **on** and currently misprices the ordinary
 two-tenant case (see `SECURITY-FINDINGS.md` / the GPU blog); the documented setup
 passes `--measure-usage=false` until that is fixed.
+
+**`--runlist-control` (NVIDIA, needs the Part-8 ghost driver).** Empty, the
+scheduler enforces via the Sentry compute gate — which on Volta+ **cannot bind a
+doorbell/cuBLAS workload at all**, so a real ML tenant is unisolated. Set to the
+ghost driver's `/proc/driver/nvidia/gpusched`, it drives the hardware runlist
+(the credit scheduler: per-tenant credit accrual, whole-tenant detach/attach),
+which does bind cuBLAS. This is the only mode that actually divides compute
+between adversarial NVIDIA tenants; it requires the Part-8 driver (with the
+`tsgs`-report patch, so charge-back is TSG-weighted). Measured to close the
+process-packing share-theft on both GB205 and GA102 (`SECURITY-FINDINGS.md` V4).
+
+> **Operational SPOF — the scheduler is a hard, fail-closed dependency.** With
+> `nvproxy-gpu-scheduler-socket` set in the runsc config, a GPU pod **cannot
+> start at all** while `runsc-gpu-scheduler` is down — sandbox creation fails with
+> `connecting to the GPU scheduler … connection refused`. That is deliberate
+> (failing open would mean an unlimited sandbox), but it makes this service a
+> single point of failure for every GPU pod on the node. To take a
+> *no-scheduler* baseline, comment the socket out of the runsc config — the shim
+> re-reads it per sandbox, so a fresh pod picks it up **without** a k3s restart.
 
 ---
 
