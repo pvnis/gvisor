@@ -269,7 +269,7 @@ func TestDisabledSlicerIsInert(t *testing.T) {
 		t.Fatal("a sandbox without a scheduler connection is being sliced")
 	}
 	// None of these may touch the driver, start a goroutine, or panic.
-	ts.trackQueue(7, 1, amdgpu.KFD_IOC_QUEUE_TYPE_COMPUTE)
+	ts.trackQueue(7, 1, amdgpu.KFD_IOC_QUEUE_TYPE_COMPUTE, 24576)
 	ts.beforeDestroyQueue(1)()
 	ts.forgetHostFD(7)
 	ts.shutdown()

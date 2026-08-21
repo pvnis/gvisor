@@ -187,6 +187,92 @@ func (ts *timeSlicer) setQueuesLocked(ids []uint32, resume bool) error {
 	return nil
 }
 
+// sampleWavesLocked asks how much wave state the suspension just performed had
+// to save, and records whether the sandbox was executing.
+//
+// This is the activity signal the scheduler is given, and it is the only one on
+// this hardware that measures *execution* rather than *submission*.
+//
+// The obvious alternative -- the queue's read and write pointers -- measures
+// submission, and gets the important case backwards. For an AQL queue the
+// command processor advances the read pointer when it *consumes* a dispatch
+// packet, not while the kernel that packet launched is running, so a sandbox
+// executing one long kernel has wptr == rptr and no pointer movement at all.
+// Reading pointers would call it idle and hand its share away while it held
+// the whole device -- and since CWSR lets this package preempt mid-kernel, the
+// throttling would succeed. Measured with a single 10-second dispatch: wave
+// state said busy on 222 of 222 samples.
+//
+// The driver offers nothing better. KFD's per-process sysfs has cu_occupancy,
+// which would be ideal, but it is not implemented on RDNA: rocm-smi reports
+// "UNKNOWN" on both a Navi 32 and a gfx1103. DRM fdinfo carries full memory
+// accounting but no drm-engine-* lines, because KFD queues bypass the DRM
+// scheduler entirely. The SMI event stream is exceptional events only.
+//
+// The reading is one-sided. A queue with no waves resident is certainly not
+// executing, so idle is never wrong; busy can be missed, because a stream of
+// short kernels sometimes has nothing in flight at the instant of preemption
+// (measured: gpuburn read busy on 82% of samples). The scheduler needs three
+// consecutive idle periods before it yields a share, which makes a spurious
+// yield a 0.18^3 event, and one wrong period costs a window rather than
+// anything durable.
+//
+// Preconditions: ts.mu is held.
+func (ts *timeSlicer) sampleWavesLocked() {
+	if !ts.sessionOpenLocked() || len(ts.queues) == 0 {
+		return
+	}
+	ts.samples++
+	for id, ctlStackSize := range ts.queues {
+		// The ioctl is never told how large the buffer is, so the only bound
+		// on what it writes is the control stack the queue was created with.
+		// Anything smaller than that would be the driver writing past the end
+		// of Sentry memory.
+		if ctlStackSize == 0 {
+			continue
+		}
+		buf := ts.waveBuf(ctlStackSize)
+		params := amdgpu.KFDIoctlGetQueueWaveStateArgs{
+			CtlStackAddress: uint64(uintptr(unsafe.Pointer(&buf[0]))),
+			QueueID:         id,
+		}
+		_, err := kfdIoctlOn(ts.hostFD, amdgpu.AMDKFD_IOC_GET_QUEUE_WAVE_STATE, &params)
+		runtime.KeepAlive(buf)
+		if err != nil {
+			// Not worth a warning per period: a queue destroyed between the
+			// suspend and this call is an ordinary race.
+			log.Debugf("amdproxy: reading wave state of queue %d: %v", id, err)
+			continue
+		}
+		if params.SaveAreaUsedSize > 0 {
+			ts.busySamples++
+			return
+		}
+	}
+}
+
+// waveBuf returns a scratch buffer of at least n bytes for the control stack
+// the driver writes, growing the one it keeps rather than allocating each
+// period.
+//
+// Preconditions: ts.mu is held.
+func (ts *timeSlicer) waveBuf(n uint32) []byte {
+	if uint32(len(ts.ctlStack)) < n {
+		ts.ctlStack = make([]byte, n)
+	}
+	return ts.ctlStack
+}
+
+// kfdIoctlOn issues an ioctl on a host KFD descriptor. params must point to
+// Sentry memory.
+func kfdIoctlOn[Params any](hostFD int32, cmd amdgpu.KFDIoctl, params *Params) (uintptr, error) {
+	n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(hostFD), uintptr(cmd), uintptr(unsafe.Pointer(params)))
+	if errno != 0 {
+		return n, errno
+	}
+	return n, nil
+}
+
 func suspendedOrResumed(resume bool) string {
 	if resume {
 		return "resumed"

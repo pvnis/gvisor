@@ -58,8 +58,9 @@ func Filters() seccomp.SyscallRules {
 		amdgpu.AMDKFD_IOC_CREATE_QUEUE,
 		amdgpu.AMDKFD_IOC_SVM,
 		// Issued only by timeslice.go, against the Sentry's own KFD process.
-		// The sandbox cannot reach it: kfdFD.Ioctl does not dispatch it.
+		// The sandbox cannot reach either: kfdFD.Ioctl dispatches neither.
 		amdgpu.AMDKFD_IOC_DBG_TRAP,
+		amdgpu.AMDKFD_IOC_GET_QUEUE_WAVE_STATE,
 	} {
 		ioctlRules = append(ioctlRules, seccomp.PerArg{
 			seccomp.NonNegativeFD{},

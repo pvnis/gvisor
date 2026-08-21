@@ -109,10 +109,25 @@ type timeSlicer struct {
 	// that was already deciding which ids to name.
 	mu sync.Mutex `state:"nosave"`
 
-	// queues are the compute queues this sandbox has open, by KFD queue id.
-	// SDMA queues are deliberately absent: suspending those stalls copies
-	// without gating any compute.
-	queues map[uint32]struct{}
+	// queues are the compute queues this sandbox has open, by KFD queue id,
+	// each mapped to the size of the control stack the runtime gave it. SDMA
+	// queues are deliberately absent: suspending those stalls copies without
+	// gating any compute.
+	//
+	// The size is kept because GET_QUEUE_WAVE_STATE writes the control stack
+	// to a buffer without being told how big that buffer is, so the only safe
+	// bound is what the queue was created with.
+	queues map[uint32]uint32
+
+	// samples and busySamples count what the wave-state probe saw since the
+	// last report to the scheduler: how many times the sandbox's queues were
+	// suspended, and how many of those suspensions had waves to save.
+	samples     uint64
+	busySamples uint64
+
+	// ctlStack is scratch for the control stack GET_QUEUE_WAVE_STATE writes,
+	// kept so the probe does not allocate every period.
+	ctlStack []byte `state:"nosave"`
 
 	// hostFD is the descriptor the debug session was opened on, or -1. Any of
 	// the sandbox's KFD descriptors would do -- DBG_TRAP names its target by
@@ -159,7 +174,7 @@ func (ts *timeSlicer) init(weight uint64, schedFD int, id string) {
 	ts.weight = weight
 	ts.schedFD = schedFD
 	ts.id = id
-	ts.queues = make(map[uint32]struct{})
+	ts.queues = make(map[uint32]uint32)
 	ts.hostFD = -1
 	ts.dbgFD = -1
 	if !ts.enabled() {
@@ -203,13 +218,13 @@ func (ts *timeSlicer) currentGrant() gpusched.Grant {
 // DBG_TRAP_ENABLE requires RUNTIME_ENABLE to have succeeded first, and that is
 // something the ROCm runtime does during its own initialisation. Waiting for a
 // queue is a simple way of waiting for that to have happened.
-func (ts *timeSlicer) trackQueue(hostFD int32, queueID uint32, queueType uint32) {
+func (ts *timeSlicer) trackQueue(hostFD int32, queueID uint32, queueType uint32, ctlStackSize uint32) {
 	if !ts.enabled() || !isComputeQueueType(queueType) {
 		return
 	}
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	ts.queues[queueID] = struct{}{}
+	ts.queues[queueID] = ctlStackSize
 	if ts.hostFD < 0 {
 		ts.hostFD = hostFD
 	}
@@ -455,6 +470,9 @@ func (ts *timeSlicer) applyLocked(resume bool) {
 		ids = append(ids, id)
 	}
 	log.Debugf("amdproxy: %s %d queues", suspendOrResume(resume), len(ids))
+	if !resume {
+		defer ts.sampleWavesLocked()
+	}
 	if err := ts.setQueuesLocked(ids, resume); err != nil {
 		// Leave ts.suspended alone so the next period tries again. Failing to
 		// resume is the dangerous direction -- it would strand the sandbox --
@@ -516,25 +534,25 @@ func (ts *timeSlicer) follow() {
 			return
 		}
 		ts.setGrant(a.Grant())
-		// What is reported is whether the sandbox holds any compute queue, not
-		// how much work it submitted: submission never reaches the Sentry,
-		// which is the whole reason this gates the queue rather than the
-		// submission. The scheduler only asks whether the number is above
-		// zero, so this reads to it as "active".
-		//
-		// The cost is that a sandbox holding an open queue it is not using
-		// still looks busy and keeps its share, where nvproxy's fault count
-		// would have let it fall to the idle floor. Work is still conserved
-		// when a tenant *leaves*; it is not conserved while a tenant idles.
-		// Closing that gap means watching each queue's write pointer against
-		// its read pointer -- the AMD analogue of GP_PUT/GP_GET, and available
-		// without a driver patch, since CREATE_QUEUE hands both addresses to
-		// the kernel. Deliberately not attempted here: they are addresses in
-		// the sandbox's own memory, so reading them from a goroutine with no
-		// task context is its own problem.
 		ts.mu.Lock()
-		active := len(ts.queues) > 0
+		samples, busy := ts.samples, ts.busySamples
+		ts.samples, ts.busySamples = 0, 0
+		hasQueues := len(ts.queues) > 0
 		ts.mu.Unlock()
+
+		// Report whether the sandbox was *executing*, as measured by how much
+		// wave state its suspensions had to save -- see sampleWavesLocked.
+		//
+		// With no samples there is no evidence either way, which happens when
+		// the sandbox holds the whole period and is therefore never suspended.
+		// Fall back to "holds a queue" there: a sandbox that is not being
+		// stopped is not taking a window from anybody, and claiming it is idle
+		// would cost it its share for the three periods of the scheduler's
+		// hysteresis the moment a neighbour appeared.
+		active := hasQueues
+		if samples > 0 {
+			active = busy > 0
+		}
 		var submissions uint64
 		if active {
 			submissions = 1

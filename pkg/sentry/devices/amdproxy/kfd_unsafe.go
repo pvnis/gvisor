@@ -427,7 +427,7 @@ func kfdCreateQueue(ki *kfdIoctlState) (uintptr, error) {
 			return 0, err
 		}
 	}
-	ki.fd.dev.amdp.timeSlicer.trackQueue(ki.fd.hostFD, params.QueueID, params.QueueType)
+	ki.fd.dev.amdp.timeSlicer.trackQueue(ki.fd.hostFD, params.QueueID, params.QueueType, params.CtlStackSize)
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err
 	}

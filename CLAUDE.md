@@ -622,6 +622,48 @@ compresses the division toward equal. Fixed by shifting both edges, which keeps
 the windows tiling the period exactly once — `TestWindowsTileThePeriod` checks
 that no instant has two tenants running or none.
 
+### Telling a busy tenant from an idle one: wave state, not queue pointers
+
+The Sentry cannot count submissions — they never enter the kernel, which is the
+whole reason this gates the *queue*. So it asks how much wave state each
+suspension had to save: `GET_QUEUE_WAVE_STATE`'s `save_area_used_size`, taken
+right after `SUSPEND_QUEUES`, for free from a preemption already happening.
+
+**Do not use the queue read/write pointers.** They measure *submission*: the
+command processor advances RPTR when it *consumes* a dispatch packet, not while
+the kernel runs. A tenant executing one long kernel has `wptr == rptr`
+throughout and reads as idle — and since CWSR lets amdproxy preempt mid-kernel,
+throttling it to the 5 ms floor would actually succeed. Measured with a single
+31.8 s dispatch.
+
+| workload | wave state says busy | correct |
+| --- | --- | --- |
+| `gpuburn`, continuous short kernels | 82% of samples | busy |
+| `longkernel`, one 10 s dispatch | **100%** | busy |
+| `idler`, queue open, nothing submitted | **0%** | idle |
+
+The reading is **one-sided**: idle is never wrong; busy can be missed when a
+stream of short kernels has nothing in flight at the instant of preemption. The
+scheduler's `idleTicksBeforeYielding = 3` makes a spurious yield a 0.18³ event.
+Cost 0.1%.
+
+End to end under gVisor, `gpuburn` against a neighbour at equal weights:
+busy → 3391 iters/s (splits), `idler` → **6878** (reclaims the device),
+`longkernel` → **2960** (correctly does not reclaim).
+
+**Everything else the driver offers was checked and is unusable.**
+`cu_occupancy` in KFD's per-process sysfs would have been ideal — kernel-
+maintained, per-process, measures execution — but **it is not implemented on
+RDNA**: `rocm-smi --showpids` reports `UNKNOWN` on both sens1's Navi 32 and
+sensnucbox2's gfx1103. Worth re-checking on CDNA/MI, where it may exist. DRM
+fdinfo carries full memory accounting but **no `drm-engine-*` lines**, because
+KFD queues bypass the DRM scheduler entirely. The KFD SMI event stream is
+exceptional events only (vmfault, throttle, reset, migrate, evict/restore,
+process start/end) — nothing per-submission.
+
+`~/amdtest/src/{idler,longkernel}.hip` are the probes that pin this down, and
+`QSLICE_WAVESTATE=1` reports the signal from the interposer.
+
 **A lesson worth keeping: `desired()` and the transition test are two booleans
 and both were wrong.** The transition test was inverted (`suspended == !want`),
 which issues a resume for queues that were never suspended; the driver counts
