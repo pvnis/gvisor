@@ -94,7 +94,12 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 			// AddressSpace.MapFile() on singleMapThreshold-aligned chunks so
 			// we can check ctx.Killed() reasonably frequently.
 			const singleMapThreshold = 1 << 30
-			if pmaMapAR.Length() <= singleMapThreshold {
+			// A non-default platform effect marks a device file whose mmap handler
+			// is sensitive to the exact mapped range: NVIDIA UVM creates one VA
+			// range per host mmap() and rejects UVM_VALIDATE_VA_RANGE for a range
+			// split by this chunking, hanging cudaMallocManaged above 1 GiB. Map
+			// such ranges in one call so the device sees one contiguous mmap.
+			if platformEffect != memmap.PlatformEffectDefault || pmaMapAR.Length() <= singleMapThreshold {
 				if err := mm.as.MapFile(pmaMapAR.Start, pma.file, pseg.fileRangeOf(pmaMapAR), perms, platformEffect == memmap.PlatformEffectCommit); err != nil {
 					return err
 				}
