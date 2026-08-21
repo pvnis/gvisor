@@ -1,0 +1,238 @@
+# GPU memory overcommit — Phase 0 feasibility spike
+
+Spike for the GVM virtual-memory / overcommit plan
+(`~/.claude/plans/fuzzy-gathering-lamport.md`). Question S1: *does native UVM
+oversubscription survive the gVisor/KVM path?* Answer: **it does now — a one-line
+gVisor MM bug was found and fixed. Before the fix, managed memory worked up to
+exactly 1 GiB and livelocked above it (both platforms). After the fix, gVisor
+allocates 20 GiB of managed memory on the 12 GiB card and pages it, matching
+native. The P0 prerequisite is cleared.**
+
+## RESOLVED — root cause found and fixed (2026-08-21)
+
+**Root cause:** `pkg/sentry/mm/address_space.go` `mapASLocked()` splits any
+mapping longer than `singleMapThreshold = 1 << 30` (1 GiB) into 1 GiB-aligned
+chunks, calling `AddressSpace.MapFile()` once per chunk — purely so it can check
+`ctx.Killed()` between chunks. For an ordinary memory file that is harmless, but
+for `/dev/nvidia-uvm` **each `MapFile` is a separate host `mmap(2)`, and the UVM
+driver creates one `uvm_va_range` per mmap** (`uvm_api_validate_va_range`,
+`kernel-open/nvidia-uvm/uvm_va_range.c:758`, returns `NV_OK` only if a single
+va_range exactly covers `[base, base+length)`). So a >1 GiB managed region became
+2+ fragmented va_ranges, `UVM_VALIDATE_VA_RANGE` returned `NV_ERR_INVALID_ADDRESS`
+(0x1e) from the first call, and the CUDA runtime re-`MAP_FIXED`ed forever
+(~2.5M times). It is in the platform-independent MM layer, which is why systrap
+and KVM failed identically and native (one real `mmap` → one va_range) worked.
+
+**Fix:** don't chunk when a non-default platform effect marks a range-sensitive
+device mmap (the same signal the adjacent code already uses at the `mapAR = ar`
+special-case). One added condition:
+`if platformEffect != memmap.PlatformEffectDefault || pmaMapAR.Length() <= singleMapThreshold`.
+Regular file/anon mappings keep the chunking (killability preserved); proxied
+device mmaps (nvproxy/amdproxy/tpuproxy, which set `PlatformEffectPopulate` via
+`GenericProxyDeviceConfigureMMap`) are mapped in a single call so the device sees
+one contiguous mmap.
+
+**Verified:** 1536 MiB `cudaMallocManaged` now `DONE ok` (was infinite hang);
+20 GiB oversubscribed on the 12 GiB card pages at 2.9→6.8 GB/s (native: 2.0→6.7);
+`//pkg/sentry/mm:mm_test` passes; gofmt clean. This is a generic gVisor bug (any
+range-sensitive proxied device with a >1 GiB mmap), not GPU-slicing-specific —
+candidate for `UPSTREAM-NOTES.md`.
+
+---
+
+_Everything below is the investigation record that led here; the "leading
+hypotheses" in it were each tested and superseded by the root cause above._
+
+## Original question (superseded by the resolution above)
+
+Measured 2026-08-21 on **sensai** (RTX 5070 / Blackwell GB205, ghost open
+**610.43.02**, kernel 6.8.0-117, `--platform=kvm`). Harness:
+`/home/dmd/overcommit/uvm_oversub.cu` (managed-memory oversubscription probe,
+compiled to compute_90 PTX and JIT-forwarded to Blackwell) +
+`~/.claude/jobs/*/tmp/overcommit/`.
+
+## The one-paragraph result
+
+`cudaMallocManaged` **livelocks under gVisor+nvproxy on this stack** — it never
+returns, spinning a tight `ioctl(/dev/nvidia-uvm, UVM_VALIDATE_VA_RANGE)=0` →
+`mmap(MAP_FIXED, <same range>, /dev/nvidia-uvm)` → repeat loop (millions of
+iterations, ~4.4M strace lines, 100% CPU). The identical binary run **natively
+(runc)** allocates **20 GiB of managed memory on the 12 GiB card and runs to
+completion**, paging at ~2 GB/s cold and ~6.7 GB/s warm. So the card + 610
+driver support UVM oversubscription; gVisor is where it breaks, and it breaks at
+allocation, before any oversubscription or compute is involved.
+
+## What was ruled out (each with its own run)
+
+| hypothesis | test | verdict |
+| --- | --- | --- |
+| oversubscription-specific | 8000 MiB (**under** the 12 GiB card) | still hangs — not it |
+| the compute gate (submission revocation) | `iters=0`, alloc **only**, no kernel, no submission | still hangs — gate revokes only frontend maps; this path submits nothing |
+| a missing UVM ioctl | nvproxy registers 62 UVM ioctls incl. `MIGRATE`, `MAP_EXTERNAL_ALLOCATION`, `VALIDATE_VA_RANGE` | surface is complete — not a missing handler |
+| size / KVM tail-page | 2000 MiB also livelocks; native 20 GiB works | size-independent; not the `<6.13` tail-page `SIGBUS` bug |
+
+The strace fingerprint (the loop that never converges):
+```
+ioctl(0x9 /dev/nvidia-uvm, 0x48 /*UVM_VALIDATE_VA_RANGE*/, …) = 0   (725ns)
+mmap(0x7f7862000000, 0x7d000000, RW, SHARED|FIXED, /dev/nvidia-uvm, 0x7f7862000000) = 0x7f7862000000
+…repeated forever on the same address and length…
+```
+The managed mmap "succeeds" (returns the fixed address) and the validate
+"succeeds" (0), yet the CUDA runtime's populate loop never advances — it
+re-validates and re-maps the same range indefinitely. The mapping nvproxy hands
+back (via `uvm_mmap.go` `ConfigureMMap`/`AddMapping`/`Translate`) is evidently
+not what the runtime treats as "range now backed," under KVM where the app's
+guest VA and the host `nvidia-uvm` module's view of the range differ. Root cause
+inside nvproxy's UVM mmap path, not yet pinned to a line.
+
+## Native baseline (seeds S4)
+
+One tenant, 20 GiB managed on the 12 GiB card, native runc:
+- `cudaMallocManaged 20000MiB -> no error`; `mem_get_info` free=11603 total=11790 MiB.
+- First sweep (cold, pages in ~8 GiB): 10.3 s → **2.0 GB/s**. Second: 13.0 s → 1.6 GB/s.
+- Warm steady state: 3.06–3.12 s → **~6.7 GB/s**, stable across iters, `DONE ok`.
+
+This reproduces GVM's motivating observation directly: native UVM paging is
+**slow** (their measured 3.4 of 16 GB/s PCIe) — the exact inefficiency GVM's
+huge-page + overlapped-swap work targets.
+
+## Root cause, characterized (follow-up dig into `uvm_mmap.go`)
+
+The livelock is **not** "managed memory is broken" — it is a clean, bisected
+**1 GiB threshold**:
+
+| managed alloc | result | placement |
+| --- | --- | --- |
+| ≤ **1024 MiB** (64/256/512/1024) | works end to end (alloc + kernel touch + `DONE ok`) | low VA, `0x2xx000000` |
+| ≥ **1025 MiB** (1025/1152/1280/1536/2000) | livelocks in `cudaMallocManaged` | high VA, `0x7f…` |
+
+The boundary is exactly 1 GiB (1024 MiB works, **1025 MiB** does not — off by one
+MiB). 1 GiB is the GMMU's page-directory coverage with 2 MB big pages
+(512 × 2 MB), and CUDA's allocator switches large managed allocations to their
+own **high-VA region**: the 1025 MiB case maps `0x7f671e000000`, length
+`0x40100000` (=1025 MiB), offset==addr, and re-`mmap`+`UVM_VALIDATE_VA_RANGE`es
+that single region ~1.6M times without converging. Small allocations stay at low
+VAs (`0x206c00000`) and validate once.
+
+What the code does right, verified: the uvmFD sets `RequireAddrEqualsFileOffset`
+(`uvm.go:66`) and `GenericProxyDeviceConfigureMMap` forces `PlatformEffectPopulate`
++ `RequirePlatformEffect`, so the host `/dev/nvidia-uvm` mapping is established
+eagerly at host addr == file offset == the app VA (`mapInternalGap` uses
+`MAP_FIXED_NOREPLACE` at `newRange.Start`). Setup ioctls all succeed
+(`UVM_INITIALIZE`, `UVM_MM_INITIALIZE`, `UVM_ALLOC_SEMAPHORE_POOL`,
+`UVM_MAP_EXTERNAL_ALLOCATION`), the app `mmap` returns the requested address, and
+no `failed to map range`/`EEXIST` warning is logged.
+
+**Collision hypothesis — TESTED AND KILLED (instrumented build, 2026-08-21).**
+The first hypothesis was that `RequireAddrEqualsFileOffset` makes the Sentry map
+the host uvm fd at host addr == the app's VA, and that a *high* VA (`0x7f…`)
+collides with the Sentry's own address space so the `MAP_FIXED_NOREPLACE` in
+`mapInternalGap` EEXISTs. I instrumented `mapInternalGap`
+(`fsutil/mmap_precise_file.go`) and `uvmFD.AddMapping`/`Translate`
+(`nvproxy/uvm_mmap.go`), rebuilt runsc, and ran the 1536 MiB case. Result:
+
+- **`mapInternalGap` is called ZERO times.** The host `MAP_FIXED_NOREPLACE` at
+  addr==offset is **not on the populate path at all** under `--platform=kvm`. So
+  `RequireAddrEqualsFileOffset` and any Sentry address-space collision are
+  irrelevant to this livelock — the hypothesis is disproven. (`MapInternal` is
+  only used for Sentry buffered I/O, which this path never triggers.)
+- **What the livelock actually is:** `uvmFD.AddMapping` + `Translate` for the
+  managed region `0x7fa270000000-0x7fa2d0000000` (exactly 1536 MiB) are called
+  **~2.5 million times**, each `AddMapping` reporting the **full 1536 MiB as
+  newly-mapped** (`newlyMappedBytes=1610612736` every time). That is the guest
+  application re-`MAP_FIXED`-ing the same high-VA range in a tight loop —
+  RemoveMapping (release) + AddMapping (re-charge) churn — because
+  `UVM_VALIDATE_VA_RANGE` never confirms the range. The small setup region
+  (`0x206c00000`, 2 MB) is `AddMapping`'d once and proceeds.
+
+**The platform is `systrap`, not KVM (corrected).** sensai's GPU sandboxes run
+`--platform=systrap` — no `--platform` in `/etc/containerd/runsc.toml` (default),
+and `dmd` is not in the `kvm` group; the failing 1536 MiB pod's boot log says
+`Platform: systrap`. So this livelock is a **systrap** behavior, and my earlier
+"KVM populate" phrasing was wrong.
+
+**Revised leading hypothesis:** under systrap the application runs in a **stub
+process**, and the Sentry services its `/dev/nvidia-uvm` mmap by mapping the host
+uvm fd into the *stub's* address space — while the UVM context itself (the fd,
+`UVM_INITIALIZE`, the ioctls) belongs to the **Sentry**. For small / low-VA
+managed regions that split is tolerated and works; for a >1 GiB region CUDA places
+at a high VA (`0x7f…`), the CPU mapping the stub holds and the UVM context the
+Sentry holds evidently don't line up the way `UVM_VALIDATE_VA_RANGE` needs, so it
+never confirms and the app re-`MAP_FIXED`es forever. This is the **same class** as
+the already-recorded systrap limitation for AMD KFD — "`/dev/kfd` mappings are
+impossible on systrap … KFD binds each mapping to the process holding the KFD
+context, and systrap maps from a stub process, so `mmap` returns `EINVAL`; KVM is
+the platform to use" (CLAUDE.md Next #6 / task #18) — except UVM degrades
+*gradually* (small managed works, large livelocks) rather than failing outright.
+
+**KVM does NOT avoid it — TESTED, hypothesis disproven (2026-08-21).** Enabled
+`allow-flag-override` in `runsc.toml` (then reverted), forced
+`dev.gvisor.flag.platform: "kvm"` on the pods, and confirmed `Platform: kvm` in
+the boot log. Result: identical to systrap — **512 MiB works** (`DONE ok`, kernel
+touch, 280 GB/s warm) but **1536 MiB livelocks** (no alloc return, GPU idle). The
+1 GiB threshold is **platform-independent**. So the systrap stub-process reasoning
+was wrong: the bug is *not* the platform's populate/mapping mechanism (systrap
+stub vs KVM Sentry), because both fail identically at the same boundary.
+
+**Where the bug actually is.** It is common to both platforms yet absent
+natively, so it is in **nvproxy's UVM handling** (the platform-independent ioctl
+interception) or the ghost 610 driver — triggered by the >1 GiB / high-VA managed
+region. Native (runc) maps 20 GiB fine, so the driver itself handles large managed
+regions; something nvproxy does or omits for the big region makes the forwarded
+`UVM_VALIDATE_VA_RANGE` never confirm (it returns ioctl 0, but the range isn't
+GPU-valid), so CUDA re-`MAP_FIXED`es forever on both platforms. The 1 GiB boundary
+= GMMU PDE coverage (512 × 2 MB big pages), where CUDA switches large managed
+allocations to a distinct high-VA arena and a different ioctl pattern (multiple /
+larger `UVM_MAP_EXTERNAL_ALLOCATION` / `UVM_CREATE_EXTERNAL_RANGE` calls). The next
+dig is that forwarded ioctl pattern for the >1 GiB region — compare the exact UVM
+ioctl/param sequence a working ≤1 GiB alloc issues against a failing >1 GiB one,
+in nvproxy — since platform is now ruled out.
+
+## S2 / S3 status
+
+Blocked behind the S1 livelock. S2 (does our own cap refuse the oversubscribing
+reservation in `memquota.go:reserveUVMVA` before the driver) and S3 (is native
+eviction global vs per-tenant) both require a *working* managed allocation under
+gVisor to measure, which we do not yet have.
+
+## Implication for the plan — a prerequisite appears
+
+The plan's managed-first Phase 1 assumed we could lean on the driver's **native
+UVM eviction** and add only Sentry policy. That assumption fails at step 0:
+**managed memory does not function under gVisor here.** So before any overcommit
+policy work, there is a hard prerequisite:
+
+- **P0 (new): make `cudaMallocManaged` work under gVisor+nvproxy on 610.** Root-
+  cause the `UVM_VALIDATE_VA_RANGE`/`mmap` livelock in `uvm_mmap.go` (+ the UVM
+  fault/validate path). Depth unknown — could be a small mmap-semantics fix, or a
+  genuine gVisor/KVM UVM-fault incompatibility (the GPU raises replayable faults
+  serviced by the host module against the Sentry's mm, not the guest app's).
+
+Only after P0 do the original Phase-1 items (relax `admitLocked` for
+oversubscription, split `gmem`/`hmem`, dynamic limit) become testable. And note
+the strategic squeeze the spike sharpens: **neither** overcommit path is free
+under gVisor today — managed memory is broken (P0), and non-managed `cudaMalloc`
+is pinned and unpageable (the deep Phase-3 driver item). Overcommit needs one of
+those two doors opened first.
+
+**Go/no-go:** NO-GO on managed-first as written until P0 is understood. The cheap
+spike did its job — it found the blocker before a line of overcommit code.
+Recommended next step: a focused root-cause of the UVM mmap livelock (is it
+nvproxy's `Translate`/`AddMapping` for MAP_FIXED UVM ranges, or the
+validate/fault path under KVM?), which also tells us whether managed memory can
+work under gVisor at all — a prerequisite worth knowing independent of overcommit.
+
+## Reproduce
+
+```
+# build (nvcc via a k3s devel-image pod, compute_90 PTX)
+nvcc -O3 -gencode arch=compute_90,code=compute_90 uvm_oversub.cu -o uvm_oversub
+# native: works
+runtimeClassName: nvidia ; command: /work/uvm_oversub 20000 8 nat   -> DONE ok
+# gVisor: livelocks in cudaMallocManaged (any size), namespace unlabelled so nvproxy uncapped
+runtimeClassName: gvisor ; command: /work/uvm_oversub 2000 0 strc   -> hangs; strace shows the loop
+```
+Spike pods: `~/.claude/jobs/*/tmp/overcommit/spikepod.sh` (gVisor, ns `overcommit`,
+deliberately not `gvisor`-labelled so the webhook injects no cap). Enable
+`dev.gvisor.flag.strace: "true"` + `strace-syscalls: "ioctl,mmap,futex"` to see
+the loop.
