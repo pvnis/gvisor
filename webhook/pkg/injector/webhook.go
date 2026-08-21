@@ -239,6 +239,7 @@ func updatePod(pod *v1.Pod) {
 	// Have runsc enforce whatever share of a GPU the pod was scheduled
 	// against, and stand down the limiter that runs inside the container.
 	gpushare.InjectMemoryLimit(pod)
+	gpushare.InjectHostSwapLimit(pod)
 	gpushare.InjectAMDMemoryLimit(pod)
 	gpushare.InjectWeight(pod)
 	gpushare.StandDownHAMi(pod)

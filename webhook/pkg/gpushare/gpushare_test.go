@@ -115,6 +115,53 @@ func TestInjectGPUMemoryLimitKeepsLower(t *testing.T) {
 	}
 }
 
+// TestInjectHostSwapLimit tests that a pod with both a GPU memory request and a
+// host-swap-headroom annotation gets the hmem flag, in bytes.
+func TestInjectHostSwapLimit(t *testing.T) {
+	pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{gpuContainer(2048)}}}
+	pod.Annotations = map[string]string{HostSwapRequestAnnotation: "4096"}
+	InjectHostSwapLimit(&pod)
+	if got, want := pod.Annotations[HostSwapLimitAnnotation], "4294967296"; got != want {
+		t.Errorf("hmem annotation = %q, want %q", got, want)
+	}
+}
+
+// TestInjectHostSwapLimitRequiresResidentQuota tests that host-swap headroom is
+// not injected for a pod that requested no GPU memory: there is no resident cap
+// to oversubscribe.
+func TestInjectHostSwapLimitRequiresResidentQuota(t *testing.T) {
+	pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{gpuContainer(0)}}}
+	pod.Annotations = map[string]string{HostSwapRequestAnnotation: "4096"}
+	InjectHostSwapLimit(&pod)
+	if got, ok := pod.Annotations[HostSwapLimitAnnotation]; ok {
+		t.Errorf("hmem annotation = %q, want none without a GPU memory request", got)
+	}
+}
+
+// TestInjectHostSwapLimitAbsent tests that a pod without the request annotation
+// keeps its hard resident cap (no hmem flag injected).
+func TestInjectHostSwapLimitAbsent(t *testing.T) {
+	pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{gpuContainer(2048)}}}
+	InjectHostSwapLimit(&pod)
+	if got, ok := pod.Annotations[HostSwapLimitAnnotation]; ok {
+		t.Errorf("hmem annotation = %q, want none", got)
+	}
+}
+
+// TestInjectHostSwapLimitNarrowsHigher tests that a pod cannot grant itself more
+// host-swap headroom than requested by pre-setting the flag higher.
+func TestInjectHostSwapLimitNarrowsHigher(t *testing.T) {
+	pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{gpuContainer(2048)}}}
+	pod.Annotations = map[string]string{
+		HostSwapRequestAnnotation: "4096",
+		HostSwapLimitAnnotation:   "8589934592", // 8 GiB, higher than the 4 GiB requested
+	}
+	InjectHostSwapLimit(&pod)
+	if got, want := pod.Annotations[HostSwapLimitAnnotation], "4294967296"; got != want {
+		t.Errorf("hmem annotation = %q, want it narrowed to %q", got, want)
+	}
+}
+
 // TestInjectGPUMemoryLimitNarrowsHigher tests the case the clamp exists for: a
 // pod that writes itself a larger limit than it was scheduled against. The pod
 // spec is usually written by the workload being limited, so a limit it can

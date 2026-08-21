@@ -64,6 +64,19 @@ const (
 	// subject to the same ceiling as MemoryLimitAnnotation.
 	WeightAnnotation = "dev.gvisor.flag.nvproxy-gpu-weight"
 
+	// HostSwapRequestAnnotation is the annotation by which a pod asks to
+	// oversubscribe GPU memory: a number of mebibytes of host memory the driver
+	// may page resident CUDA unified memory out to, letting the pod reserve that
+	// much more unified memory than the device-resident quota it was scheduled
+	// for. It is host memory rather than a GPU resource, so it is requested by
+	// annotation rather than scheduled by HAMi.
+	HostSwapRequestAnnotation = "gpu.gvisor.dev/hmem-mib"
+
+	// HostSwapLimitAnnotation is the annotation runsc reads for the host-swap
+	// headroom, in bytes. It is subject to the same ceiling as
+	// MemoryLimitAnnotation: a pod may lower it but not raise it.
+	HostSwapLimitAnnotation = "dev.gvisor.flag.nvproxy-gpu-hmem-limit"
+
 	// AMDMemoryResourceName is the extended resource by which a container
 	// requests AMD GPU memory. Despite the name, the AMD device plugin
 	// advertises and accounts VRAM in fixed-size *units*, not in mebibytes: a
@@ -119,6 +132,28 @@ func InjectAMDMemoryLimit(pod *v1.Pod) {
 	limit := peak * mibPerAMDUnit * bytesPerMiB
 	setAnnotation(pod, AMDMemoryLimitAnnotation, narrow(pod, AMDMemoryLimitAnnotation, limit))
 	log.Debugf("Injected AMD GPU memory limit of %d MiB from %q requests", peak*mibPerAMDUnit, AMDMemoryResourceName)
+}
+
+// InjectHostSwapLimit lets a pod oversubscribe GPU memory: the value of
+// HostSwapRequestAnnotation becomes the host-swap headroom by which the pod's
+// CUDA unified memory may exceed its device-resident quota, with the driver
+// paging the excess out to host memory.
+//
+// It is only meaningful alongside a device-resident quota -- there is no
+// resident cap to oversubscribe without one -- so it is injected only for a pod
+// that requested GPU memory, and left off otherwise.
+func InjectHostSwapLimit(pod *v1.Pod) {
+	if peakRequest(pod, MemoryResourceName) <= 0 {
+		return
+	}
+	mib, err := strconv.ParseInt(strings.TrimSpace(pod.Annotations[HostSwapRequestAnnotation]), 10, 64)
+	if err != nil || mib <= 0 {
+		// No oversubscription requested; leave the hard resident cap in place.
+		return
+	}
+	// Mebibytes of host memory cannot express a total large enough to overflow.
+	setAnnotation(pod, HostSwapLimitAnnotation, narrow(pod, HostSwapLimitAnnotation, mib*bytesPerMiB))
+	log.Debugf("Injected GPU host-swap headroom of %d MiB from %q", mib, HostSwapRequestAnnotation)
 }
 
 // InjectWeight has runsc give the pod the share of GPU compute it was
