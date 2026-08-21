@@ -664,6 +664,76 @@ process start/end) — nothing per-submission.
 `~/amdtest/src/{idler,longkernel}.hip` are the probes that pin this down, and
 `QSLICE_WAVESTATE=1` reports the signal from the interposer.
 
+### Adversarial multi-tenant: the compute share holds, unlike NVIDIA's
+
+`~/amdtest/adversary.sh` runs N well-behaved tenants and one hostile one under
+the Sentry-side slicer; `src/evilburn.hip` is the attacker. This is the AMD
+counterpart to `NVIDIA-COMPUTE-ISOLATION.md`'s gpu0-a section, where the
+compute *share* is the one boundary that does **not** hold: a hostile tenant
+submitting through cuBLAS rings a doorbell nvproxy cannot revoke and takes an
+equal split whatever weight it was given (weight-25 attacker vs weight-75
+victim measured 1:1).
+
+**On AMD it holds.** The lever is the queue lifecycle, not the submission path,
+so how the attacker submits is irrelevant.
+
+| the attack | result |
+| --- | --- |
+| `DBG_TRAP TRAP_ENABLE` on itself | **refused** (EINVAL) — amdproxy does not dispatch DBG_TRAP |
+| `DBG_TRAP RESUME_QUEUES` over guessed ids | **refused** (EINVAL) |
+| `CREATE_PROCESS` for a second KFD context | **refused** (EINVAL) |
+| `UPDATE_QUEUE queue_percentage=100` | allowed, and does not lift the suspension — the two mechanisms share no state. It corrupts the caller's *own* ring, since the struct carries `ring_base_address`/`ring_size` and a container does not know its own |
+| `RUNTIME_ENABLE(disable)` to dismantle the session | allowed, and **stops the attacker's own GPU work**. Identical with slicing off entirely, so it is the driver halting the process, not an escape |
+
+| configuration | good : adversary | adversary's share |
+| --- | --- | --- |
+| 2 good @300, evil @100 | **3.00:1** (asks 3:1) | 14.3% vs 14.3% entitled |
+| 3 good @200, evil @100 | **1.93:1** (asks 2:1) | 14.7% vs 14.3% entitled |
+| before vs after attacking | ratio 0.996 | **CONTAINED** |
+| an *honest* tenant in its place | 953.3 iters/s | adversary got 947.0 — **within 0.6%** |
+
+That last row is the statement: the attacker gains nothing over a well-behaved
+tenant of the same weight.
+
+**Measure the contended interval.** The adversary's own before/after verdict
+read `ESCAPED` at ratio 1.187 purely because the good tenants finished first
+and left it alone at the end. Same trap as `tslice.sh -t`.
+
+### Slicing and `--amdproxy-share-kfd-vm` do not compose, and vLLM needs both
+
+**This blocks the vLLM half of the adversarial test.** A KFD debug session on a
+sandbox whose processes share one KFD context kills the *second* process to
+initialise the ROCm runtime. Measured: vLLM's API server came up, its engine
+core died with SIGSEGV, reported only as
+`Engine core initialization failed ... {'EngineCore_DP0': -11}` — nothing in
+`dmesg`, nothing in the Sentry log.
+
+Bisected precisely:
+
+| configuration | result |
+| --- | --- |
+| vLLM, sharing on, **no** scheduler socket | serves, 92 s to ready |
+| vLLM, sharing on, socket set | engine core SIGSEGV |
+| `gpuburn` (single process), sharing on, socket set | **fine**, 6869 iters/s |
+
+So it is neither sharing nor slicing alone — it is a second process joining a
+context a debugger is attached to. Opening the session earlier helps but does
+not fix it: doing it at the first `CREATE_QUEUE` attaches to a runtime already
+`ENABLED_BUSY` (`runtime_state=2`), which is ROCgdb's attach-to-a-live-process
+path and expects a `SEND_RUNTIME_EVENT` answer nothing here gives; moving it to
+just after `RUNTIME_ENABLE` gets `runtime_state=1` and still dies.
+
+Likely mechanism, **not confirmed**: `RUNTIME_ENABLE` is answered locally for
+every process after the first (the driver gives `EBUSY` otherwise, which is why
+`runtimeShare` exists), so a later process never learns from the driver that a
+debugger is attached and sets itself up as though none were.
+
+**amdproxy now refuses the combination** rather than letting a workload die:
+with `--amdproxy-share-kfd-vm` set, the sandbox is not sliced and says so
+loudly, keeping its memory quota and CU mask. Multi-process GPU workloads —
+vLLM above all — are therefore **not time-sliced today**. This is the largest
+open gap in the AMD half.
+
 **A lesson worth keeping: `desired()` and the transition test are two booleans
 and both were wrong.** The transition test was inverted (`suspended == !want`),
 which issues a resume for queues that were never suspended; the driver counts

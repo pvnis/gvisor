@@ -260,11 +260,23 @@ func TestOnlyComputeQueuesAreSliced(t *testing.T) {
 	}
 }
 
+// TestShareKFDVMDisablesSlicing tests that the two features refuse to combine.
+// A debug session on a shared KFD context kills the second process in the
+// sandbox to initialise the ROCm runtime, so the combination has to be refused
+// where it can still be reported rather than discovered as a crash.
+func TestShareKFDVMDisablesSlicing(t *testing.T) {
+	var ts timeSlicer
+	ts.init(100, 7, "cid", true)
+	if ts.enabled() {
+		t.Error("slicing is on for a sandbox sharing one KFD address space")
+	}
+}
+
 // TestDisabledSlicerIsInert tests that a sandbox with no scheduler connection
 // takes none of this path, since that is every sandbox by default.
 func TestDisabledSlicerIsInert(t *testing.T) {
 	var ts timeSlicer
-	ts.init(0, -1, "")
+	ts.init(0, -1, "", false)
 	if ts.enabled() {
 		t.Fatal("a sandbox without a scheduler connection is being sliced")
 	}

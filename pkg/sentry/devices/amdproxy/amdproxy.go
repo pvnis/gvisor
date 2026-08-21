@@ -123,7 +123,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	amdp.renderShare.init(opts.ShareKFDVM)
 	amdp.runtimeShare.init(opts.ShareKFDVM)
 	amdp.eventShare.init(opts.ShareKFDVM)
-	amdp.timeSlicer.init(opts.SchedulerWeight, opts.SchedulerFD, opts.ContainerID)
+	amdp.timeSlicer.init(opts.SchedulerWeight, opts.SchedulerFD, opts.ContainerID, opts.ShareKFDVM)
 	if opts.GPUMemoryLimit != 0 {
 		log.Infof("amdproxy: GPU memory limited to %d bytes", opts.GPUMemoryLimit)
 	}

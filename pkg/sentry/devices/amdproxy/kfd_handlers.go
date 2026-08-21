@@ -126,6 +126,11 @@ func kfdRuntimeEnable(ki *kfdIoctlState) (uintptr, error) {
 		}
 		return n, err
 	}
+	if enabling {
+		// The one moment at which a debug session may be opened: the debug
+		// runtime is up, and has not yet become busy. See openSession.
+		ki.fd.dev.amdp.timeSlicer.openSession(ki.fd.hostFD)
+	}
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err
 	}

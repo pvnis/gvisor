@@ -145,10 +145,6 @@ type timeSlicer struct {
 	// whether it has anything to undo.
 	suspended bool
 
-	// warnedNoSession keeps a sandbox whose debug session cannot be opened
-	// from logging once per queue it creates.
-	warnedNoSession bool
-
 	// running is whether run() has been started, and stop closes to end it.
 	running bool
 	stop    chan struct{} `state:"nosave"`
@@ -170,10 +166,36 @@ func (ts *timeSlicer) sessionOpenLocked() bool {
 	return ts.dbgFD >= 0 && ts.hostFD >= 0
 }
 
-func (ts *timeSlicer) init(weight uint64, schedFD int, id string) {
+func (ts *timeSlicer) init(weight uint64, schedFD int, id string, shareKFDVM bool) {
 	ts.weight = weight
 	ts.schedFD = schedFD
 	ts.id = id
+	if schedFD >= 0 && shareKFDVM {
+		// Slicing and address-space sharing do not currently compose, and the
+		// way they fail is not survivable, so refuse the combination here
+		// rather than let a workload die.
+		//
+		// A debug session on a sandbox whose processes share one KFD context
+		// kills the second process to initialise the ROCm runtime. Measured
+		// with vLLM: the API server came up, the engine core reached its own
+		// initialisation and died with SIGSEGV, reported only as
+		// "{'EngineCore_DP0': -11}", with nothing in dmesg and nothing in the
+		// Sentry log. The same workload runs when the session is not opened,
+		// and a *single*-process workload runs with sharing on and a session
+		// open, so it is neither sharing nor slicing alone -- it is a second
+		// process joining a context a debugger is attached to.
+		//
+		// The likely mechanism, not confirmed: RUNTIME_ENABLE is answered
+		// locally for every process after the first (the driver gives EBUSY
+		// otherwise, which is why runtimeShare exists), so a later process
+		// never learns from the driver that a debugger is attached, and sets
+		// itself up as though none were.
+		log.Warningf("amdproxy: NOT time-slicing this sandbox: --amdproxy-share-kfd-vm is set, " +
+			"and a KFD debug session on a shared context kills the second process to initialise " +
+			"the ROCm runtime. The sandbox keeps its memory quota and CU mask; it will not be " +
+			"held to a share of GPU time")
+		ts.schedFD = -1
+	}
 	ts.queues = make(map[uint32]uint32)
 	ts.hostFD = -1
 	ts.dbgFD = -1
@@ -211,13 +233,60 @@ func (ts *timeSlicer) currentGrant() gpusched.Grant {
 	return gpusched.Grant{}
 }
 
-// trackQueue records a compute queue, and starts slicing if this is the first
-// one. Called after CREATE_QUEUE has succeeded.
+// openSession starts slicing this sandbox, and must be called immediately
+// after its first RUNTIME_ENABLE has succeeded.
 //
-// The debug session is opened here rather than at registration because
-// DBG_TRAP_ENABLE requires RUNTIME_ENABLE to have succeeded first, and that is
-// something the ROCm runtime does during its own initialisation. Waiting for a
-// queue is a simple way of waiting for that to have happened.
+// The timing is the whole point, and it is not a detail. DBG_TRAP_ENABLE
+// requires RUNTIME_ENABLE to have happened, so the session cannot be opened
+// before this; and it must not be opened much later, because attaching to a
+// runtime that has become *busy* is a different operation. The driver reports
+// which case it is in the runtime_state it returns: 1 is ENABLED, 2 is
+// ENABLED_BUSY, and attaching to a busy runtime is ROCgdb's attach-to-a-live-
+// process path, where the driver expects the debugger to answer a runtime
+// event with SEND_RUNTIME_EVENT. Nothing here answers it.
+//
+// Measured: opening the session lazily at the first CREATE_QUEUE works for a
+// single-process workload, whose runtime is still merely ENABLED by then, and
+// kills a multi-process one. vLLM's engine core reached CREATE_QUEUE with the
+// runtime already ENABLED_BUSY, the session opened, and the process died with
+// SIGSEGV within milliseconds -- reported by vLLM only as "Engine core
+// initialization failed ... {'EngineCore_DP0': -11}", with nothing in dmesg.
+//
+// Opening it here also puts the session before every queue the sandbox will
+// ever create, which is the case EC_QUEUE_NEW exists for and the one the
+// driver is built around.
+func (ts *timeSlicer) openSession(hostFD int32) {
+	if !ts.enabled() {
+		return
+	}
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.running {
+		return
+	}
+	if ts.hostFD < 0 {
+		ts.hostFD = hostFD
+	}
+	if err := ts.enableSessionLocked(); err != nil {
+		// This sandbox is not sliced. That is a loss of division, not of
+		// isolation -- its memory quota and CU mask are untouched, and those
+		// are what bound what it can reach -- so say so loudly and let the
+		// workload run rather than failing it to enforce a share.
+		log.Warningf("amdproxy: this sandbox will NOT be time-sliced: %v", err)
+		return
+	}
+	// Enabling debug takes the process's queues through a suspend, and does
+	// not hand them back running. There are none yet, but the bookkeeping has
+	// to start from stopped so that the first window opens them.
+	ts.suspended = true
+	ts.running = true
+	ts.stop = make(chan struct{})
+	ts.done = make(chan struct{})
+	go ts.run()
+}
+
+// trackQueue records a compute queue so that it is suspended along with the
+// rest. Called after CREATE_QUEUE has succeeded.
 func (ts *timeSlicer) trackQueue(hostFD int32, queueID uint32, queueType uint32, ctlStackSize uint32) {
 	if !ts.enabled() || !isComputeQueueType(queueType) {
 		return
@@ -227,34 +296,6 @@ func (ts *timeSlicer) trackQueue(hostFD int32, queueID uint32, queueType uint32,
 	ts.queues[queueID] = ctlStackSize
 	if ts.hostFD < 0 {
 		ts.hostFD = hostFD
-	}
-	if !ts.running {
-		if err := ts.enableSessionLocked(); err != nil {
-			// Slicing is off for this sandbox until a later queue succeeds in
-			// opening the session -- the usual reason to fail is that the
-			// runtime has not enabled the debug runtime yet. This is a loss of
-			// division, not of isolation: the memory quota and the CU mask are
-			// unaffected, and both are what bound what the sandbox can reach.
-			// Failing the queue instead would break a workload to enforce a
-			// share, which is the wrong trade.
-			if !ts.warnedNoSession {
-				ts.warnedNoSession = true
-				log.Warningf("amdproxy: cannot time-slice this sandbox yet: %v", err)
-			}
-			return
-		}
-		// Opening a session activates debug on the process's queues, and the
-		// driver takes them through a suspend to do it. It does not hand them
-		// back running, so the state to assume here is stopped: the resume
-		// below is what actually starts them. Assuming they were left running
-		// is silent -- the queues never start, and the sandbox hangs with no
-		// error anywhere, which is what the interposer this was ported from
-		// never hit because it resumed on its own first window.
-		ts.suspended = true
-		ts.running = true
-		ts.stop = make(chan struct{})
-		ts.done = make(chan struct{})
-		go ts.run()
 	}
 	// Consume the queue-new exception this queue was just flagged with.
 	//
