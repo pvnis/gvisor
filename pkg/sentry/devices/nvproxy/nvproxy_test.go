@@ -257,6 +257,10 @@ func TestFilterCapabilities(t *testing.T) {
 			nvgpu.UVM_TOOLS_READ_PROCESS_MEMORY: struct{}{},
 			// Similar deal for writing to UVM memory-mapped data.
 			nvgpu.UVM_TOOLS_WRITE_PROCESS_MEMORY: struct{}{},
+			// UVM_SET_GMEM_LIMIT is issued by nvproxy itself (setUVMGmemLimit)
+			// to program the driver's per-tenant eviction cap; it is never
+			// accepted from the application.
+			nvgpu.UVM_SET_GMEM_LIMIT: struct{}{},
 		}
 	)
 

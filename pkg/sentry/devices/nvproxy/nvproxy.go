@@ -147,6 +147,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	}
 	nvp.memAcct.gpuLimit = opts.GPUMemoryLimit
 	nvp.memAcct.hmemLimit = opts.GPUHostSwapLimit
+	nvp.gmemGroupID = gmemGroupIDFromContainerID(opts.ContainerID)
 	nvp.maxTimesliceUs = opts.MaxTimesliceUs
 	nvp.setTimesliceUs = opts.SetTimesliceUs
 	nvp.setInterleaveLevel = opts.SetInterleaveLevel
@@ -356,6 +357,14 @@ type nvproxy struct {
 	// frontendDevice and frontendFD in the sandbox, so it accounts the
 	// sandbox's aggregate usage across all of its processes.
 	memAcct memAccount
+
+	// gmemGroupID identifies this sandbox as one tenant to the driver's
+	// per-tenant UVM eviction. Every process in the sandbox opens its own UVM
+	// va_space; passing them all the same group id (via UVM_SET_GMEM_LIMIT) has
+	// the driver account their device residency together, so a tenant cannot
+	// multiply its protected residency by forking. Derived from the container
+	// ID, so it is stable for this sandbox and distinct from other sandboxes'.
+	gmemGroupID uint64
 
 	fdsMu       fdsMutex `state:"nosave"`
 	frontendFDs map[*frontendFD]struct{}

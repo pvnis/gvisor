@@ -230,7 +230,10 @@ func setUVMGmemLimit(ui *uvmIoctlState) {
 	if limit == 0 {
 		return
 	}
-	ioctlParams := nvgpu.UVM_SET_GMEM_LIMIT_PARAMS{Limit: limit}
+	ioctlParams := nvgpu.UVM_SET_GMEM_LIMIT_PARAMS{
+		Limit: limit,
+		Group: ui.fd.dev.nvp.gmemGroupID,
+	}
 	sub := &uvmIoctlState{
 		fd:  ui.fd,
 		ctx: ui.ctx,
@@ -240,6 +243,27 @@ func setUVMGmemLimit(ui *uvmIoctlState) {
 	if _, err := uvmIoctlInvoke(sub, &ioctlParams); err != nil {
 		ui.ctx.Warningf("nvproxy: failed to set UVM gmem limit to %d bytes: %v", limit, err)
 	}
+}
+
+// gmemGroupIDFromContainerID derives the driver-side tenant group id for a
+// sandbox from its container ID, via FNV-1a. All processes of the sandbox share
+// this id so the driver accounts their UVM device residency together; different
+// sandboxes get different ids. Non-zero, since the driver reads zero as "no
+// group".
+func gmemGroupIDFromContainerID(containerID string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := 0; i < len(containerID); i++ {
+		h ^= uint64(containerID[i])
+		h *= prime64
+	}
+	if h == 0 {
+		h = 1
+	}
+	return h
 }
 
 func uvmMMInitialize(ui *uvmIoctlState) (uintptr, error) {

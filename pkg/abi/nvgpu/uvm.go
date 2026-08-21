@@ -850,6 +850,7 @@ func (p *UVM_VALIDATE_VA_RANGE_PARAMS) SetStatus(status uint32) {
 type UVM_SET_GMEM_LIMIT_PARAMS struct {
 	_             structs.HostLayout
 	Limit         uint64
+	Group         uint64
 	ResidentBytes uint64
 	RMStatus      uint32
 	Pad0          [4]byte
