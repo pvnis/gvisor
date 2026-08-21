@@ -290,3 +290,42 @@ op has to be added to `uvmIoctlFilters` or the Sentry is killed with SIGSYS on
 UVM init (commit on `gpu-overcommit`). The eviction driver is a backward-
 compatible superset of the working ghost driver: with no gmem cap set it uses the
 original global eviction, so slicing workloads are unaffected while it is loaded.
+
+## Adversarial: a memory PACKING attack defeats per-tenant eviction (2026-08-21)
+
+The V4 compute-packing attack has a memory analog under overcommit, and it works.
+The driver's gmem cap is set **per va_space**, but under gVisor each sandboxed
+*process* opens its own UVM fd → its own va_space, and nvproxy issues
+`UVM_SET_GMEM_LIMIT(gmem)` for **each** (in `uvmInitialize`). So a sandbox that
+forks N processes gets **N va_spaces each capped at the full gmem** — N× the
+protected residency the tenant is entitled to.
+
+Measured on the RTX 5070 (gmem=4 GiB, hmem=16 GiB), a 3 GiB hot victim beside an
+adversary making the **same ~11 GiB total** managed allocation:
+
+| adversary shape | adversary resident | victim bw |
+| --- | --- | --- |
+| 1 process (11 GiB, over its 4 GiB cap) | capped at 4 GiB, rest paged | **281 GB/s** (protected) |
+| 3 processes (3×3.7 GiB, each under 4 GiB) | ~11 GiB, none evicted | **~63 GB/s**, dips to 5.9 (starved) |
+
+One process at 11 GiB is *over* its cap, so per-tenant eviction pages it down to
+4 GiB and the victim is untouched. The same 11 GiB split across 3 processes is
+three va_spaces each *under* their 4 GiB cap, so `get_over_budget_allocated_chunk`
+finds no over-budget tenant, eviction falls back to the global LRU, and the
+adversary holds ~11 GiB resident — squeezing the victim ~4.5x (real-time: the
+victim recovered to 281 the instant the attack stopped).
+
+**Root cause, same shape as V4:** the protection unit (va_space = process) is
+finer than the tenant (sandbox), and packing multiplies the units. The Sentry's
+admit-before-forward cap *does* bound the sandbox's total *reservation* at
+gmem+hmem, but the driver-side *residency* protection is per-va_space, so packing
+converts reservation headroom (hmem) into extra protected residency.
+
+**Fix direction:** account residency per **tenant group**, not per va_space. The
+Sentry already knows every va_space of a sandbox (it forwards each UVM_INITIALIZE
+on the same nvproxy), so it can pass a per-sandbox group id with
+`UVM_SET_GMEM_LIMIT`; the driver sums `gmem_resident_bytes` across the group and
+treats the group as over budget when the sum exceeds the shared gmem cap. This is
+the exact memory analog of the credit scheduler's per-tenant grouping that closed
+V4 on the compute side. Until then, per-tenant eviction protects against a
+single-process oversubscriber but not a packing one.
