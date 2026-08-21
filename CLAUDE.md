@@ -570,15 +570,28 @@ Measured on sens1 with `~/amdtest/tslice.sh`, gpuburn, no interposer anywhere:
 
 | configuration | result |
 | --- | --- |
-| one sandbox alone, unsliced | 11974 iters/s |
-| one sandbox alone, session open | 6880 iters/s |
-| two sandboxes, 100:100 | 3442 / 3517, **Jain 0.9999** |
-| two sandboxes, 300:100 | 5141 / 1831, **2.81:1** for a 3:1 request |
-| `vecadd` sliced against a burner | `RESULT CORRECT` |
+| one sandbox alone, unsliced | 11984 iters/s |
+| one sandbox alone, session open | 6869 iters/s |
+| two sandboxes, 100:100 | 3391 / 3398, **Jain 1.0000** |
+| two sandboxes, 300:100 | 5110 / 1673, **3.05:1** |
+| two sandboxes, 500:100 | 5676 / 1106, **5.13:1** |
+| `vecadd` sliced against a burner | `RESULT CORRECT`, 3/3 |
 | a neighbour leaving | 1400 → 3440 → 6850 iters/s |
 
-Aggregate under contention is 6959–6971 against one tenant's 6880, so slicing
+Aggregate under contention is 6782–6790 against one tenant's 6869, so slicing
 on top of the session is work-conserving and nearly free. Zero driver faults.
+
+**This is the first exact proportional divider on the AMD side.** CU masks give
+2:1 → 1.84:1 and 3:1 → 2.67:1, and cannot be changed once queues exist; this
+gives 3:1 → 3.05:1 and 5:1 → 5.13:1 and re-divides every period.
+
+**Measure over the contended interval, not the whole run.** The two tenants are
+staggered and each spends a second or two in ROCr's initialisation, so at one
+edge of every run a tenant is alone on the device. Averaged into a short run
+that is several percent, always favouring the smaller share, and it reads
+exactly like an imprecise divider — the same configuration measured **2.8:1**
+untrimmed and **3.05:1** trimmed. `tslice.sh -t` trims it; this cost an hour
+chasing a bias in the scheduler that was never there.
 
 **Four bugs, each silent, all of which cost real time:**
 
@@ -601,6 +614,13 @@ on top of the session is work-conserving and nearly free. Zero driver faults.
   each time. It still divided the GPU, just at half the granted share — 1.57:1
   for a 3:1 request, with the *other* tenant landing exactly on its own share.
   The unit test missed it by only ever testing phase 50 ms.
+
+**`resumeSlack` shifts the window, it does not widen it.** Adding it to only
+the closing edge gives every tenant `allowance + slack` of running time, which
+is a far larger relative gift to a small share than to a large one and quietly
+compresses the division toward equal. Fixed by shifting both edges, which keeps
+the windows tiling the period exactly once — `TestWindowsTileThePeriod` checks
+that no instant has two tenants running or none.
 
 **A lesson worth keeping: `desired()` and the transition test are two booleans
 and both were wrong.** The transition test was inverted (`suspended == !want`),
