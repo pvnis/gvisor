@@ -359,3 +359,28 @@ rather than one chunk per allocation-driven call), and tighten accounting
 precision under churn. The seccomp lesson recurred: `UVM_SET_GMEM_LIMIT` must be
 allowed under any capability set (like the other nvproxy-issued UVM ioctls), and
 listed in the filter-count test's nvproxyOnlyUVMIoctls.
+
+### Steady holding needs a proactive evictor, not a reactive tweak
+
+Tried to steady the oscillation with eviction hysteresis (keep an over-budget
+group as the eviction target until drained to 3/4 of its cap). It did not help —
+the victim still swung 63 ↔ 282. The decisive comparison: a **single-process**
+oversubscriber holds the victim steady at 281 (S3), while **three processes in
+one group** oscillate. So this is not accounting drift (the one-process case
+proves detection + accounting work) — it is **eviction rate**: three fault
+streams re-fill the group's excess faster than the reactive,
+one-root-chunk-per-allocation eviction can drain it, so the group overshoots its
+cap in bursts and the victim's pages are caught in the global-LRU fallback during
+those bursts.
+
+The reactive PMM eviction (triggered only when PMA is full) is structurally
+unable to pin a continuously-faulting oversubscriber at a tight cap. The fix is
+the one GVM uses: a **proactive per-tenant background evictor** — a per-GPU
+kthread that periodically scans groups and, for any group over its cap, evicts
+its chunks down to the cap using the existing `evict_root_chunk` machinery,
+independent of PMA pressure. That keeps over-cap groups pinned at their cap, so
+the card always has free space for within-cap tenants and the victim stays
+resident (steady 281). Scoped but non-trivial (kthread lifecycle + a drain loop
+holding the right locks); left as the next step. The reactive group accounting
+already lands the security-relevant result — a packed tenant is capped as one and
+can no longer masquerade as N — so this is a stability refinement, not a hole.
