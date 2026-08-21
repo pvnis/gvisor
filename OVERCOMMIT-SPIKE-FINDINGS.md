@@ -412,3 +412,48 @@ Reframed conclusion: overcommit's residency guarantee is delivered and steady
 isolation from a thrashing oversubscriber is a distinct, out-of-scope problem
 (it would need bandwidth partitioning or throttling the oversubscriber's fault
 servicing, not more eviction).
+
+## How much can we practically oversubscribe? (2026-08-21, RTX 5070, gVisor)
+
+The one number everyone asks for, measured. One uncapped gVisor sandbox
+(`--nvproxy-gpu-memory-limit=0`), `cudaMallocManaged` of TOTAL, whole buffer
+populated once, then a timed loop touching only the first HOT MiB each pass
+(the working set). Card is 12227 MiB. `uvm_oversub.cu` (`~/overcommit`) grew a
+4th `HOT_MiB` arg for this.
+
+**Regime A — working set = whole allocation (touch everything):**
+
+| total (× card) | warm bandwidth |
+| --- | --- |
+| 8000 MiB (0.65×) | **275.2 GB/s** (fits, full HBM) |
+| 12000 MiB (0.98×) | **6.0 GB/s** |
+| 16000 MiB (1.31×) | 5.8 GB/s |
+| 18000 MiB (1.47×) | 5.8 GB/s |
+
+**Regime B — working set fixed at 8000 MiB (< card), allocation grows:**
+
+| total (× card) | hot | warm bandwidth |
+| --- | --- | --- |
+| 12000 MiB (0.98×) | 8000 | **275.5 GB/s** |
+| 16000 MiB (1.31×) | 8000 | 275.4 GB/s |
+| 20000 MiB (1.64×) | 8000 | 275.1 GB/s |
+
+**The limit is the working set, not the allocation.** The cliff sits exactly at
+the card: the instant the *actively-touched* set exceeds VRAM, throughput falls
+**~46×** (275 → ~6 GB/s, i.e. PCIe paging speed) and stays flat there no matter
+how much further you go — you are simply paging every sweep. But as long as the
+hot set fits in VRAM, the *total commitment* oversubscribes essentially for free:
+**20 GiB committed on a 12 GiB card ran at full 275 GB/s** because the 12 GiB
+cold tail sat on host RAM costing nothing while untouched. The practical ceiling
+on total commitment is host RAM (30 GiB here), not the card.
+
+**Practical rule.** Size `gmem` ≈ each tenant's hot working set and `hmem` = the
+cold overflow you want to allow. Overcommit buys capacity for cold/rarely-touched
+memory — idle models, large sparse tables, checkpoints, a paused tenant — at zero
+throughput cost, not room to grow a hot working set (that thrashes at ~6 GB/s).
+Two more bounds stand from the sections above: this is **UVM/managed memory
+only** — `cudaMalloc` device memory (vLLM/PyTorch's default path) is still
+hard-capped at `gmem` and cannot page (Phase 3) — and a tenant whose hot set
+*does* exceed VRAM thrashes at PCIe speed; the per-tenant evictor keeps that
+thrashing from stealing a well-behaved neighbour's residency, but not its
+memory-bus bandwidth.
