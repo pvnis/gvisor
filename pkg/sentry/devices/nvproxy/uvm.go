@@ -210,10 +210,36 @@ func uvmInitialize(ui *uvmIoctlState) (uintptr, error) {
 	if err != nil {
 		return n, err
 	}
+	// The va_space now exists on the host UVM fd; program its per-tenant
+	// device-resident cap from this sandbox's gmem quota.
+	setUVMGmemLimit(ui)
 	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
 		return n, err
 	}
 	return n, nil
+}
+
+// setUVMGmemLimit programs the driver's per-va_space device-resident cap
+// (UVM_SET_GMEM_LIMIT) from the sandbox's gmem quota, so the driver's per-tenant
+// eviction keeps this sandbox's device residency within its share while its
+// unified memory oversubscribes into host swap. Best-effort and non-fatal: on a
+// driver without the ioctl (or with no quota configured) the sandbox keeps the
+// driver's default global eviction, exactly the prior behaviour.
+func setUVMGmemLimit(ui *uvmIoctlState) {
+	limit := ui.fd.dev.nvp.memAcct.residentLimit()
+	if limit == 0 {
+		return
+	}
+	ioctlParams := nvgpu.UVM_SET_GMEM_LIMIT_PARAMS{Limit: limit}
+	sub := &uvmIoctlState{
+		fd:  ui.fd,
+		ctx: ui.ctx,
+		t:   ui.t,
+		cmd: nvgpu.UVM_SET_GMEM_LIMIT,
+	}
+	if _, err := uvmIoctlInvoke(sub, &ioctlParams); err != nil {
+		ui.ctx.Warningf("nvproxy: failed to set UVM gmem limit to %d bytes: %v", limit, err)
+	}
 }
 
 func uvmMMInitialize(ui *uvmIoctlState) (uintptr, error) {

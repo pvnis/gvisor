@@ -54,6 +54,7 @@ const (
 	UVM_ALLOC_SEMAPHORE_POOL           = 68
 	UVM_PAGEABLE_MEM_ACCESS_ON_GPU     = 70
 	UVM_VALIDATE_VA_RANGE              = 72
+	UVM_SET_GMEM_LIMIT                 = 82 // gVisor overcommit: per-tenant device-resident cap
 	UVM_CREATE_EXTERNAL_RANGE          = 73
 	UVM_MM_INITIALIZE                  = 75
 )
@@ -842,6 +843,25 @@ func (p *UVM_VALIDATE_VA_RANGE_PARAMS) GetStatus() uint32 {
 
 // SetStatus implements HasStatus.SetStatus.
 func (p *UVM_VALIDATE_VA_RANGE_PARAMS) SetStatus(status uint32) {
+	p.RMStatus = status
+}
+
+// +marshal
+type UVM_SET_GMEM_LIMIT_PARAMS struct {
+	_             structs.HostLayout
+	Limit         uint64
+	ResidentBytes uint64
+	RMStatus      uint32
+	Pad0          [4]byte
+}
+
+// GetStatus implements HasStatus.GetStatus.
+func (p *UVM_SET_GMEM_LIMIT_PARAMS) GetStatus() uint32 {
+	return p.RMStatus
+}
+
+// SetStatus implements HasStatus.SetStatus.
+func (p *UVM_SET_GMEM_LIMIT_PARAMS) SetStatus(status uint32) {
 	p.RMStatus = status
 }
 

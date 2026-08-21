@@ -482,6 +482,13 @@ func (a *memAccount) releaseUVMVA(ctx context.Context, size uint64) {
 	}
 }
 
+// residentLimit returns the device-resident cap ("gmem") in bytes, or 0 if the
+// sandbox is uncapped. gpuLimit is immutable after Register(), so no lock is
+// taken. It is used to program the driver's per-tenant UVM eviction cap.
+func (a *memAccount) residentLimit() uint64 {
+	return a.gpuLimit
+}
+
 // usage returns the memory currently charged to a, in bytes, by kind.
 func (a *memAccount) usage() (vram, pinnedHost, uvmVA uint64) {
 	a.mu.Lock()
