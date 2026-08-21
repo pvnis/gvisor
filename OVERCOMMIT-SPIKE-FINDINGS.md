@@ -384,3 +384,31 @@ resident (steady 281). Scoped but non-trivial (kthread lifecycle + a drain loop
 holding the right locks); left as the next step. The reactive group accounting
 already lands the security-relevant result — a packed tenant is capped as one and
 can no longer masquerade as N — so this is a stability refinement, not a hole.
+
+### Proactive evictor: residency is held steadily; bandwidth contention is fundamental
+
+Added a per-GPU background kthread (driver branch, evictor commit) that drains
+over-cap tenant groups every 4 ms, independent of PMA pressure. Instrumented it
+on the RTX 5070 (diagnostic since removed) to settle the oscillation's cause. The
+data is decisive:
+
+- Adversary group: counted resident **~8000 MiB** vs its **4096 MiB** cap — held
+  there stably (down from filling the whole 12 GiB card without the evictor).
+- Victim group: counted resident a **flat 3000 MiB** the whole run — **never
+  evicted**.
+- Evictor: `drained=16` every pass (its per-wake budget).
+
+So **accounting is exact (no drift), and the victim's residency is protected
+steadily** — the whole point. The evictor cannot force the adversary all the way
+to 4 GiB because fault-in (CPU→GPU) and evict-out (GPU→CPU) are both
+PCIe-bandwidth-limited at equal rates — a fundamental tug-of-war, not a bug — so
+the adversary thrashes at ~8 GiB. The victim's remaining bandwidth dip (63↔279)
+is therefore **not eviction** (it stays resident) but **memory-bus/PCIe
+contention** from the oversubscriber's thrashing, which residency isolation does
+not address — the same limit CU masks hit on the AMD side.
+
+Reframed conclusion: overcommit's residency guarantee is delivered and steady
+(a packed tenant is capped as one and cannot evict a neighbour); bandwidth
+isolation from a thrashing oversubscriber is a distinct, out-of-scope problem
+(it would need bandwidth partitioning or throttling the oversubscriber's fault
+servicing, not more eviction).
