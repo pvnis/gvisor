@@ -259,3 +259,34 @@ Spike pods: `~/.claude/jobs/*/tmp/overcommit/spikepod.sh` (gVisor, ns `overcommi
 deliberately not `gvisor`-labelled so the webhook injects no cap). Enable
 `dev.gvisor.flag.strace: "true"` + `strace-syscalls: "ioctl,mmap,futex"` to see
 the loop.
+
+## Phase 2 validated on hardware — per-tenant eviction protects residency (2026-08-21)
+
+The eviction driver (driver branch `gpu-overcommit-evict`) + the Phase-2a Sentry
+wiring were built, loaded on the RTX 5070, and run end to end. Repeat of S3, now
+with a 4 GiB gmem cap on each tenant (nvproxy issues `UVM_SET_GMEM_LIMIT` from the
+quota), a 3 GiB hot tenant A (under its cap) beside a 16 GiB oversubscriber B
+(over its cap):
+
+| eviction policy | A alone | A while B oversubscribes |
+| --- | --- | --- |
+| global LRU (before Phase 2) | 281 GB/s | **13.5 GB/s** — A evicted (~20x) |
+| per-tenant (Phase 2) | 281 GB/s | **~131 GB/s** — A resident (~2x) |
+
+Per-tenant eviction keeps A **resident** (stable ~131 GB/s, ≫ the 3.5 GB/s paging
+speed, so not evicted) instead of collapsing to disk speed — a **~10x**
+improvement in the innocent tenant's floor under an oversubscriber. The driver
+evicted the over-budget tenant B, not A.
+
+The residual drop from 281 to 131 is **memory-bandwidth contention** from B's
+paging DMA, not eviction — a stable plateau, and A is clearly resident. Residency
+isolation does not isolate HBM/PCIe bandwidth, the same limit CU masks hit on the
+AMD side. So Phase 2 delivers what it targets (residency), and bandwidth
+isolation under a paging neighbour remains a separate, open problem.
+
+One bug found and fixed while loading it: the Sentry issues `UVM_SET_GMEM_LIMIT`
+itself, and its own seccomp filter allow-lists UVM ioctls explicitly, so the new
+op has to be added to `uvmIoctlFilters` or the Sentry is killed with SIGSYS on
+UVM init (commit on `gpu-overcommit`). The eviction driver is a backward-
+compatible superset of the working ghost driver: with no gmem cap set it uses the
+original global eviction, so slicing workloads are unaffected while it is loaded.
