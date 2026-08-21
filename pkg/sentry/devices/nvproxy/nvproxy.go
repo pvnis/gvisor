@@ -59,6 +59,12 @@ type Options struct {
 	// sandbox may allocate. Zero means no limit.
 	GPUMemoryLimit uint64
 
+	// GPUHostSwapLimit is the host-swap headroom, in bytes, by which the
+	// sandbox's CUDA unified memory reservation may exceed GPUMemoryLimit; the
+	// driver pages the excess out to host memory. Zero disables oversubscription.
+	// Only meaningful alongside a non-zero GPUMemoryLimit.
+	GPUHostSwapLimit uint64
+
 	// MaxTimesliceUs is the longest GPU scheduler timeslice, in microseconds,
 	// that the sandbox may request. Zero means no limit.
 	MaxTimesliceUs uint64
@@ -140,6 +146,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		clients:                make(map[nvgpu.Handle]*rootClient),
 	}
 	nvp.memAcct.gpuLimit = opts.GPUMemoryLimit
+	nvp.memAcct.hmemLimit = opts.GPUHostSwapLimit
 	nvp.maxTimesliceUs = opts.MaxTimesliceUs
 	nvp.setTimesliceUs = opts.SetTimesliceUs
 	nvp.setInterleaveLevel = opts.SetInterleaveLevel
@@ -173,7 +180,11 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		log.Infof("nvproxy: GPU compute preemption mode required to be at least %s", opts.MinComputePreemption)
 	}
 	if opts.GPUMemoryLimit != 0 {
-		log.Infof("nvproxy: GPU memory limited to %d bytes", opts.GPUMemoryLimit)
+		if opts.GPUHostSwapLimit != 0 {
+			log.Infof("nvproxy: GPU memory limited to %d bytes resident, oversubscribable to %d bytes via host swap", opts.GPUMemoryLimit, opts.GPUMemoryLimit+opts.GPUHostSwapLimit)
+		} else {
+			log.Infof("nvproxy: GPU memory limited to %d bytes", opts.GPUMemoryLimit)
+		}
 	}
 	// Force ModifyDeviceFiles in /proc/driver/nvidia/params to 0. This is
 	// consistent with libnvidia-container's src/nvc_mount.c:mount_procfs().
@@ -323,20 +334,20 @@ func (nvp *nvproxy) noteGPUArch(class nvgpu.ClassID) {
 
 // +stateify savable
 type nvproxy struct {
-	abi                    *driverABI `state:"nosave"`
-	version                nvconf.DriverVersion
-	capsEnabled            nvconf.DriverCaps
-	maxTimesliceUs         uint64
-	setTimesliceUs         uint64
-	setInterleaveLevel     uint64
-	minComputePreemption   nvconf.ComputePreemption
-	computeGate            computeGate
+	abi                  *driverABI `state:"nosave"`
+	version              nvconf.DriverVersion
+	capsEnabled          nvconf.DriverCaps
+	maxTimesliceUs       uint64
+	setTimesliceUs       uint64
+	setInterleaveLevel   uint64
+	minComputePreemption nvconf.ComputePreemption
+	computeGate          computeGate
 	// gpuArch is the GPU architecture, detected from the first compute or
 	// channel class the sandbox allocates, or archUnknown until then. It is an
 	// atomic because allocations race, and is read to adapt behaviour that
 	// differs by GPU generation. See noteGPUArch.
-	gpuArch     atomicbitops.Int32
-	useDevGofer bool
+	gpuArch                atomicbitops.Int32
+	useDevGofer            bool
 	procDriverNvidiaParams string
 	devInfo                DeviceInfo
 	regularDevs            [nvgpu.NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1]*frontendDevice

@@ -580,6 +580,57 @@ func TestLimitSharedBetweenVRAMAndUVM(t *testing.T) {
 	checkUVMUsage(t, nvp, 4096)
 }
 
+// TestOversubscriptionAdmitsUVMPastResidentCap tests that with a non-zero
+// host-swap headroom (hmem), a CUDA unified memory reservation may exceed the
+// device-resident cap (gmem) up to gmem+hmem, since the driver pages the excess
+// out to host memory; a reservation past gmem+hmem is still denied.
+func TestOversubscriptionAdmitsUVMPastResidentCap(t *testing.T) {
+	ctx := context.Background()
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuLimit = 4096  // resident cap (gmem)
+	nvp.memAcct.hmemLimit = 4096 // host-swap headroom (hmem); virtual ceiling 8192
+	fd := newTestUVMFD(nvp)
+	var ms testMappingSpace
+
+	// A reservation up to the resident cap is fine.
+	if err := fd.AddMapping(ctx, ms, addrRange(0x100000, 4096), 0, true); err != nil {
+		t.Fatalf("AddMapping within resident cap: %v", err)
+	}
+	// A further reservation that exceeds the resident cap but stays within the
+	// virtual ceiling (gmem+hmem) is admitted.
+	if err := fd.AddMapping(ctx, ms, addrRange(0x200000, 4096), 4096, true); err != nil {
+		t.Fatalf("UVM oversubscription within gmem+hmem denied: %v", err)
+	}
+	checkUVMUsage(t, nvp, 8192)
+	// One page past the virtual ceiling is denied.
+	if err := fd.AddMapping(ctx, ms, addrRange(0x300000, 4096), 8192, true); err == nil {
+		t.Errorf("UVM reservation past gmem+hmem succeeded, want denial")
+	}
+	checkUVMUsage(t, nvp, 8192)
+}
+
+// TestOversubscriptionVRAMStillCappedAtResident tests that device memory, which
+// is pinned and cannot be paged, is bounded by the resident cap (gmem) alone and
+// cannot draw on the host-swap headroom (hmem).
+func TestOversubscriptionVRAMStillCappedAtResident(t *testing.T) {
+	ctx := context.Background()
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuLimit = 4096  // resident cap (gmem)
+	nvp.memAcct.hmemLimit = 4096 // host-swap headroom; ignored for pinned device memory
+	client := newTestClient(nvp, 1)
+
+	// Device memory up to the resident cap is fine.
+	addMem(t, nvp, client, handle(10), nvgpu.NV01_MEMORY_LOCAL_USER, 4096, handle(nvgpu.NV01_NULL_OBJECT))
+	checkUsage(t, nvp, 4096, 0)
+
+	// Device memory cannot use the host-swap headroom, so a reservation past the
+	// resident cap is denied even though the virtual ceiling has room.
+	if _, ok := nvp.memAcct.reserveForClass(ctx, nvgpu.NV01_MEMORY_LOCAL_USER, 4096); ok {
+		t.Errorf("device memory past resident cap succeeded, want denial")
+	}
+	checkUsage(t, nvp, 4096, 0)
+}
+
 // TestLimitDeniedMappingNotTracked tests that a mapping refused for exceeding
 // the limit is not left in the mapping set, which would otherwise release a
 // charge that was never taken when it is later unmapped.

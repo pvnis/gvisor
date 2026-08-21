@@ -53,6 +53,7 @@ const (
 	flagNVProxyGPUComputePct     = "nvproxy-gpu-compute-percent"
 	flagNVProxyGPUWeight         = "nvproxy-gpu-weight"
 	flagNVProxyGPUMemLimit       = "nvproxy-gpu-memory-limit"
+	flagNVProxyGPUHmemLimit      = "nvproxy-gpu-hmem-limit"
 	flagNVProxyMinComputePreempt = "nvproxy-min-compute-preemption"
 	flagNVProxyGPUPreempt        = "nvproxy-gpu-preempt"
 	flagNVProxyGPUUnschedule     = "nvproxy-gpu-unschedule"
@@ -203,6 +204,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool(flagNVProxyGPUPreempt, false, "preempt the sandbox's GPU channel groups when its share of the GPU ends, evicting work that is already running. Without this, the sandbox is only stopped from submitting more work, so a long kernel submitted just before the deadline runs on into other sandboxes' time. Requires --nvproxy-gpu-compute-percent or --nvproxy-gpu-scheduler-socket.")
 	flagSet.Bool(flagNVProxyGPUUnschedule, false, "DO NOT USE: take the sandbox's GPU channel groups off the runlist for the rest of each period once its share of the GPU ends. This starves any sandbox the scheduler marks idle: an idle client keeps only the 5ms MinAllowance floor, which is enough time to fault and be counted active again but not enough GPU time to finish a unit of work and report one, so it stays idle and never recovers. Measured, a weight-100 tenant produced no output at all while its weight-25 neighbour ran unimpeded. The revocation-based limit this was meant to replace works correctly; see ~/vllm-overhead/PLAN.md. Kept only because the control it issues is ground-truthed and works, should a workload ever turn out to need it.")
 	flagSet.Uint64(flagNVProxyGPUMemLimit, 0, "maximum number of bytes of GPU memory that the sandbox may allocate, counting device memory and address space reserved for CUDA unified memory. 0 means no limit.")
+	flagSet.Uint64(flagNVProxyGPUHmemLimit, 0, "host-swap headroom in bytes by which the sandbox's CUDA unified memory reservation may exceed nvproxy-gpu-memory-limit; the driver pages the excess out to host memory. 0 disables oversubscription. Only meaningful with a non-zero nvproxy-gpu-memory-limit.")
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("amdproxy", false, "WIP: enable support for AMD GPUs. AMD GPU support gets automatically enabled if /dev/kfd is present in the OCI spec.")
 	flagSet.Uint64(flagAMDProxyGPUMemLimit, 0, "maximum number of bytes of AMD GPU device memory that the sandbox may allocate at once. The limit is applied where the application's ioctls are interpreted, so sandboxed code cannot bypass it. 0 means no limit.")
@@ -246,6 +248,7 @@ var overrideAllowlist = map[string]struct {
 	flagQDiscTBFBurst:            {check: checkQDiscTBFBurst},
 	flagMountCgroupV2:            {},
 	flagNVProxyGPUMemLimit:       {check: checkNVProxyGPUMemoryLimit},
+	flagNVProxyGPUHmemLimit:      {check: checkNVProxyGPUHostSwapLimit},
 	flagNVProxyGPUComputePct:     {check: checkNVProxyGPUComputePercent},
 	flagNVProxyGPUWeight:         {check: checkNVProxyGPUWeight},
 	flagNVProxyMinComputePreempt: {check: checkNVProxyMinComputePreemption},
@@ -431,6 +434,28 @@ func checkNVProxyGPUMemoryLimit(c *Config, name string, value string) error {
 	}
 	if limit == 0 || limit > c.NVProxyGPUMemoryLimit {
 		return fmt.Errorf("%s=%q exceeds the limit of %d bytes configured on the runtime; annotations may only lower it", name, value, c.NVProxyGPUMemoryLimit)
+	}
+	return nil
+}
+
+// checkNVProxyGPUHostSwapLimit ensures that the host-swap headroom can be
+// lowered but not raised. Raising it would let a container grant itself more
+// total GPU memory (device plus swap) than the runtime configured, so the
+// runtime value is a ceiling on it just as for the resident memory limit.
+func checkNVProxyGPUHostSwapLimit(c *Config, name string, value string) error {
+	limit, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid %s annotation %q: %w", name, value, err)
+	}
+	if c.NVProxyGPUHostSwapLimit == 0 {
+		// The runtime grants no host-swap headroom, so any value would widen it.
+		if limit != 0 {
+			return fmt.Errorf("%s=%q exceeds the host-swap headroom of 0 bytes configured on the runtime; annotations may only lower it", name, value)
+		}
+		return nil
+	}
+	if limit > c.NVProxyGPUHostSwapLimit {
+		return fmt.Errorf("%s=%q exceeds the host-swap headroom of %d bytes configured on the runtime; annotations may only lower it", name, value, c.NVProxyGPUHostSwapLimit)
 	}
 	return nil
 }

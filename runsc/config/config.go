@@ -378,6 +378,13 @@ type Config struct {
 	// the sandbox may allocate. Zero means no limit.
 	NVProxyGPUMemoryLimit uint64 `flag:"nvproxy-gpu-memory-limit"`
 
+	// NVProxyGPUHostSwapLimit is the host-swap headroom, in bytes, by which the
+	// sandbox's CUDA unified memory reservation may exceed NVProxyGPUMemoryLimit;
+	// the driver pages the excess out to host memory. Zero disables
+	// oversubscription. Only meaningful alongside a non-zero
+	// NVProxyGPUMemoryLimit.
+	NVProxyGPUHostSwapLimit uint64 `flag:"nvproxy-gpu-hmem-limit"`
+
 	// NVProxyMaxTimesliceUs is the longest GPU scheduler timeslice, in
 	// microseconds, that the sandbox may request for its channel groups. Zero
 	// means no limit.

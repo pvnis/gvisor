@@ -278,10 +278,20 @@ type memAccount struct {
 	pinnedHost uint64
 	uvmVA      uint64
 
-	// gpuLimit is the maximum number of bytes of GPU memory, being the sum of
-	// vram and uvmVA, that may be charged to this sandbox. Zero means no
-	// limit. gpuLimit is immutable after Register().
+	// gpuLimit is the device-resident cap ("gmem"): the maximum number of bytes
+	// of GPU device memory this sandbox may hold resident. Pinned device memory
+	// (vram) is bounded by it directly; CUDA unified memory (uvmVA) is bounded
+	// by it plus hmemLimit, since the driver can page resident unified memory
+	// out to host memory. Zero means no limit. Immutable after Register().
 	gpuLimit uint64
+
+	// hmemLimit is the host-swap headroom ("hmem"): additional bytes of CUDA
+	// unified memory reservation permitted beyond gpuLimit, on the understanding
+	// that the excess is paged out to host memory rather than held on the
+	// device. Zero disables oversubscription, reducing admission to the hard
+	// gpuLimit cap. Only meaningful alongside a non-zero gpuLimit. Immutable
+	// after Register().
+	hmemLimit uint64
 
 	// warnedDenied records that reaching the limit has already been reported.
 	warnedDenied bool
@@ -337,10 +347,28 @@ func (a *memAccount) admitLocked(kind memKind, size uint64) bool {
 	if a.gpuLimit == 0 || !kind.countsAgainstGPULimit() {
 		return true
 	}
+	// The virtual ceiling (gmem + hmem) bounds the total reservation: device
+	// memory plus unified-memory address space. Unified memory may reserve up to
+	// this ceiling because the driver pages resident pages out to host memory
+	// once the device-resident cap is exceeded. When hmemLimit is zero this is
+	// just gpuLimit, i.e. the original hard cap with no oversubscription.
+	//
 	// Written so that a size chosen by the application cannot overflow the
-	// comparison and be wrongly admitted.
+	// comparison and be wrongly admitted. The runtime-configured limits are
+	// bounded well below the point at which their sum would overflow.
+	ceiling := a.gpuLimit + a.hmemLimit
 	used := a.vram + a.uvmVA
-	return size <= a.gpuLimit && used <= a.gpuLimit-size
+	if size > ceiling || used > ceiling-size {
+		return false
+	}
+	// Pinned device memory cannot be paged out, so it alone must fit within the
+	// device-resident cap, independent of any host-swap headroom.
+	if kind == memKindVRAM {
+		if size > a.gpuLimit || a.vram > a.gpuLimit-size {
+			return false
+		}
+	}
+	return true
 }
 
 // reserve charges size bytes of the given kind against a, unless doing so
