@@ -114,6 +114,10 @@ func uvmIoctlFilters(enabledCaps nvconf.DriverCaps) []seccomp.SyscallRule {
 		{seccomp.EqualTo(nvgpu.UVM_ALLOC_SEMAPHORE_POOL), compUtil},
 		{seccomp.EqualTo(nvgpu.UVM_VALIDATE_VA_RANGE), compUtil},
 		{seccomp.EqualTo(nvgpu.UVM_CREATE_EXTERNAL_RANGE), compUtil},
+		// gVisor GPU memory overcommit: the Sentry issues UVM_SET_GMEM_LIMIT
+		// itself (setUVMGmemLimit) to program the driver's per-tenant eviction
+		// cap, so its own syscall filter must permit the ioctl.
+		{seccomp.EqualTo(nvgpu.UVM_SET_GMEM_LIMIT), compUtil},
 	} {
 		if uvmIoctl.caps&enabledCaps != 0 {
 			ioctlRules = append(ioctlRules, seccomp.PerArg{
