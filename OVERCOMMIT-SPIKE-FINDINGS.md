@@ -188,12 +188,35 @@ dig is that forwarded ioctl pattern for the >1 GiB region — compare the exact 
 ioctl/param sequence a working ≤1 GiB alloc issues against a failing >1 GiB one,
 in nvproxy — since platform is now ruled out.
 
-## S2 / S3 status
+## S3 — native UVM eviction is global, and it wrecks an innocent tenant (2026-08-21, post-fix)
 
-Blocked behind the S1 livelock. S2 (does our own cap refuse the oversubscribing
-reservation in `memquota.go:reserveUVMVA` before the driver) and S3 (is native
-eviction global vs per-tenant) both require a *working* managed allocation under
-gVisor to measure, which we do not yet have.
+With the fix in place, S3 is now measurable, and it is decisive. Two uncapped
+gVisor sandboxes on the 12 GiB card:
+
+- **A** — 4 GiB managed, hot (touched every sweep). Alone: **281 GB/s** steady,
+  fully resident.
+- **B** — 16 GiB managed, oversubscribed, hot. Pages at ~3.5 GB/s (PCIe-bound).
+
+When B starts, A collapses **281 → 218 → 130 → 13.5 GB/s — a ~20x hit** — even
+though A is 4 GiB on a 12 GiB card, well within any fair share. The driver's
+native UVM eviction is a **global LRU**: B's 16 GiB working set evicts A's
+resident pages, so A re-faults from host on every sweep. GPU 100% busy, 11789 MiB
+resident, the rest paged.
+
+**This is the justification and the specification for Phase 2.** Sentry-side
+admission (Phase 1) bounds each tenant's *reservation*, but *residency* is the
+driver's, and today it is unpartitioned. Per-tenant eviction (GVM's per-container
+CLOCK: evict a tenant's own pages when it exceeds its device-resident share,
+rather than the globally coldest page) is required to keep A's resident share
+intact while B oversubscribes. Without it, overcommit is unsafe for latency-
+sensitive tenants — one oversubscriber is a 20x noisy neighbour.
+
+## S2 status
+
+S2 (does `memquota.go:reserveUVMVA` refuse an oversubscribing reservation before
+the driver) is subsumed: Phase 1 changed exactly that admission path, and the
+end-to-end test above (5000 MiB admitted where the hard cap refused it, 7000 MiB
+denied at gmem+hmem) confirms the Sentry is the admission authority.
 
 ## Implication for the plan — a prerequisite appears
 
