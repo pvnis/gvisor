@@ -519,7 +519,7 @@ func (s *Server) Tick() {
 				pid = p
 			}
 			if pid == 0 {
-				if s.warnedNoPID[id] != true {
+				if !s.warnedNoPID[id] {
 					log.Warningf("gpusched: sandbox %q connected with weight %d but no host pid known (conn pid %d, announced %d); it cannot be enforced on the runlist until runsc announces its pid", id, sc.weight, sc.pid, s.pids[id])
 					if s.warnedNoPID == nil {
 						s.warnedNoPID = map[ID]bool{}

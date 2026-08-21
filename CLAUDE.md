@@ -23,12 +23,14 @@ difference in their behaviour follows from that.
 
 | | AMD (`amdproxy`) | NVIDIA (`nvproxy`) |
 | --- | --- | --- |
-| compute is divided in | **space** — CU masks | **time** — submission windows |
-| enforced by | the GPU's command processor | the Sentry, gating submission |
-| set at | queue creation, per ioctl | continuously, per period |
-| unused share goes to | nobody; it idles | whoever is asking (with the scheduler) |
-| granularity | 2 CUs on RDNA, fixed at start | a weight, re-divided every period |
+| compute is divided in | **space** — CU masks, **and time** — queue suspension | **time** — submission windows |
+| enforced by | the GPU's command processor; or the Sentry, suspending queues | the Sentry, gating submission |
+| set at | queue creation, per ioctl; or continuously, per period | continuously, per period |
+| unused share goes to | CU masks: nobody. Time slices: whoever is asking | whoever is asking (with the scheduler) |
+| granularity | 2 CUs on RDNA fixed at start; or a weight, re-divided every period | a weight, re-divided every period |
 | memory quota | admit-before-forward on `ALLOC_MEMORY_OF_GPU` | admit-before-forward on the RM/VMM paths |
+| preempts running work | **yes** — CWSR saves in-flight waves | no — a long kernel outlives the window |
+| privileged host component | **none** | needed, for the runlist enforcer |
 
 **Why AMD gets a spatial partition and NVIDIA cannot.** Once an NVIDIA channel
 is set up, work is submitted by writing to a pushbuffer in mapped memory and
@@ -45,6 +47,13 @@ give an idle tenant's share to a busy one, and it cannot be changed once queues
 exist. The NVIDIA scheduler *can* reassign unused time and adjusts as tenants
 come and go, but it is a policy running every period, and it costs more to be
 right.
+
+**AMD now has both**, and they compose: the CU mask for a hard spatial floor,
+queue suspension for a work-conserving weighted share. Which to reach for
+follows from what the workload is bound on — masks partition compute pipeline
+occupancy but not memory bandwidth, which is why three vLLM tenants on disjoint
+masks still cost each other 35%. See "Time-slicing AMD from userspace" and "The
+Sentry now enforces it" below.
 
 ## Where the work runs
 
@@ -543,8 +552,63 @@ shape the Sentry is in, since it is itself the KFD process for the sandbox.
 `dbg_fd` wants a pollable fd; an `eventfd` works. `RUNTIME_ENABLE` must have
 succeeded first, which ROCr does during init well before creating a queue.
 
-gVisor models none of this today: `DBG_TRAP` is denied outright, with no struct
-and no op enum in `pkg/abi/amdgpu`.
+### The Sentry now enforces it, with nothing preloaded (2026-08-21)
+
+`pkg/sentry/devices/amdproxy/timeslice.go` drives the `dbg` lever from the
+Sentry, so the LD_PRELOAD interposer is no longer in the enforcement path at
+all. `--amdproxy-gpu-scheduler-socket` + `--amdproxy-gpu-weight`, served by the
+same `runsc gpu-scheduler` the NVIDIA side uses; `pkg/gpusched` was reused
+unchanged. **`DBG_TRAP` stays denied to the sandbox, and that denial is now
+load-bearing** — a sandbox able to issue it could resume the queues gating it.
+
+**There is no privileged host component in the AMD enforcement path.** The
+scheduler only advises; each Sentry suspends its own queues. That is strictly
+better than the NVIDIA arrangement, where the runlist enforcer needs kernel
+privilege.
+
+Measured on sens1 with `~/amdtest/tslice.sh`, gpuburn, no interposer anywhere:
+
+| configuration | result |
+| --- | --- |
+| one sandbox alone, unsliced | 11974 iters/s |
+| one sandbox alone, session open | 6880 iters/s |
+| two sandboxes, 100:100 | 3442 / 3517, **Jain 0.9999** |
+| two sandboxes, 300:100 | 5141 / 1831, **2.81:1** for a 3:1 request |
+| `vecadd` sliced against a burner | `RESULT CORRECT` |
+| a neighbour leaving | 1400 → 3440 → 6850 iters/s |
+
+Aggregate under contention is 6959–6971 against one tenant's 6880, so slicing
+on top of the session is work-conserving and nearly free. Zero driver faults.
+
+**Four bugs, each silent, all of which cost real time:**
+
+- **`EC_QUEUE_NEW` must be drained after every queue creation, not just before
+  a suspend.** Subscribing to an exception tells the driver a debugger is
+  watching, and a queue whose exception nobody collects *does not run*. A lone
+  tenant holding the whole period is never suspended, so it never drained, so
+  it never started.
+- **The session must be closed before the app's `RUNTIME_ENABLE` disable
+  reaches the driver.** The driver raises a runtime event to the debugger there
+  and waits forever for an answer. The app blocked inside the ioctl with no
+  error and nothing in `dmesg`; `--strace --strace-syscalls=ioctl` found it in
+  one run by showing an ioctl entered and never left. The interposer never hit
+  this because its `atexit` handler happened to close the session first.
+- **Opening a session leaves the queues stopped**, so the state to assume after
+  it is *suspended*, and the first resume is what starts them.
+- **The window arithmetic has to wrap.** `resumeSlack` moves the opening edge
+  back, so a window at phase 0 begins in the *previous* period; computing that
+  as a non-positive interval left the phase-0 tenant suspended an extra period
+  each time. It still divided the GPU, just at half the granted share — 1.57:1
+  for a 3:1 request, with the *other* tenant landing exactly on its own share.
+  The unit test missed it by only ever testing phase 50 ms.
+
+**A lesson worth keeping: `desired()` and the transition test are two booleans
+and both were wrong.** The transition test was inverted (`suspended == !want`),
+which issues a resume for queues that were never suspended; the driver counts
+suspends against resumes, so that unmatched resume stopped the queue entirely.
+Both now have named helpers (`needsTransition`, `inWindow`, `until`) and tests,
+because in this area a wrong boolean produces a *plausible* number rather than
+an error.
 
 Three traps worth keeping:
 - **`strace` cannot symbolize `CREATE_QUEUE` on this host.** ABI 1.22 grew the

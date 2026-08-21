@@ -440,6 +440,14 @@ type Config struct {
 	// address space, so that more than one of them can use the GPU.
 	AMDProxyShareKFDVM bool `flag:"amdproxy-share-kfd-vm"`
 
+	// AMDProxyGPUWeight is this sandbox's share of an AMD GPU relative to the
+	// others scheduled alongside it.
+	AMDProxyGPUWeight uint64 `flag:"amdproxy-gpu-weight"`
+
+	// AMDProxyGPUSchedulerSocket is the path of a GPU scheduler dividing an
+	// AMD GPU between the sandboxes sharing it.
+	AMDProxyGPUSchedulerSocket string `flag:"amdproxy-gpu-scheduler-socket"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 

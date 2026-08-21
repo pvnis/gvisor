@@ -1024,10 +1024,16 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	// Connect to the GPU scheduler out here and hand the sandbox the open
 	// connection: the Sentry's syscall filter does not permit it to connect to
 	// anything itself.
-	if conf.NVProxyGPUSchedulerSocket != "" {
-		schedConn, err := net.Dial("unix", conf.NVProxyGPUSchedulerSocket)
+	// Either vendor may be the one being scheduled; a host serves one socket
+	// per GPU, not one per driver.
+	schedulerSocket := conf.NVProxyGPUSchedulerSocket
+	if schedulerSocket == "" {
+		schedulerSocket = conf.AMDProxyGPUSchedulerSocket
+	}
+	if schedulerSocket != "" {
+		schedConn, err := net.Dial("unix", schedulerSocket)
 		if err != nil {
-			return fmt.Errorf("connecting to the GPU scheduler at %q: %w", conf.NVProxyGPUSchedulerSocket, err)
+			return fmt.Errorf("connecting to the GPU scheduler at %q: %w", schedulerSocket, err)
 		}
 		schedFile, err := schedConn.(*net.UnixConn).File()
 		schedConn.Close()

@@ -57,10 +57,19 @@ see how many others are competing with it, nor whether they are using the GPU at
 all. This command runs outside every sandbox and decides for them.
 
 Sandboxes connect to the socket given by --socket, which they are pointed at
-with the runsc flag --nvproxy-gpu-scheduler-socket. Those using the same GPU
-divide each period in proportion to their weights, so one running alone receives
-all of it, and they are given windows that do not overlap so that they take
-turns.
+with the runsc flag --nvproxy-gpu-scheduler-socket or --amdproxy-gpu-scheduler-socket.
+Those using the same GPU divide each period in proportion to their weights, so
+one running alone receives all of it, and they are given windows that do not
+overlap so that they take turns.
+
+Both vendors are served, but what happens at the end of a window differs, because
+the two drivers put the lever in different places. On NVIDIA the sandbox is
+stopped from submitting more work, and --runlist-control additionally drives the
+hardware runlist from here, at kernel privilege, to bind workloads submission
+gating cannot. On AMD nothing is enforced from this process at all: the window is
+advice, and each Sentry suspends its own GPU queues to honour it, because the
+queue lifecycle stays behind ioctls the Sentry already interprets. AMD sandboxes
+are therefore also preempted mid-kernel, which the NVIDIA gate cannot do.
 
 Run one per host. Each of the host's GPUs is divided separately, so sandboxes
 placed on different devices do not take time from one another; runsc reports

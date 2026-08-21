@@ -79,6 +79,22 @@ type Options struct {
 	// It is a correctness trade, confined to this sandbox; sharedvm.go states
 	// the terms.
 	ShareKFDVM bool
+
+	// SchedulerFD is an open connection to the GPU scheduler that divides the
+	// device between the sandboxes on this host, or -1 if this sandbox is not
+	// being time-sliced. The Sentry may not connect to anything itself, so the
+	// descriptor is opened by runsc and donated.
+	SchedulerFD int
+
+	// SchedulerWeight is this sandbox's share of the GPU relative to the
+	// others the scheduler is dividing it between. It is a weight rather than
+	// a percentage because a percentage means nothing without naming a
+	// particular device, and says nothing useful when the shares do not sum
+	// to 100.
+	SchedulerWeight uint64
+
+	// ContainerID identifies this sandbox to the scheduler.
+	ContainerID string
 }
 
 // DeviceInfo contains information on registered amdproxy devices. Device
@@ -107,6 +123,7 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 	amdp.renderShare.init(opts.ShareKFDVM)
 	amdp.runtimeShare.init(opts.ShareKFDVM)
 	amdp.eventShare.init(opts.ShareKFDVM)
+	amdp.timeSlicer.init(opts.SchedulerWeight, opts.SchedulerFD, opts.ContainerID)
 	if opts.GPUMemoryLimit != 0 {
 		log.Infof("amdproxy: GPU memory limited to %d bytes", opts.GPUMemoryLimit)
 	}
@@ -212,6 +229,11 @@ type amdproxy struct {
 	// page, since an event can never wake them.
 	eventShare eventShare
 
+	// timeSlicer holds the sandbox to its share of the GPU by suspending the
+	// queues it submits through. It is inert unless a scheduler connection was
+	// donated.
+	timeSlicer timeSlicer
+
 	fdsMu     sync.Mutex `state:"nosave"`
 	kfdFDs    map[*kfdFD]struct{}
 	renderFDs map[*renderFD]struct{}
@@ -225,8 +247,25 @@ func (amdp *amdproxy) trackFD(fd *kfdFD) {
 
 func (amdp *amdproxy) untrackFD(fd *kfdFD) {
 	amdp.fdsMu.Lock()
-	defer amdp.fdsMu.Unlock()
-	delete(amdp.kfdFDs, fd)
+	last := false
+	if _, ok := amdp.kfdFDs[fd]; ok {
+		delete(amdp.kfdFDs, fd)
+		last = len(amdp.kfdFDs) == 0
+	}
+	amdp.fdsMu.Unlock()
+	if !last {
+		// This descriptor is going away but the sandbox is still using the
+		// GPU. If the debug session was opened on it, it has to be given up:
+		// the number is about to be reused.
+		amdp.timeSlicer.forgetHostFD(fd.hostFD)
+		return
+	}
+	if last {
+		// The sandbox has stopped using the GPU. Stop slicing it, and above
+		// all leave its queues running: a suspended queue cannot be destroyed,
+		// so a session torn down mid-suspend would strand them.
+		amdp.timeSlicer.shutdown()
+	}
 }
 
 func (amdp *amdproxy) trackRenderFD(fd *renderFD) {

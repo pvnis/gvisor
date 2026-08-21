@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(default_applicable_licenses = ["//:license"])
 
@@ -18,6 +18,8 @@ go_library(
         "memquota.go",
         "seccomp_filters.go",
         "sharedvm.go",
+        "timeslice.go",
+        "timeslice_unsafe.go",
     ],
     visibility = [
         "//pkg/sentry:internal",
@@ -29,6 +31,7 @@ go_library(
         "//pkg/devutil",
         "//pkg/errors/linuxerr",
         "//pkg/fdnotifier",
+        "//pkg/gpusched",
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/marshal",
@@ -45,5 +48,16 @@ go_library(
         "//pkg/usermem",
         "//pkg/waiter",
         "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "amdproxy_test",
+    size = "small",
+    srcs = ["timeslice_test.go"],
+    library = ":amdproxy",
+    deps = [
+        "//pkg/abi/amdgpu",
+        "//pkg/gpusched",
     ],
 )
