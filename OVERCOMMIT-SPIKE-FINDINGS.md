@@ -329,3 +329,33 @@ treats the group as over budget when the sum exceeds the shared gmem cap. This i
 the exact memory analog of the credit scheduler's per-tenant grouping that closed
 V4 on the compute side. Until then, per-tenant eviction protects against a
 single-process oversubscriber but not a packing one.
+
+## Fix: per-tenant-GROUP accounting closes the packing attack (2026-08-21)
+
+Implemented per-tenant-group residency in the driver (branch
+`gpu-overcommit-evict`): `UVM_SET_GMEM_LIMIT` gains a `group` id, va_spaces
+sharing an id share one resident total + cap, and nvproxy derives the id per
+sandbox from the container ID (FNV-1a) so all of a sandbox's processes are one
+group. Loaded on the RTX 5070 and re-ran the packing test (3 processes ×
+3.7 GiB, each under the 4 GiB va_space cap):
+
+| | victim under the packed adversary |
+| --- | --- |
+| per-va_space eviction | steady ~63 GB/s (attack succeeds) |
+| per-tenant-group eviction | oscillates **281 ↔ 63**, peaks at full 281 |
+
+The group is now summed (~11 GiB) against one 4 GiB cap, found over budget, and
+its processes are the ones evicted (all paging at ~1.3 GB/s) — so packing no
+longer multiplies protection, and the victim reaches full 281 GB/s, which is
+impossible without the fix. But protection is **not yet steady**: with three
+processes re-faulting their working sets, the group overshoots its cap faster
+than the single-victim-per-call eviction drains it, so the victim swings between
+protected (281) and contended (63), averaging ~134 vs the steady ~63 without the
+fix. So the mechanism is correct (packing defeated) but the holding is loose.
+
+Follow-up to make it steady: evict more aggressively from an over-budget group
+(a per-group CLOCK list, or draining the group to its cap in one eviction pass
+rather than one chunk per allocation-driven call), and tighten accounting
+precision under churn. The seccomp lesson recurred: `UVM_SET_GMEM_LIMIT` must be
+allowed under any capability set (like the other nvproxy-issued UVM ioctls), and
+listed in the filter-count test's nvproxyOnlyUVMIoctls.
