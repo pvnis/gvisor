@@ -924,3 +924,26 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
    is mandatory in Kubernetes. The GPU scheduler works around the same problem
    on the NVIDIA side by re-announcing devices from `StartSubcontainer`; the
    same trick may apply here.
+8. **Container suspend/resume — two different things, one gap.** Runtime
+   suspend/resume of a tenant's GPU *execution* already works and is exercised
+   every scheduling period: the compute gate revokes the submission mappings
+   (`pkg/sentry/devices/nvproxy/computegate.go` → `revokeMappings()`) and the app
+   faults them back in on resume, and the credit scheduler detaches a whole
+   tenant's TSGs from the runlist when it overdraws and reattaches on recovery
+   (`pkg/gpusched/credit.go`). A tenant that merely stops submitting is handled
+   too (idle → share reassigned, banked credit capped, never detach the last
+   runnable one). What does **not** work is checkpoint/restore of a GPU
+   container to disk (`runsc checkpoint`/`restore`, i.e. suspend-to-disk /
+   migration): `nvproxy.beforeSave()` panics on the first object that is not a
+   `restorableObjectImpl`, and only `rmAllocObject`/`rootClient` implement
+   `Restore` — `miscObject` and `osDescMem` do not, and those cover the OS
+   events, RM/heap allocations, duplicated handles, and pinned host descriptors
+   every CUDA context creates (`pkg/sentry/devices/nvproxy/save_restore.go`,
+   `object.go`). The mapping half is already solved (`InvalidateUnsavable` drops
+   device-memory mappings, the app re-faults on restore). Future work is
+   implementing `Restore` for `miscObject`/`osDescMem` — replaying each object's
+   creation with the right host FD and params, and re-pinning pages for
+   `osDescMem` — which is the one piece standing between this branch and
+   GPU-container migration. Upstream gVisor gap, not slicing-specific; see the
+   "Checkpointing a GPU sandbox does not work" section above and `runsc pause`
+   on a live GPU sandbox is untested (should follow from the same revoke path).

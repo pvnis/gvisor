@@ -530,6 +530,48 @@ the *functional* check (`pid … active 1 tsgs 3`), not srcversion.
   200 matmuls per line × lines ÷ window, which is correct for any process count
   and so is the right measure precisely because packing changes the count.
 
+**Confirmed against the whole stack with a real serving workload — vCluster +
+HAMi + webhook + gVisor + credit scheduler, RTX 5070, 2026-08-21.** The 5070
+table above is the isolated harness (cuBLAS burn, bare k3s pods). This run puts
+the same conclusion through every production layer at once: four *separate
+vClusters* (own API server + NetworkPolicy each), three honest tenants serving
+**real vLLM (Qwen2.5-0.5B)** under continuous load at weights 100/50/25, and a
+fourth adversarial tenant in its own vCluster. Each pod's quota is derived by
+the gpushare webhook from its HAMi-admitted `nvidia.com/gpumem` and enforced by
+the Sentry; compute is divided by the credit scheduler in `--runlist-control`
+mode. Harness: `~/.claude/jobs/a05027b4/tmp/bigtest/` (`run2.sh`).
+
+| adversary state | its TSGs | honest agg tok/s | honest a:b:c | adversary matmul/s |
+| --- | --- | --- | --- | --- |
+| none | — | 7795 | 4.25 : 2.12 : 1 | — |
+| 1 process | 3 | 6466 | 3.56 : 1.98 : 1 | 31 |
+| **4 processes packed** | **12** | 6272 | 3.54 : 1.89 : 1 | **27** |
+
+- **Packing neutralized under a doorbell-submitting LLM server, not just the
+  synthetic burn.** The adversary quadrupled its channel groups (3 → 12, one
+  Sentry pid — the V4 signature, confirmed `active 1 tsgs 12` in the driver
+  view) and gained *no* compute (31 → 27 matmul/s) while the honest tenants lost
+  nothing beyond noise (agg 6466 → 6272). This is the credit scheme holding on
+  vLLM's CUDA-graph/cuBLAS workload — the same class the gate could never bind.
+- **Weight fidelity survives real tenancy.** 4.25:2.12:1 with no adversary and
+  3.5:1.9:1 with the packer present, both against a nominal 4:2:1 — a marked
+  improvement over the earlier *gate*-path vCluster result, which compressed
+  toward equal (`~/vllm-overhead/PLAN.md`). Aggregate ~7800 tok/s exceeds the
+  6704 tok/s a lone tenant reaches, i.e. work-conserving.
+- **The memory-grab attack is capped at the quota, live under contention.** A
+  fifth probe pod (own vCluster, 1024 MiB quota) whose code ignores the reported
+  free memory and `cudaMalloc`s until failure: `torch.cuda.mem_get_info()`
+  reported **total=1024 MiB, not the 12227 MiB device**, and it OOM'd at 832 MiB
+  (quota minus ~190 MiB context) — it could not reach the other ~11 GiB.
+- **A silent quota-escape prerequisite, worth flagging here.** The gpushare
+  webhook fires only on namespaces labelled `gvisor` (Exists), and the host
+  tenant namespaces that vCluster syncs pods into are **not** labelled by
+  default — so without `kubectl label ns … gvisor=`, every synced GPU pod is
+  admitted *unmutated* and runs at the node-wide ceiling (the whole card). Same
+  failure class as the `failurePolicy: Ignore` escape already recorded, reached
+  by a different route. Verified: labelled → per-pod 2560 MiB enforced; the
+  synced pod carries `nvproxy-gpu-memory-limit` only once the label is present.
+
 **Operational note: the scheduler is a hard dependency, fail-closed.** With
 `nvproxy-gpu-scheduler-socket` set in the runsc config, a GPU pod cannot start
 at all while `runsc-gpu-scheduler` is down — sandbox creation fails with
