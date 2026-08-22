@@ -16,6 +16,12 @@ NVIDIA's driver on the host. It provides access to NVIDIA GPU-specific devices
 to the sandboxed application. The GPU application can run unmodified inside the
 sandbox and interact transparently with these devices.
 
+AMD GPUs are supported the same way by `amdproxy`, which proxies the Kernel
+Fusion Driver and amdgpu's DRM render nodes and runs ROCm applications
+unmodified. Most of this page is about NVIDIA; see
+[AMD GPUs](#amdproxy) for what differs, including how a single AMD device is
+divided between sandboxes.
+
 ## Environments
 
 The `runsc` flag `--nvproxy` must be specified to enable GPU support. gVisor
@@ -948,6 +954,267 @@ on both, which leaves the unshared one idle for the rest of each period.
 Checkpointing does not work either; see
 [Checkpointing is not yet supported](#compute-limits) above. That applies to any
 sandbox with a GPU, not just a scheduled one.
+
+## AMD GPUs {#amdproxy}
+
+gVisor proxies AMD GPUs with `amdproxy`, the counterpart to `nvproxy`. It
+covers the Kernel Fusion Driver (`/dev/kfd`) and amdgpu's DRM render nodes, and
+runs ROCm applications unmodified: enable it with `--amdproxy`, which also turns
+on automatically when `/dev/kfd` is in the OCI spec.
+
+Everything below is enforced in the Sentry, where the application's `ioctl`s are
+interpreted. Nothing depends on a library inside the container, so a container
+cannot lift its own limits.
+
+`--platform=kvm` is required. KFD binds each mapping to the process holding the
+KFD context, and systrap maps from a stub process, so `mmap` of a KFD offset
+returns `EINVAL` there.
+
+### Three limits, and one rule about combining them
+
+| flag | limits | enforced by |
+| --- | --- | --- |
+| `--amdproxy-gpu-memory-limit` | bytes of VRAM the sandbox may hold | the Sentry, admitting `ALLOC_MEMORY_OF_GPU` before forwarding it |
+| `--amdproxy-cu-mask` | which compute units it may run on | the GPU's command processor, from a mask applied to every queue |
+| `--amdproxy-gpu-weight` | its share of GPU *time* | the Sentry, suspending its queues outside the granted window |
+
+**A sandbox may be given a compute unit mask or a time slice, never both.** The
+amdgpu driver refuses to put a debug session's CWSR workaround on a queue that
+carries a user CU mask -- `kfd_dbg_set_queue_workaround()` returns `EBUSY` for
+GC versions 11.0.0 to 11.0.3, which is every RDNA3 part -- and a time slice is
+enforced through exactly such a session. runsc refuses a sandbox configured with
+both, at startup, rather than letting it fail later as a queue creation that
+returns `EBUSY` and a ROCm runtime that dies on a null dereference.
+
+Which to choose is a real trade:
+
+*   A **CU mask** is a hard spatial partition. It holds with no ongoing
+    decision and isolates well, but it idles when its tenant does, cannot be
+    changed once queues exist, and is only a partition if the masks do not
+    overlap -- which whatever places the sandboxes must arrange. It also
+    partitions compute pipeline occupancy and *not* memory bandwidth, so
+    bandwidth-bound tenants still interfere.
+*   A **weight** is work-conserving and re-divided every period, so an idle
+    tenant's share goes to a busy one. It is the more accurate dial of the two.
+
+The memory limit composes with either.
+
+### Dividing an AMD GPU in time {#amd-gpu-scheduler}
+
+The mechanism is `KFD_IOC_DBG_TRAP_SUSPEND_QUEUES`, the operation ROCgdb uses to
+stop one process's queues while others keep using the device. The Sentry is
+itself the KFD process for the whole sandbox, and the kernel skips its
+`PTRACE_ATTACHED` check when the target is the caller, so the Sentry can suspend
+its own queues with no privileged helper. Two consequences follow, and both are
+improvements on the NVIDIA side:
+
+*   Work already running is preempted. CWSR saves and restores in-flight waves,
+    so a kernel is stopped mid-flight rather than having to run to completion.
+*   **Nothing privileged is in the enforcement path.** `runsc gpu-scheduler`
+    only advises; each Sentry suspends its own queues.
+
+#### 1. Run the coordinator
+
+One per host, exactly as for NVIDIA. It decides the windows, because a sandbox
+cannot see how many others are competing with it.
+
+```
+runsc gpu-scheduler --socket=/run/runsc-gpu-scheduler.sock \
+                    --measure-usage=false --period=100ms
+```
+
+`--measure-usage` reads `nvidia-smi` and is meaningless on an AMD host; turn it
+off.
+
+#### 2. Point the runtime at it, and remove any CU mask
+
+```toml
+# /etc/runsc/config.toml, read by the containerd shim
+[runsc_config]
+  platform = "kvm"
+  amdproxy = "true"
+  amdproxy-gpu-memory-limit = "12868124672"   # node-wide ceiling
+  amdproxy-gpu-scheduler-socket = "/run/runsc-gpu-scheduler.sock"
+  # No amdproxy-cu-mask here -- not even a full-device one. Any mask makes
+  # runsc refuse every weighted sandbox.
+```
+
+The scheduler must be running before any sandbox starts: with the socket
+configured node-wide, a sandbox whose runsc cannot connect fails to start.
+
+This file is decoded into `pkg/shim/v1/runsc.Options`, **not** into runsc's flag
+format. runsc flags belong under `[runsc_config]`; unknown top-level keys are
+dropped without a word.
+
+#### 3. Let the annotations through
+
+containerd's CRI plugin copies only its own annotations unless told otherwise,
+and this is the step that fails silently -- without it every pod runs on the
+node-wide ceiling with nothing to indicate it.
+
+```toml
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"
+  pod_annotations = ["dev.gvisor.*"]
+  container_annotations = ["dev.gvisor.*"]
+```
+
+#### 4. Put the scheduler in the matching mode
+
+With HAMi, set `timeSlice` in the AMD section of the `hami-scheduler-device`
+ConfigMap. It writes a weight *or* a CU mask, and must agree with step 2:
+
+```yaml
+amd:
+  resourceCountName: "amd.com/gpu"
+  resourceMemoryName: "amd.com/gpu-vram-mib"
+  defaultCUs: 64
+  cuGroupSize: 2
+  timeSlice: true
+```
+
+The scheduler logs which mode it is in once, at startup:
+
+```
+AMD GPUs on this cluster are divided in time, not in space:
+pods get dev.gvisor.flag.amdproxy-gpu-weight and no CU mask
+```
+
+#### 5. Request a slice
+
+A pod asks only for memory. `amd.com/gpu-vram-mib` counts fixed-size *units* --
+512 MiB each by default, so a ~12 GiB card advertises about 23 -- despite the
+name.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: trainer
+spec:
+  runtimeClassName: gvisor
+  containers:
+    - name: trainer
+      image: myrepo/trainer:latest
+      resources:
+        limits:
+          amd.com/gpu-vram-mib: 6      # 6 x 512 MiB = 3 GiB
+        requests:
+          amd.com/gpu-vram-mib: 6
+```
+
+Both annotations are then derived from that one request, by two different
+components:
+
+| annotation | written by | from |
+| --- | --- | --- |
+| `dev.gvisor.flag.amdproxy-gpu-memory-limit` | the admission webhook | slices x 512 MiB, in bytes |
+| `dev.gvisor.flag.amdproxy-gpu-weight` | the scheduler | slices as a percentage of the device |
+
+Six of 23 slices therefore yields `amdproxy-gpu-memory-limit: "3221225472"` and
+`amdproxy-gpu-weight: "27"`.
+
+Without either component, state them directly:
+
+```yaml
+metadata:
+  annotations:
+    dev.gvisor.flag.amdproxy-gpu-memory-limit: "3221225472"
+    dev.gvisor.flag.amdproxy-gpu-weight: "27"
+    # Only for a multi-process workload; see below.
+    dev.gvisor.flag.amdproxy-share-kfd-vm: "true"
+```
+
+A pod cannot escalate either. The memory limit may only be lowered: the webhook
+rewrites a larger self-annotation down to what the request derives. The weight
+is not clamped but *recomputed* -- the scheduler overwrites whatever the pod
+claimed. Measured against a pod that asked for 2 slices while annotating itself
+the whole card and weight 100: it received a 1 GiB limit and a weight of 9.
+
+#### 6. Multi-process workloads
+
+A sandbox gets **one** KFD process context, because KFD keys it on the calling
+`mm` and the Sentry is one host process. Without help only the first process to
+touch the GPU succeeds and the rest get `EBUSY`, which rules out vLLM, PyTorch
+distributed, and anything else that forks.
+
+`--amdproxy-share-kfd-vm` (or the annotation above) shares the one context. The
+cost is that those processes allocate from one address space while each believes
+it has its own, so an allocation that would overlap another's is refused rather
+than aliased. Nothing crosses a sandbox boundary, so this is a correctness trade
+confined to the container that opts in -- which is why it is off by default.
+
+#### 7. Check that it took
+
+The annotations first, since step 3 is the silent one:
+
+```
+crictl inspectp <pod-id> | grep dev.gvisor.flag
+```
+
+Then the Sentry, which records the session opening and each change of window:
+
+```
+grep -E "debug session|GPU window is now" /var/log/runsc/<sandbox-id>/*
+```
+
+```
+amdproxy: KFD debug session open (runtime_state=1 ttmp_setup=0); GPU time-slicing active
+amdproxy: GPU window is now 75ms of every 100ms at phase 0s (75%)
+```
+
+A window covering the whole period on a contended GPU means the sandbox is not
+being held; one that changes as pods come and go means it is. The `phase` is
+what keeps two sandboxes off the same 75 ms.
+
+The memory limit shows in the pod's own view: `rocm-smi` and
+`torch.cuda.mem_get_info()` inside the sandbox report its quota, never the
+device's.
+
+### What time-slicing costs
+
+Measured on a Navi 32 (54 CUs, ROCm 7.2), with a saturating ALU-bound workload:
+
+| | |
+| --- | --- |
+| one sandbox alone, unsliced | 11984 iters/s |
+| one sandbox alone, sliced | 6869 iters/s |
+| two sandboxes, weights 100:100 | 3391 / 3398, Jain 1.0000 |
+| two sandboxes, weights 300:100 | 5110 / 1673 = **3.05:1** |
+| two sandboxes, weights 500:100 | 5676 / 1106 = **5.13:1** |
+
+The step from 11984 to 6869 is the debug session's cost, and it is **entirely
+workload-shaped**: the session costs *occupancy*, not throughput. Fewer waves
+stay resident, so only kernels that need many of them to hide latency pay.
+The same session costs a bandwidth-bound workload 0.003%. The ALU-bound figure
+above is the most pessimistic instrument available.
+
+Slicing on top of the session is close to free: two contending tenants aggregate
+6782-6790 against one tenant's 6869.
+
+For real inference the picture is different again, because a small model does
+not saturate the device. Two vLLM tenants weighted 3:1 divide 2.38:1 and
+aggregate 102% of a single tenant -- work-conserving -- but about 27% less than
+the same two tenants ungated, which interleave and fill each other's gaps.
+**Time-slicing pays when tenants contend for a saturated resource and costs when
+they complement each other.**
+
+### Known limitations
+
+*   `AMDKFD_IOC_SVM` is denied deliberately. Forwarding it crashes ROCr's
+    initialisation under KVM, where the driver would act on a guest address;
+    denied, ROCr falls back cleanly. `hipMallocManaged` does not work;
+    `hipMalloc` workloads are unaffected.
+*   Checkpoint and restore of a sandbox that has used the GPU is not supported.
+*   A CU mask must select whole workgroup processors on RDNA, which pairs them.
+    runsc refuses a mask that splits a pair at startup, naming the offending
+    unit: the driver would otherwise reject it at the first queue and ROCr does
+    not survive a failed queue creation.
+*   A wedged GPU sandbox does not release `/dev/kfd` on `kubectl delete --force`
+    or `runsc delete --force`. It appears in `ps` as `exe`, so `pgrep
+    runsc-sandbox` finds nothing; `lsof /dev/kfd` names it. Until it is gone the
+    next pod fails on memory the previous one still holds, which reads like a
+    quota bug and is not one.
 
 ## Security
 

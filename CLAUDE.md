@@ -1136,10 +1136,13 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
 
 ## Next
 
-1. **Document the AMD half in `g3doc/user_guide/gpu.md`.** That file is
-   1054 lines and entirely NVIDIA; amdproxy has no user-facing documentation at
-   all. This is the largest remaining gap in making the branch genuinely
-   two-vendor.
+1. ~~**Document the AMD half in `g3doc/user_guide/gpu.md`.**~~ **Done
+   (2026-08-22).** `## AMD GPUs {#amdproxy}` covers the three limits and the
+   rule that a sandbox gets a CU mask *or* a weight, the seven-step runbook for
+   dividing a device in time, the pod annotations and which component derives
+   each of them, what the slicing costs, and the known limitations. The
+   remaining gap is narrower: nothing there is generated or tested, so the
+   measured figures in it will go stale.
 2. **Fix or default off `--measure-usage`.** It is on by default and makes an
    ordinary two-pod split *worse* than no scheduler at all (31/618 against
    324/324). The documented setup works around it; the code should not need the
