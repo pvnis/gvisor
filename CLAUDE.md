@@ -773,11 +773,29 @@ sandbox.
 
 Consequences worth stating plainly:
 
-- **Under Kubernetes as configured today, nothing can be time-sliced.** HAMi's
-  fork assigns a CU mask to every pod, and `/etc/runsc/config.toml` on sens1
-  carries a node-wide `amdproxy-cu-mask` ceiling besides. Both have to go for a
-  pod to get a weight. Changing the HAMi fork to assign a mask *or* a weight is
-  the next piece of work.
+- **Kubernetes now works, in either mode.** The HAMi fork takes
+  `amd.timeSlice` in the `hami-scheduler-device` ConfigMap and writes a weight
+  *or* a mask, never both (`~/HAMi`, branch `gvisor-amd-timeslice`, `d409e9e`).
+  The weight is derived from the memory request and scaled to a percentage of
+  the device, the same proportion `cusForRequest` uses for compute units, since
+  memory is the only thing an AMD pod asks for. Verified on sens1: a pod
+  requesting 8 of 23 slices got `amdproxy-gpu-weight: "35"` and **no**
+  `amdproxy-cu-mask`, and `--amdproxy-gpu-weight=35` appears in the sandbox's
+  `boot.txt`.
+
+  **The node config must match the scheduler's mode.** `/etc/runsc/config.toml`
+  on sens1 now carries `amdproxy-gpu-scheduler-socket` and deliberately *no*
+  `amdproxy-cu-mask` — not even a full-device one, since any mask makes runsc
+  refuse a weighted sandbox. The previous file is at
+  `config.toml.bak-preslice`. A `runsc gpu-scheduler` must be running or every
+  gVisor sandbox on the node fails to start.
+
+  **Memory quota and time slice compose.** The same pod, with the in-tree
+  webhook also injecting a quota: `amdproxy-gpu-memory-limit: 4294967296` and
+  `amdproxy-gpu-weight: 35` together, and memprobe saw 4096 MiB and stopped at
+  exactly 4096. Without the webhook (namespace not labelled `gvisor`) it saw
+  the node ceiling and took 12032 MiB — the quota is the webhook's doing, not
+  the scheduler's.
 - The refusal is unconditional, though the driver's rule is gfx11-only. CDNA
   and gfx12 fall outside `IP_VERSION(11,0,0)..(11,0,3)` and should permit both;
   nothing here can test that, and refusing an untested combination known to
