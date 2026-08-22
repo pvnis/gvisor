@@ -699,60 +699,68 @@ tenant of the same weight.
 read `ESCAPED` at ratio 1.187 purely because the good tenants finished first
 and left it alone at the end. Same trap as `tslice.sh -t`.
 
-### Slicing and `--amdproxy-share-kfd-vm` do not compose, and vLLM needs both
+### Time-slicing and CU masks cannot both be applied on gfx11
 
-**This blocks the vLLM half of the adversarial test.** With a debug session
-open on a sandbox whose processes share one KFD context, **`CREATE_QUEUE`
-returns `EBUSY`**, and ROCr's error path dereferences null.
+**Root cause found in the kernel source, and it is not what the symptom
+suggested.** The Ubuntu source for the exact running kernel is at
+`~/kernel-source/linux-7.0` (`linux-hwe-7.0` 7.0.0-28.28~24.04.1, verified: its
+changelog names that version, `KFD_IOCTL_MINOR_VERSION` is 22, and its
+`kfd_ioctl_create_queue_args` computes to the 96 bytes that make the ioctl
+`0xc0604b02`). `drivers/gpu/drm/amd/amdkfd/kfd_debug.c:310`:
 
-Traced with `--strace-syscalls=ioctl`. vLLM's engine core made **1002** KFD
-ioctls, then the sandbox's one and only `CREATE_QUEUE` (`0xc0604b02`) came back
-`EBUSY`; the engine core then ran an unwind — `DESTROY_EVENT`,
-`UNMAP_MEMORY_FROM_GPU`, `FREE_MEMORY_OF_GPU` — and took **`Signal 11 ... fault
-addr: 0x34`**. vLLM reports that only as `{'EngineCore_DP0': -11}`. Nothing in
-`dmesg`; amdproxy never returns `EBUSY` itself, so the refusal is the driver's.
+```c
+static int kfd_dbg_set_queue_workaround(struct queue *q, bool enable)
+{
+	if (!kfd_dbg_has_cwsr_workaround(q->device))
+		return 0;
+	if (enable && q->properties.is_user_cu_masked)
+		return -EBUSY;
+```
 
-*No ioctl hung* — the strace shows every call entered and left. The earlier
-guess that a process was stuck waiting was wrong.
+and `kfd_dbg_has_cwsr_workaround()` is `GC_VERSION >= IP_VERSION(11,0,0) &&
+<= IP_VERSION(11,0,3)` — which includes sens1's Navi 32. **On gfx11 the driver
+refuses to put a debug session's CWSR workaround on a queue that carries a user
+CU mask.** The two mechanisms this branch enforces with, spatial and temporal,
+are mutually exclusive on this ASIC, by the driver's own rule.
 
-Bisected precisely:
+The chain, every step measured:
 
-| configuration | result |
+1. amdproxy opens the debug session, which time-slicing needs.
+2. `CREATE_QUEUE` succeeds.
+3. amdproxy applies the sandbox's CU mask, as it always has —
+   `SET_CU_MASK` sets `is_user_cu_masked` and returns **`EBUSY`**.
+4. `kfdCreateQueue` destroys the queue and returns that error as the
+   *`CREATE_QUEUE`* result: `amdproxy: applying CU mask to queue 0 failed
+   (device or resource busy); destroying it`.
+5. ROCr does not handle a failed queue creation and dereferences null —
+   `Signal 11 ... fault addr: 0x34`. **The same ROCr bug already recorded above
+   for a CU mask that splits a workgroup processor.**
+
+Reproduced in one command, no Kubernetes and no vLLM:
+
+| `gpuburn` under | result |
 | --- | --- |
-| vLLM, sharing on, **no** scheduler socket | serves, 92 s to ready |
-| vLLM, sharing on, socket set | engine core SIGSEGV |
-| `gpuburn` (single process), sharing on, socket set | **fine**, 6869 iters/s |
+| `--amdproxy-cu-mask=0xfffff` alone | 4550 iters/s |
+| `--amdproxy-cu-mask=0xfffff` + scheduler socket | **dies at the first queue** |
+| scheduler socket alone | 6869 iters/s |
 
-So it is neither sharing nor slicing alone — it is a second process joining a
-context a debugger is attached to. Opening the session earlier helps but does
-not fix it: doing it at the first `CREATE_QUEUE` attaches to a runtime already
-`ENABLED_BUSY` (`runtime_state=2`), which is ROCgdb's attach-to-a-live-process
-path and expects a `SEND_RUNTIME_EVENT` answer nothing here gives; moving it to
-just after `RUNTIME_ENABLE` gets `runtime_state=1` and still dies.
+**vLLM was a red herring.** It failed only because HAMi's allocator assigns
+every pod a CU mask (`0xfffff`, 20 CUs, visible in the pod annotations). Three
+earlier hypotheses are now dead, and all three were plausible: it is not the
+session attaching to an `ENABLED_BUSY` runtime, not the file descriptor the
+session is opened on, and **not multi-process sharing at all** — the
+`--amdproxy-share-kfd-vm` guard now in the code is aimed at the wrong thing.
 
-**Two mechanisms were tried and both are refuted:**
+Consequences worth stating plainly:
 
-- *Session timing.* Opening it at the first `CREATE_QUEUE` attaches to a
-  runtime already `ENABLED_BUSY` (`runtime_state=2`) — ROCgdb's
-  attach-to-a-live-process path, which expects a `SEND_RUNTIME_EVENT` answer
-  nothing here gives. Real bug, fixed by opening at `RUNTIME_ENABLE`
-  (`runtime_state=1`), and *not* this one.
-- *Descriptor identity.* Each guest process opens its own `/dev/kfd`, so the
-  session was on one host fd and the queue created on another. Opening the
-  session on the very descriptor that then creates the queue, before the queue
-  exists, at `runtime_state=1`, gives **the same `EBUSY`**.
-
-What is left is the multi-process state itself: earlier processes hold the
-signal page and have had their `ACQUIRE_VM` and `RUNTIME_ENABLE` answered
-locally by `sharedvm.go`, because the driver refuses those a second time.
-Settling it needs the `EBUSY` paths of `kfd_ioctl_create_queue`, and **no
-kernel source for 7.0.0-28 is installed on sens1** — that is the next step.
-
-**amdproxy now refuses the combination** rather than letting a workload die:
-with `--amdproxy-share-kfd-vm` set, the sandbox is not sliced and says so
-loudly, keeping its memory quota and CU mask. Multi-process GPU workloads —
-vLLM above all — are therefore **not time-sliced today**. This is the largest
-open gap in the AMD half.
+- On gfx11, a sandbox may have a CU mask **or** a time slice, not both.
+- HAMi assigns CU masks automatically, so under Kubernetes as configured today
+  *every* pod gets one and none can be time-sliced.
+- The right fix is to make the two exclusive deliberately and per sandbox —
+  drop the CU mask when a weight is given, or refuse the combination at startup
+  the way an invalid mask already is — rather than the share-kfd-vm guard.
+- Whether this applies beyond gfx11 is a one-line check: CDNA and gfx12 are
+  outside `IP_VERSION(11,0,0)..(11,0,3)` and should permit both.
 
 **A lesson worth keeping: `desired()` and the transition test are two booleans
 and both were wrong.** The transition test was inverted (`suspended == !want`),
