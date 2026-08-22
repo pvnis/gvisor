@@ -692,6 +692,40 @@ so how the attacker submits is irrelevant.
 | before vs after attacking | ratio 0.996 | **CONTAINED** |
 | an *honest* tenant in its place | 953.3 iters/s | adversary got 947.0 — **within 0.6%** |
 
+#### Through the full Kubernetes stack, 3 good tenants and 1 attacker (2026-08-22)
+
+`~/amdtest/k8s/adversary-k8s.sh`. Everything above was runsc invoked directly;
+this is the webhook, the HAMi fork's weight assignment and amdproxy's
+enforcement together. The attacker requests the *smallest* slice and then
+annotates itself the whole card and the largest weight it can name.
+
+**Two defences, in two different places, and both hold:**
+
+| the attack | asked for | got |
+| --- | --- | --- |
+| annotate `amdproxy-gpu-memory-limit` = 12868124672 (whole card) | 2 slices | **1073741824** — clamped by the webhook, narrow-only |
+| annotate `amdproxy-gpu-weight` = 100 | 2 slices | **9** — overwritten by the scheduler, which derives it from the request |
+| `DBG_TRAP TRAP_ENABLE` on itself | | **refused** (EINVAL) |
+| `DBG_TRAP RESUME_QUEUES` over guessed ids | | **refused** (EINVAL) |
+| `CREATE_PROCESS` | | **refused** (EINVAL) |
+| `UPDATE_QUEUE queue_percentage=100` | | allowed, does not lift the suspension |
+
+| tenant | weight | iters/s |
+| --- | --- | --- |
+| good1 / good2 / good3 | 27 each | 1807.7 / 1811.8 / 1786.4 |
+| **adversary** | 9 | **555.3** |
+
+**3.25:1** against the 3:1 the weights ask; the adversary took **9.3%** of the
+aggregate where its weight entitles it to 10.0%. Its own before/after ratio was
+**0.963 — CONTAINED**: attacking made it slightly *worse* off. Zero driver
+faults during the run.
+
+The weight defence is worth naming separately from the memory one, because it
+is not the webhook's: the webhook has no AMD weight injector, and runsc's
+narrow-only check has nothing to compare against when the runtime sets no
+weight. What stops the escalation is that the scheduler *computes* the weight
+from the resource request and overwrites whatever the pod claimed.
+
 That last row is the statement: the attacker gains nothing over a well-behaved
 tenant of the same weight.
 
