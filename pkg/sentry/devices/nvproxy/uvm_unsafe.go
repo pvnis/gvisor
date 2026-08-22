@@ -37,6 +37,20 @@ func uvmIoctlInvoke[Params any, PtrParams hasStatusPtr[Params]](ui *uvmIoctlStat
 	return n, nil
 }
 
+// uvmQueryGmem issues an idempotent UVM_SET_GMEM_LIMIT (re-setting the same
+// limit and group) purely to read back the driver's per-tenant device-resident
+// and cumulative-evicted byte counters. Used by the thrash-detection monitor.
+// Re-setting the same limit is a no-op in the driver beyond returning the
+// counters.
+func uvmQueryGmem(hostFD int32, limit, group uint64) (resident, evicted uint64, err error) {
+	params := nvgpu.UVM_SET_GMEM_LIMIT_PARAMS{Limit: limit, Group: group}
+	_, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(hostFD), uintptr(nvgpu.UVM_SET_GMEM_LIMIT), uintptr(unsafe.Pointer(&params)))
+	if errno != 0 {
+		return 0, 0, errno
+	}
+	return params.ResidentBytes, params.EvictedBytes, nil
+}
+
 // BufferReadAt implements memmap.File.BufferReadAt.
 func (mf *uvmFDMemmapFile) BufferReadAt(off uint64, dst []byte) (uint64, error) {
 	// kernel-open/nvidia-uvm/uvm.c:uvm_fops.{read,read_iter,splice_read} ==

@@ -16,6 +16,7 @@ package nvproxy
 
 import (
 	"fmt"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
@@ -91,10 +92,19 @@ type uvmFD struct {
 	mappings   memmap.MappingSet
 
 	queue waiter.Queue
+
+	// monitorStop, when closed, stops the gmem thrash-detection monitor
+	// goroutine started for this fd by setUVMGmemLimit (see gmemMonitor). nil
+	// when no monitor runs (no gmem quota configured, or a driver without the
+	// counters). Not saved: a GPU sandbox cannot be checkpointed anyway.
+	monitorStop chan struct{} `state:"nosave"`
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *uvmFD) Release(context.Context) {
+	if fd.monitorStop != nil {
+		close(fd.monitorStop)
+	}
 	fdnotifier.RemoveFD(fd.hostFD)
 	fd.queue.Notify(waiter.EventHUp)
 	fd.memmapFile.MappableRelease()
@@ -242,6 +252,71 @@ func setUVMGmemLimit(ui *uvmIoctlState) {
 	}
 	if _, err := uvmIoctlInvoke(sub, &ioctlParams); err != nil {
 		ui.ctx.Warningf("nvproxy: failed to set UVM gmem limit to %d bytes: %v", limit, err)
+		return
+	}
+	// The driver accepted the cap and reported this tenant's counters back, so
+	// the thrash-detection counters are present. Start a background monitor that
+	// samples them and logs the eviction rate (the detection half of the
+	// thrash-policy mechanism). One per uvm fd; harmless if several of a
+	// sandbox's fds each start one, since they observe the same shared group.
+	if ui.fd.monitorStop == nil {
+		ui.fd.monitorStop = make(chan struct{})
+		go gmemMonitor(ui.fd, limit, ui.fd.dev.nvp.gmemGroupID)
+	}
+}
+
+// Thresholds for tagging a sample as thrashing. These are fixed for now; the
+// configurable thrash *policy* (per-node default + narrow-only per-tenant
+// override, and the throttle/detach/kill actions) is layered on in a later step.
+const (
+	// A tenant counts as "at cap" when its device-resident bytes are within this
+	// fraction of its gmem limit — the precondition for thrashing (a tenant well
+	// under its cap is not paging under pressure).
+	gmemAtCapFraction = 0.9
+	// Sustained eviction above this rate while at cap is the thrash signature.
+	// A healthy overcommit (large but cold working set) evicts once at warmup
+	// then settles to ~0; a thrasher pages every access and stays high.
+	gmemThrashRateMiBps = 100.0
+	// How often the monitor samples the driver counters.
+	gmemMonitorInterval = 2 * time.Second
+)
+
+// gmemMonitor periodically reads this tenant's per-group device-resident and
+// cumulative-evicted byte counters from the driver (via an idempotent
+// UVM_SET_GMEM_LIMIT that returns them) and logs the eviction rate. A tenant
+// pinned at its gmem cap with a sustained nonzero eviction rate is a thrashing
+// oversubscriber — paging every access at PCIe speed and saturating the memory
+// bus its neighbours share. Read-only and best-effort: it observes, never acts,
+// and exits when the fd is released or the driver ioctl starts failing.
+func gmemMonitor(fd *uvmFD, limit, group uint64) {
+	ticker := time.NewTicker(gmemMonitorInterval)
+	defer ticker.Stop()
+	var prevEvicted uint64
+	havePrev := false
+	for {
+		select {
+		case <-fd.monitorStop:
+			return
+		case <-ticker.C:
+		}
+		resident, evicted, err := uvmQueryGmem(fd.hostFD, limit, group)
+		if err != nil {
+			// The fd is likely closing; stop quietly.
+			return
+		}
+		if havePrev {
+			deltaMiB := float64(int64(evicted-prevEvicted)) / (1 << 20)
+			rateMiBps := deltaMiB / gmemMonitorInterval.Seconds()
+			atCap := limit > 0 && float64(resident) >= gmemAtCapFraction*float64(limit)
+			tag := ""
+			if atCap && rateMiBps >= gmemThrashRateMiBps {
+				tag = " THRASH"
+			}
+			log.Infof("nvproxy: gmem group=%#x resident=%dMiB/%dMiB evict_rate=%.0fMiB/s%s",
+				group, resident>>20, limit>>20, rateMiBps, tag)
+		}
+		prevEvicted = evicted
+		havePrev = true
 	}
 }
 
