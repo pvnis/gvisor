@@ -244,6 +244,64 @@ func TestNeedsTransition(t *testing.T) {
 	}
 }
 
+// TestQuietPeriodsBeforeIdle tests that one quiet sample is not idleness.
+//
+// A suspension catches whatever waves are resident at that instant, and a
+// latency-bound workload is between kernels more often than inside one. Acting
+// on a single sample made the scheduler oscillate between handing a tenant the
+// whole period and the 5 ms floor, and two vLLM tenants weighted 3:1 came out
+// 1.06:1.
+func TestQuietPeriodsBeforeIdle(t *testing.T) {
+	ts := &timeSlicer{queues: map[uint32]uint32{1: 24576}}
+	active := func() bool {
+		samples, busy := ts.samples, ts.busySamples
+		ts.samples, ts.busySamples = 0, 0
+		if samples > 0 {
+			if busy > 0 {
+				ts.quietPeriods = 0
+			} else {
+				ts.quietPeriods++
+			}
+		}
+		return len(ts.queues) > 0 && (samples == 0 || ts.quietPeriods < activeMemory)
+	}
+	quiet := func() { ts.samples, ts.busySamples = 1, 0 }
+	busy := func() { ts.samples, ts.busySamples = 1, 1 }
+
+	// A run of quiet periods shorter than activeMemory keeps the tenant active.
+	for i := 0; i < activeMemory-1; i++ {
+		quiet()
+		if !active() {
+			t.Fatalf("reported idle after %d quiet periods, want active until %d", i+1, activeMemory)
+		}
+	}
+	// One more tips it over.
+	quiet()
+	if active() {
+		t.Errorf("still active after %d quiet periods", activeMemory)
+	}
+	// Any wave seen resets it immediately.
+	busy()
+	if !active() {
+		t.Error("reported idle in a period whose sample saw waves")
+	}
+	// A tenant that has gone quiet and is then left unsuspended -- which is
+	// what happens the moment it is granted the whole period -- must report
+	// active again, because there is no longer any evidence and wave state
+	// only exists where a suspension put it. Reporting idle here latches: the
+	// tenant is granted everything, so it is never suspended, so it never
+	// samples, so it can never be seen to resume.
+	for i := 0; i < activeMemory; i++ {
+		quiet()
+		active()
+	}
+	for i := 0; i < 3*activeMemory; i++ {
+		if !active() { // no samples this period
+			t.Fatal("a tenant with no evidence reported idle; it can never recover")
+		}
+	}
+}
+
 // TestOnlyComputeQueuesAreSliced tests that SDMA queues are left alone.
 // Suspending those stalls memory copies without gating any compute.
 func TestOnlyComputeQueuesAreSliced(t *testing.T) {

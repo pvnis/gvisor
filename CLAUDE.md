@@ -783,13 +783,64 @@ Consequences worth stating plainly:
   nothing here can test that, and refusing an untested combination known to
   crash the runtime elsewhere is the safe direction. Narrow it when there is an
   MI part to try.
-- **Whether a multi-process workload can be time-sliced is untested**, and the
-  earlier claim that it cannot is withdrawn — it rested on vLLM, whose failure
-  was the CU mask. `src/multiburn.c` was written to settle it and cannot: three
-  gpuburn processes in one `--amdproxy-share-kfd-vm` sandbox lose two of the
-  three *with slicing off*, so the probe hits a sharing limit of its own before
-  it reaches the question. Settling it needs vLLM with a weight and no mask,
-  which needs the HAMi change above.
+- **vLLM is time-sliced, measured** — see below. The claim that multi-process
+  workloads cannot be is withdrawn; it rested entirely on the CU mask.
+
+### vLLM time-sliced under gVisor, straight from runsc (2026-08-22)
+
+`~/amdtest/vllm-runsc.sh` runs a vLLM server in a gVisor sandbox with no
+Kubernetes, no HAMi, no device plugin and **no CU mask**; the image is exported
+once to `/var/lib/vllm-rootfs` and shared read-only, so two tenants cost one
+copy. `vllm-bench-runsc.sh` drives each server from inside its own sandbox via
+`runsc exec`, so no networking is in the measurement.
+
+Qwen2.5-0.5B-Instruct, 0.30 utilization each, concurrency 16, 45 s:
+
+| configuration | result |
+| --- | --- |
+| one tenant alone, sliced | 1808.6 tok/s |
+| two tenants, weights 300:100 | **1296.8 / 546.0 = 2.38:1** (asked 3:1) |
+| aggregate under contention | 1842.8 tok/s — **102% of one tenant alone** |
+| two tenants, neither actually gated | 2508 tok/s |
+
+So the division is real and work-conserving against a single tenant, and costs
+about 27% against two *ungated* tenants — the same sign and size the interposer
+measured, and for the same reason: neither vLLM tenant saturates the device, so
+ungated they interleave and fill each other's gaps, and slicing destroys that
+overlap. Precision is lower than gpuburn's 3.05:1 for the same reason.
+
+**Two things about the harness, both of which produced a wrong number first.**
+
+- **Drive the tenants concurrently.** A weighted slice only binds a tenant that
+  wants more than its share. One request at a time, a 0.5B model leaves the GPU
+  mostly idle, a 25% window exceeds the tenant's demand, and 3:1 measures
+  0.90:1 while the scheduler grants exactly 75 ms and 25 ms. That is the load
+  being too light to divide, not the divider failing.
+- **`--network=none`, not the default.** vLLM's engine core reaches its own API
+  server over torch.distributed's TCPStore on loopback. The default sandbox
+  netstack has no loopback address at all — `bind(("127.0.0.1", 0))` returns
+  `EADDRNOTAVAIL`, with or without a network namespace in the spec — while both
+  `none` and `host` provide one. `none` also gives each tenant its own, so two
+  servers cannot collide on a port. `VLLM_HOST_IP=127.0.0.1` is needed besides,
+  or vLLM falls back to `0.0.0.0`, which Linux treats as loopback and gVisor's
+  netstack does not.
+
+**The activity signal has to fail towards "active", and the reason is a
+feedback loop.** Wave state exists only where a suspension put it, so a sandbox
+that is not being suspended cannot be measured — and a sandbox granted the
+whole period is never suspended. Reporting idle on no evidence therefore
+latches: the tenant is granted everything, stops being suspended, never samples
+again, and can never be seen to resume. Measured: two vLLM tenants weighted 3:1
+held the correct 75/25 windows for **0.7 seconds**, then both latched idle,
+were each granted the whole period, and finished **0.88:1** having been
+suspended **six times in forty seconds**. With no-evidence reading as active
+the same run suspends 864 times and divides 2.38:1.
+
+The other half of the same problem is the opposite failure: acting on a single
+quiet sample. A suspension catches whatever is resident at that instant, and a
+decode loop is between kernels more often than inside one, so one sample makes
+a busy tenant look idle and the two tenants trade places every few periods.
+`activeMemory` requires five consecutive quiet samples before yielding.
 
 **A lesson worth keeping: `desired()` and the transition test are two booleans
 and both were wrong.** The transition test was inverted (`suspended == !want`),

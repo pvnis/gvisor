@@ -70,6 +70,26 @@ const (
 	// spinning forever.
 	maxDrainedEvents = 1024
 
+	// activeMemory is how many consecutive periods must pass with no wave state
+	// saved before the sandbox is reported idle.
+	//
+	// One period's sample is not enough. A suspension catches whatever happens
+	// to be resident at that instant, and a latency-bound workload -- an LLM
+	// decoding a token at a time -- is between kernels far more often than it
+	// is inside one. gpuburn is caught 82% of the time; vLLM is caught rarely,
+	// and reporting from the last sample alone made the scheduler oscillate:
+	// the tenant reported idle, dropped to the 5 ms floor, was granted the
+	// whole period back the moment its neighbour looked idle too, and the two
+	// swapped places every few periods. Measured on two vLLM tenants weighted
+	// 3:1, whose windows flapped between 5%, 75% and 100% and whose throughput
+	// came out 1.06:1.
+	//
+	// Five periods is half a second at the default period: long enough to span
+	// the gaps in a decode loop, short enough that a tenant which really stops
+	// hands its share over promptly. The scheduler applies its own hysteresis
+	// on top.
+	activeMemory = 5
+
 	// resumeSlack shifts the whole window this far earlier, so that the queues
 	// are already running when the granted slot begins. A suspend and a resume
 	// cost around half a millisecond each (a queue's *first* suspend costs
@@ -124,6 +144,11 @@ type timeSlicer struct {
 	// suspended, and how many of those suspensions had waves to save.
 	samples     uint64
 	busySamples uint64
+
+	// quietPeriods counts consecutive reports whose samples saw no waves at
+	// all, and is what decides idleness rather than the latest sample. See
+	// activeMemory.
+	quietPeriods uint64
 
 	// ctlStack is scratch for the control stack GET_QUEUE_WAVE_STATE writes,
 	// kept so the probe does not allocate every period.
@@ -552,22 +577,29 @@ func (ts *timeSlicer) follow() {
 		ts.mu.Lock()
 		samples, busy := ts.samples, ts.busySamples
 		ts.samples, ts.busySamples = 0, 0
-		hasQueues := len(ts.queues) > 0
-		ts.mu.Unlock()
-
-		// Report whether the sandbox was *executing*, as measured by how much
-		// wave state its suspensions had to save -- see sampleWavesLocked.
-		//
-		// With no samples there is no evidence either way, which happens when
-		// the sandbox holds the whole period and is therefore never suspended.
-		// Fall back to "holds a queue" there: a sandbox that is not being
-		// stopped is not taking a window from anybody, and claiming it is idle
-		// would cost it its share for the three periods of the scheduler's
-		// hysteresis the moment a neighbour appeared.
-		active := hasQueues
 		if samples > 0 {
-			active = busy > 0
+			// Evidence this period. A single quiet sample is not idleness;
+			// activeMemory says how many in a row are.
+			if busy > 0 {
+				ts.quietPeriods = 0
+			} else {
+				ts.quietPeriods++
+			}
 		}
+		// With no samples there is no evidence either way, and the only safe
+		// answer is that the sandbox is asking for the GPU.
+		//
+		// Wave state exists only where a suspension put it, so a sandbox that
+		// is not being suspended cannot be measured -- and a sandbox holding
+		// the whole period is never suspended. Carrying the previous verdict
+		// forward instead looks tidier and latches: a tenant reported idle is
+		// granted everything, stops being suspended, never samples again, and
+		// can never be seen to resume. Measured on two vLLM tenants weighted
+		// 3:1, where the correct 75/25 windows held for 0.7 seconds before
+		// both tenants latched idle, were each granted the whole period, and
+		// finished 0.88:1 having been suspended six times in forty seconds.
+		active := len(ts.queues) > 0 && (samples == 0 || ts.quietPeriods < activeMemory)
+		ts.mu.Unlock()
 		var submissions uint64
 		if active {
 			submissions = 1
