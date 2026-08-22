@@ -576,6 +576,18 @@ func (c *Config) Validate() error {
 	} else if c.AMDProxyCUMask != "" && mask.Empty() {
 		return fmt.Errorf("amdproxy-cu-mask=%q selects no compute units", c.AMDProxyCUMask)
 	}
+	// A sandbox may be divided in space or in time, not both. amdproxy refuses
+	// the combination too, since that is where the reason lives, but by then
+	// the sandbox is already starting and the refusal reaches the operator as
+	// "cannot read client sync file: EOF" with the real message a log deep.
+	// This runs in runsc itself, so the operator is told directly.
+	if c.AMDProxyCUMask != "" && c.AMDProxyGPUSchedulerSocket != "" {
+		return fmt.Errorf("amdproxy-cu-mask and amdproxy-gpu-scheduler-socket are mutually exclusive: "+
+			"a sandbox may be given a share of the GPU in space (a compute unit mask) or in time (a weight), "+
+			"and the amdgpu driver refuses a time slice's debug session on a CU-masked queue. "+
+			"Got mask %q and scheduler %q; unset one, including any node-wide default in /etc/runsc/config.toml",
+			c.AMDProxyCUMask, c.AMDProxyGPUSchedulerSocket)
+	}
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
 	}

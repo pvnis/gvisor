@@ -23,7 +23,7 @@ difference in their behaviour follows from that.
 
 | | AMD (`amdproxy`) | NVIDIA (`nvproxy`) |
 | --- | --- | --- |
-| compute is divided in | **space** — CU masks, **and time** — queue suspension | **time** — submission windows |
+| compute is divided in | **space** — CU masks, **or time** — queue suspension, never both | **time** — submission windows |
 | enforced by | the GPU's command processor; or the Sentry, suspending queues | the Sentry, gating submission |
 | set at | queue creation, per ioctl; or continuously, per period | continuously, per period |
 | unused share goes to | CU masks: nobody. Time slices: whoever is asking | whoever is asking (with the scheduler) |
@@ -751,16 +751,45 @@ session attaching to an `ENABLED_BUSY` runtime, not the file descriptor the
 session is opened on, and **not multi-process sharing at all** — the
 `--amdproxy-share-kfd-vm` guard now in the code is aimed at the wrong thing.
 
+**The combination is now refused, in two places.** `Config.Validate()` catches
+it in runsc itself, so the operator is told directly; without that the refusal
+reaches them as `cannot read client sync file: EOF` with the real message a log
+deep, because `Register` runs inside the sandbox. `checkSliceOrMask` in
+`amdproxy.go` refuses it again where the reason lives, for callers that do not
+come through the flag path.
+
+    $ runsc --amdproxy-cu-mask=0xfffff --amdproxy-gpu-scheduler-socket=... ...
+    amdproxy-cu-mask and amdproxy-gpu-scheduler-socket are mutually exclusive:
+    a sandbox may be given a share of the GPU in space (a compute unit mask) or
+    in time (a weight) ... unset one, including any node-wide default in
+    /etc/runsc/config.toml
+
+Verified on hardware: mask only 4561 iters/s, weight only 6898, both refused.
+
+Neither is silently preferred. Which one a sandbox should get is a real choice
+— a mask is a hard partition that idles when its tenant does, a weight is
+work-conserving and exactly proportional — and it belongs to whoever places the
+sandbox.
+
 Consequences worth stating plainly:
 
-- On gfx11, a sandbox may have a CU mask **or** a time slice, not both.
-- HAMi assigns CU masks automatically, so under Kubernetes as configured today
-  *every* pod gets one and none can be time-sliced.
-- The right fix is to make the two exclusive deliberately and per sandbox —
-  drop the CU mask when a weight is given, or refuse the combination at startup
-  the way an invalid mask already is — rather than the share-kfd-vm guard.
-- Whether this applies beyond gfx11 is a one-line check: CDNA and gfx12 are
-  outside `IP_VERSION(11,0,0)..(11,0,3)` and should permit both.
+- **Under Kubernetes as configured today, nothing can be time-sliced.** HAMi's
+  fork assigns a CU mask to every pod, and `/etc/runsc/config.toml` on sens1
+  carries a node-wide `amdproxy-cu-mask` ceiling besides. Both have to go for a
+  pod to get a weight. Changing the HAMi fork to assign a mask *or* a weight is
+  the next piece of work.
+- The refusal is unconditional, though the driver's rule is gfx11-only. CDNA
+  and gfx12 fall outside `IP_VERSION(11,0,0)..(11,0,3)` and should permit both;
+  nothing here can test that, and refusing an untested combination known to
+  crash the runtime elsewhere is the safe direction. Narrow it when there is an
+  MI part to try.
+- **Whether a multi-process workload can be time-sliced is untested**, and the
+  earlier claim that it cannot is withdrawn — it rested on vLLM, whose failure
+  was the CU mask. `src/multiburn.c` was written to settle it and cannot: three
+  gpuburn processes in one `--amdproxy-share-kfd-vm` sandbox lose two of the
+  three *with slicing off*, so the probe hits a sharing limit of its own before
+  it reaches the question. Settling it needs vLLM with a weight and no mask,
+  which needs the HAMi change above.
 
 **A lesson worth keeping: `desired()` and the transition test are two booleans
 and both were wrong.** The transition test was inverted (`suspended == !want`),

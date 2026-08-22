@@ -15,12 +15,14 @@
 package amdproxy
 
 import (
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/abi/amdgpu"
 	"gvisor.dev/gvisor/pkg/gpusched"
+	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy/amdconf"
 )
 
 // TestDbgTrapArgSizes tests that every DBG_TRAP parameter struct is the size
@@ -260,15 +262,48 @@ func TestOnlyComputeQueuesAreSliced(t *testing.T) {
 	}
 }
 
-// TestShareKFDVMDisablesSlicing tests that the two features refuse to combine.
-// A debug session on a shared KFD context kills the second process in the
-// sandbox to initialise the ROCm runtime, so the combination has to be refused
-// where it can still be reported rather than discovered as a crash.
-func TestShareKFDVMDisablesSlicing(t *testing.T) {
-	var ts timeSlicer
-	ts.init(100, 7, "cid", true)
-	if ts.enabled() {
-		t.Error("slicing is on for a sandbox sharing one KFD address space")
+// TestCUMaskAndWeightAreExclusive tests that a sandbox cannot be configured
+// with both a compute unit mask and a time slice.
+//
+// The driver refuses the combination -- kfd_dbg_set_queue_workaround() returns
+// EBUSY for a debug session's CWSR workaround on a CU-masked queue -- and it
+// refuses it far too late to be diagnosable: the queue is destroyed and ROCr
+// dies on a null dereference. Registration is where it has to be caught.
+func TestCUMaskAndWeightAreExclusive(t *testing.T) {
+	mask, err := amdconf.ParseCUMask("0x3f")
+	if err != nil {
+		t.Fatalf("parsing a CU mask: %v", err)
+	}
+	for _, test := range []struct {
+		name    string
+		opts    Options
+		wantErr bool
+	}{
+		{name: "mask alone", opts: Options{CUMask: mask, SchedulerFD: -1}},
+		{name: "weight alone", opts: Options{SchedulerFD: 7, SchedulerWeight: 100}},
+		{name: "neither", opts: Options{SchedulerFD: -1}},
+		{name: "both", opts: Options{CUMask: mask, SchedulerFD: 7, SchedulerWeight: 100}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := checkSliceOrMask(&test.opts)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("accepted both a CU mask and a time slice, want a refusal")
+				}
+				// The message has to name both flags: an operator seeing this
+				// has set one of them somewhere they may have forgotten, very
+				// likely a node-wide default.
+				for _, want := range []string{"amdproxy-cu-mask", "amdproxy-gpu-weight"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("refusal does not mention %q: %v", want, err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected refusal: %v", err)
+			}
+		})
 	}
 }
 
@@ -276,7 +311,7 @@ func TestShareKFDVMDisablesSlicing(t *testing.T) {
 // takes none of this path, since that is every sandbox by default.
 func TestDisabledSlicerIsInert(t *testing.T) {
 	var ts timeSlicer
-	ts.init(0, -1, "", false)
+	ts.init(0, -1, "")
 	if ts.enabled() {
 		t.Fatal("a sandbox without a scheduler connection is being sliced")
 	}

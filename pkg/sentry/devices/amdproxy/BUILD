@@ -59,5 +59,6 @@ go_test(
     deps = [
         "//pkg/abi/amdgpu",
         "//pkg/gpusched",
+        "//pkg/sentry/devices/amdproxy/amdconf",
     ],
 )
