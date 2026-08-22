@@ -701,12 +701,19 @@ and left it alone at the end. Same trap as `tslice.sh -t`.
 
 ### Slicing and `--amdproxy-share-kfd-vm` do not compose, and vLLM needs both
 
-**This blocks the vLLM half of the adversarial test.** A KFD debug session on a
-sandbox whose processes share one KFD context kills the *second* process to
-initialise the ROCm runtime. Measured: vLLM's API server came up, its engine
-core died with SIGSEGV, reported only as
-`Engine core initialization failed ... {'EngineCore_DP0': -11}` — nothing in
-`dmesg`, nothing in the Sentry log.
+**This blocks the vLLM half of the adversarial test.** With a debug session
+open on a sandbox whose processes share one KFD context, **`CREATE_QUEUE`
+returns `EBUSY`**, and ROCr's error path dereferences null.
+
+Traced with `--strace-syscalls=ioctl`. vLLM's engine core made **1002** KFD
+ioctls, then the sandbox's one and only `CREATE_QUEUE` (`0xc0604b02`) came back
+`EBUSY`; the engine core then ran an unwind — `DESTROY_EVENT`,
+`UNMAP_MEMORY_FROM_GPU`, `FREE_MEMORY_OF_GPU` — and took **`Signal 11 ... fault
+addr: 0x34`**. vLLM reports that only as `{'EngineCore_DP0': -11}`. Nothing in
+`dmesg`; amdproxy never returns `EBUSY` itself, so the refusal is the driver's.
+
+*No ioctl hung* — the strace shows every call entered and left. The earlier
+guess that a process was stuck waiting was wrong.
 
 Bisected precisely:
 
@@ -723,10 +730,23 @@ not fix it: doing it at the first `CREATE_QUEUE` attaches to a runtime already
 path and expects a `SEND_RUNTIME_EVENT` answer nothing here gives; moving it to
 just after `RUNTIME_ENABLE` gets `runtime_state=1` and still dies.
 
-Likely mechanism, **not confirmed**: `RUNTIME_ENABLE` is answered locally for
-every process after the first (the driver gives `EBUSY` otherwise, which is why
-`runtimeShare` exists), so a later process never learns from the driver that a
-debugger is attached and sets itself up as though none were.
+**Two mechanisms were tried and both are refuted:**
+
+- *Session timing.* Opening it at the first `CREATE_QUEUE` attaches to a
+  runtime already `ENABLED_BUSY` (`runtime_state=2`) — ROCgdb's
+  attach-to-a-live-process path, which expects a `SEND_RUNTIME_EVENT` answer
+  nothing here gives. Real bug, fixed by opening at `RUNTIME_ENABLE`
+  (`runtime_state=1`), and *not* this one.
+- *Descriptor identity.* Each guest process opens its own `/dev/kfd`, so the
+  session was on one host fd and the queue created on another. Opening the
+  session on the very descriptor that then creates the queue, before the queue
+  exists, at `runtime_state=1`, gives **the same `EBUSY`**.
+
+What is left is the multi-process state itself: earlier processes hold the
+signal page and have had their `ACQUIRE_VM` and `RUNTIME_ENABLE` answered
+locally by `sharedvm.go`, because the driver refuses those a second time.
+Settling it needs the `EBUSY` paths of `kfd_ioctl_create_queue`, and **no
+kernel source for 7.0.0-28 is installed on sens1** — that is the next step.
 
 **amdproxy now refuses the combination** rather than letting a workload die:
 with `--amdproxy-share-kfd-vm` set, the sandbox is not sliced and says so

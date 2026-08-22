@@ -175,21 +175,34 @@ func (ts *timeSlicer) init(weight uint64, schedFD int, id string, shareKFDVM boo
 		// way they fail is not survivable, so refuse the combination here
 		// rather than let a workload die.
 		//
-		// A debug session on a sandbox whose processes share one KFD context
-		// kills the second process to initialise the ROCm runtime. Measured
-		// with vLLM: the API server came up, the engine core reached its own
-		// initialisation and died with SIGSEGV, reported only as
-		// "{'EngineCore_DP0': -11}", with nothing in dmesg and nothing in the
-		// Sentry log. The same workload runs when the session is not opened,
-		// and a *single*-process workload runs with sharing on and a session
-		// open, so it is neither sharing nor slicing alone -- it is a second
-		// process joining a context a debugger is attached to.
+		// With a debug session open on a sandbox whose processes share one KFD
+		// context, CREATE_QUEUE returns EBUSY. Traced with vLLM under
+		// --strace-syscalls=ioctl: its engine core made 1002 KFD ioctls, then
+		// the sandbox's one and only CREATE_QUEUE came back EBUSY from the
+		// driver, and ROCr's error path dereferenced null -- SIGSEGV at fault
+		// address 0x34, which vLLM reports only as
+		// "{'EngineCore_DP0': -11}". Nothing appears in dmesg, and amdproxy
+		// itself never returns EBUSY, so the refusal is the driver's.
 		//
-		// The likely mechanism, not confirmed: RUNTIME_ENABLE is answered
-		// locally for every process after the first (the driver gives EBUSY
-		// otherwise, which is why runtimeShare exists), so a later process
-		// never learns from the driver that a debugger is attached, and sets
-		// itself up as though none were.
+		// The same pod serves with the session never opened, and a
+		// *single*-process workload runs with sharing on and a session open,
+		// so it is neither sharing nor slicing alone.
+		//
+		// Two mechanisms were tried and both are refuted. Opening the session
+		// later, at the first CREATE_QUEUE, attaches to a runtime that has
+		// become ENABLED_BUSY (runtime_state 2) -- ROCgdb's attach-to-a-live-
+		// process path, which expects a SEND_RUNTIME_EVENT answer -- and dies
+		// differently. Opening it on the very descriptor that then creates the
+		// queue, before the queue exists, with runtime_state 1, gives the same
+		// EBUSY: it is not the session's timing and not the identity of the
+		// file descriptor.
+		//
+		// What is left is the multi-process state itself: earlier processes
+		// hold the signal page and have had their ACQUIRE_VM and
+		// RUNTIME_ENABLE answered locally by sharedvm.go, because the driver
+		// refuses those a second time. Settling it needs the EBUSY paths of
+		// kfd_ioctl_create_queue, and no kernel source for 7.0.0-28 is
+		// installed on sens1.
 		log.Warningf("amdproxy: NOT time-slicing this sandbox: --amdproxy-share-kfd-vm is set, " +
 			"and a KFD debug session on a shared context kills the second process to initialise " +
 			"the ROCm runtime. The sandbox keeps its memory quota and CU mask; it will not be " +
