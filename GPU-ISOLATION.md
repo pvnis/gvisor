@@ -155,12 +155,23 @@ driver side is in `open-gpu-kernel-modules/DRIVER-CHANGES.md`.
 
 ## Kubernetes integration (HAMi-gvisor)
 
-Placement and admission run on **`HAMi-gvisor`**, a fork of HAMi. HAMi's
-scheduler and device plugin place each pod on a node/GPU and bin-pack by memory
-exactly as upstream; on NVIDIA the fork is essentially stock — the one deletion
-is HAMi's `libvgpu.so` in-container preload, since that is the in-container
-enforcement this project replaces. On **AMD** the fork additionally assigns
-**disjoint CU masks** from a node-scoped allocation record (`cusForRequest`).
+Placement and admission run on **`HAMi-gvisor`**, a fork of HAMi (v2.9.0). Its
+scheduler and device plugin place each pod on a node/GPU and bin-pack by memory.
+The fork is a small delta — **4 commits, all under `pkg/device/amd/`**:
+
+- **NVIDIA: HAMi is unmodified.** Stock upstream HAMi runs the whole NVIDIA path.
+  HAMi's injected `libvgpu.so` preload — the in-container enforcement this project
+  replaces — is left in place but neutralised with `CUDA_DISABLE_CONTROL`, since
+  the real limit is enforced in the Sentry.
+- **AMD: the fork adds automatic disjoint CU-mask assignment** (`cualloc.go` /
+  `cumask.go`, `cusForRequest` proportional to the VRAM request) plus accurate
+  VRAM accounting. This is the only part that *needs* the fork; without it, AMD
+  pods still slice via a **manually supplied `amd.com/cu-mask` annotation** that
+  the Sentry enforces — you just lose conflict-free automatic assignment.
+
+Enforcement never depends on HAMi: the Sentry applies the memory and CU limits
+from the pod's flags regardless of who set them. HAMi is trusted placement and
+convenience translation, not part of the isolation guarantee.
 
 Two admission webhooks run side by side:
 
