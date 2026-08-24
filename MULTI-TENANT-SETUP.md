@@ -343,8 +343,8 @@ needs placement state admission cannot see — it lives in the HAMi scheduler,
 arbitrary (doorbell/cuBLAS/graph-replay) CUDA workload — which the Sentry
 compute gate cannot, because those workloads never re-fault the gated buffer.
 It is a research prototype: a patched host kernel driver, keyed on the Sentry's
-process, not yet driven by `nvproxy`. See `GHOST-PLAN.md`,
-`NVIDIA-COMPUTE-ISOLATION.md`, and `ghost-experiment/HANDOFF.md`.
+process, not yet driven by `nvproxy`. See `NVIDIA-COMPUTE-ISOLATION.md`,
+`GPU-ISOLATION.md`, and `../open-gpu-kernel-modules/DRIVER-CHANGES.md`.
 
 ```sh
 git clone git@github.com:pvnis/open-gpu-kernel-modules.git
@@ -465,9 +465,10 @@ than it is:
 
 ## Pointers
 
+- `GPU-ISOLATION.md` — the top-level design overview (start here).
 - `CLAUDE.md` — the project's own running record of what is done and verified.
 - `NVIDIA-COMPUTE-ISOLATION.md` — compute-isolation findings + per-GPU playbook.
-- `GHOST-PLAN.md` — the driver-broker design (Part 8).
+- `../open-gpu-kernel-modules/DRIVER-CHANGES.md` — the driver-broker mechanisms.
 - `SECURITY-FINDINGS.md` — the red-team and every compute lever measured.
 - `UPSTREAM-NOTES.md` — the two gVisor bugs to send upstream + the KVM issue.
 - `vcluster-multitenant/{TWO-VENDOR-CLUSTER,CILIUM-DESIGN}.md` — the cluster.

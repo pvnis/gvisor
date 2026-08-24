@@ -3,6 +3,11 @@
 Dividing one GPU between mutually untrusting containers, for both vendors:
 `nvproxy` for NVIDIA and `amdproxy` for AMD, alongside `tpuproxy`.
 
+> **Docs.** `GPU-ISOLATION.md` is the top-level design overview and the map to
+> every other doc (and to the sibling projects `../open-gpu-kernel-modules` and
+> `../vcluster-multitenant`). This file (`CLAUDE.md`) is the running status log
+> of what is done and verified. Start a new reader at `GPU-ISOLATION.md`.
+
 **The governing constraint, and the reason this work exists:** *nothing may
 depend on changes inside the container.* Every limit is enforced in the Sentry,
 where ioctls are interpreted, and a hostile container cannot lift it. The
@@ -903,7 +908,7 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
 
    **Immediate next work: re-run the Step-3 playbook from the deferred call
    site on sensai's RTX 5070 and on the pro nodes (RTX A6000 GA102, RTX 6000
-   Pro Blackwell GB202)** — `ghost-experiment/HANDOFF.md` is the procedure and
+   Pro Blackwell GB202)** — the `ghost-experiment/` scripts are the procedure and
    `driver-hooks.patch` carries all the hooks. (Memory-quota isolation is
    separate and works everywhere.)
 4. **Send the two upstream fixes** (`797e29b80`, `6bfb3c267`) and file the KVM
