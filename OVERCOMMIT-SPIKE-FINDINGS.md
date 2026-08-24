@@ -457,3 +457,39 @@ hard-capped at `gmem` and cannot page (Phase 3) — and a tenant whose hot set
 *does* exceed VRAM thrashes at PCIe speed; the per-tenant evictor keeps that
 thrashing from stealing a well-behaved neighbour's residency, but not its
 memory-bus bandwidth.
+
+## Thrash detection (step 1 of a configurable thrash-response mechanism), 5070
+
+The oversubscription cliff above means a tenant whose *hot* set exceeds its gmem
+cap pages every access at PCIe speed, saturating the memory bus its neighbours
+share — residency isolation protects a neighbour's resident pages but not the
+bus. Step 1 adds a per-tenant signal to *detect* that, cleanly separated from any
+action (the throttle/detach/kill policy is layered on later).
+
+Mechanism: the driver keeps a monotonic per-tenant `evicted` byte counter (each
+GPU->host page-out, charged in `mark_chunk_evicted`), returned through a new
+`evictedBytes` OUT field on `UVM_SET_GMEM_LIMIT`. A Sentry monitor per uvm fd
+re-issues that idempotent ioctl every 2 s, reads resident+evicted back, and logs
+the eviction rate; a sample that is at-cap (resident >= 90% of limit) with a
+sustained rate (>= 100 MiB/s) is tagged THRASH.
+
+Verified on the RTX 5070 (driver srcversion 608346F7…, gmem cap 4 GiB / hmem
+16 GiB node-wide):
+
+- **Thrasher** — 3-process packing adversary, each touching 6000 MiB (hot >
+  cap): `resident=11232MiB/4096MiB evict_rate≈6800MiB/s THRASH`, sustained
+  indefinitely. The rate equals the ~6.8 GB/s PCIe paging ceiling from the sweep
+  above — the physical signature of thrashing.
+- **Healthy overcommit** — one tenant, 12000 MiB committed (2.93× the cap) but
+  only 3000 MiB hot (< cap): a 2-sample THRASH burst during the one-time
+  whole-buffer populate (resident 6376→4096, rate 2628→1515), then **25
+  consecutive clean samples** at `resident=4096/4096 evict_rate=0` through the
+  steady hot loop — running at full 258 GB/s. Sitting *at* the cap with heavy
+  overcommit does not trip it; only sustained eviction does.
+
+So the discriminator holds: a thrasher shows a sustained nonzero eviction rate at
+cap; a legitimate cold-overcommit tenant evicts once at warmup then reads zero.
+The transient populate burst is exactly what the step-2 policy's sustain window
+(WindowMS) filters. gVisor commit `748320fac`, driver `6f3d7501`. Reproduce with
+`~/.claude/jobs/a05027b4/tmp/overcommit/thrashwatch.sh` (thrasher) and a
+long-lived `uvm_oversub <total> 100000 <tag> <hot<cap>` pod (cold).
