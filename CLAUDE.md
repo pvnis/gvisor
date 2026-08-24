@@ -812,7 +812,45 @@ sandbox.
 
 Consequences worth stating plainly:
 
-- **Kubernetes now works, in either mode.** The HAMi fork takes
+- **Time slicing runs on stock upstream HAMi; the fork is not needed for it
+  (2026-08-24).** `projecthami/hami:v2.9.0`, unmodified, placing pods on sens1.
+  The weight comes from the webhook's `InjectAMDWeight` instead of from a
+  scheduler, which is the whole reason the fork can go: a CU mask needs
+  coordinated disjoint allocation and so must live in a cluster scheduler, and
+  a weight needs none, because weights are relative and every tenant's share
+  follows from the others' without anyone arranging them. The fork remains the
+  only way to get a *mask*.
+
+  **The weight is the requested unit count, not a percentage.** Admission runs
+  before placement, so the device's size is not known; and a ratio is all the
+  scheduler needs. 6 slices beside 2 gives 6:2.
+
+  **Two things about upstream that are worth knowing.** Its
+  `resourceCountName` is `amd.com/gpu`, and the AMD device plugin here
+  advertises only `amd.com/gpu-vram-mib`, so upstream logs
+  `FilteringFailed: does not request any resource` and does no HAMi-level
+  accounting for AMD. It still binds the pod, and oversubscription is still
+  refused — by ordinary Kubernetes extended-resource accounting, verified: a
+  request for 24 of 23 slices stays `Pending` with `Insufficient
+  amd.com/gpu-vram-mib`. So for AMD, HAMi is currently contributing little
+  beyond what Kubernetes does by itself, which is a further argument against
+  carrying a fork.
+
+  Measured on upstream, 3 good tenants + 1 attacker: weights 6/6/6/2, no CU
+  mask anywhere, **3.15:1** against the 3:1 asked, attacker took 9.6% against
+  10.0% entitled, `ratio=1.041 CONTAINED`. Direct runsc, 300:100: **3.05:1**.
+  Memory quota still Sentry-enforced — memprobe stopped at exactly 4096 MiB of
+  a 4 GiB annotation. **NVIDIA regression gate passed**: a pod on sensai was
+  placed by `hami-scheduler`, allocated a real device, and got
+  `nvproxy-gpu-memory-limit: 3221225472` and `nvproxy-gpu-weight: 30`.
+
+  **The escalation defence changed mechanism and still holds.** With the fork
+  the scheduler *recomputed* the weight and overwrote the pod's claim; with
+  upstream it is the webhook's narrow-only clamp. An attacker requesting 2
+  slices while annotating itself the whole card and weight 100 got
+  `1073741824` and `2`.
+
+- **The fork also still works, in either mode.** It takes
   `amd.timeSlice` in the `hami-scheduler-device` ConfigMap and writes a weight
   *or* a mask, never both (`~/HAMi`, branch `gvisor-amd-timeslice`, `d409e9e`).
   The weight is derived from the memory request and scaled to a percentage of

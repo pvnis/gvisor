@@ -59,7 +59,7 @@ Both proxies enforce in the Sentry, but they partition **different resources**.
 
 | | **AMD** (`amdproxy`) | **NVIDIA** (`nvproxy`) |
 | --- | --- | --- |
-| Compute divided in | **space** — CU masks *(and optionally time)* | **time** — submission windows |
+| Compute divided in | **space** — CU masks **or** time — queue suspension, never both | **time** — submission windows |
 | Enforced by | the GPU command processor | the Sentry (gate) / driver runlist (broker) |
 | Unused share | idles (spatial) / reassigned (temporal) | reassigned (with the scheduler) |
 | Memory quota | admit-before-forward on `ALLOC_MEMORY_OF_GPU` | admit-before-forward on the RM/UVM paths |
@@ -103,7 +103,18 @@ The driver mechanisms the last two rely on are documented in
 
 ## AMD (`amdproxy`)
 
-AMD can be divided by **space** or **time** — the operator chooses per workload.
+AMD can be divided by **space** or **time**, and on RDNA3 **not both** — the
+operator chooses per device.
+
+The exclusion is the driver's rule, not a policy choice.
+`kfd_dbg_set_queue_workaround()` in `drivers/gpu/drm/amd/amdkfd/kfd_debug.c`
+returns `-EBUSY` for a debug session's CWSR workaround on a queue carrying a
+user CU mask, guarded by a check for GC versions 11.0.0 to 11.0.3 — every RDNA3
+part. A time slice is enforced through exactly such a session, so the two
+cannot both apply to one queue. runsc refuses a sandbox configured with both,
+at startup. Read out of the source of the running kernel, not inferred.
+
+The memory quota composes with either. Only spatial-plus-temporal is excluded.
 
 **Spatial — CU masks** (`--amdproxy-cu-mask`, the default, fully Sentry-enforced).
 A hard partition set at queue creation; tenants run concurrently on disjoint
@@ -117,9 +128,18 @@ patch needed). Tenants take turns on the whole device by weighted duty cycle
 (75/25 → 3.04 : 1; 50/50 → Jain 1.0000). `vecadd` stays correct while sliced
 because AMD preempts mid-kernel via CWSR. Work-conserving, and it partitions the
 memory bus that CU masks cannot — but it costs occupancy on latency-hiding
-compute. The controlling `ioctl`s are ones amdproxy already forwards; the
-mechanism is proven (userspace interposer) and **in-Sentry enforcement is the
-remaining integration step**.
+compute — which makes it workload-shaped rather than a flat cost: the same
+session costs a bandwidth-bound workload 0.003% and an ALU-bound one 43%.
+
+**Enforced in the Sentry** since 2026-08-21 (`--amdproxy-gpu-weight` plus
+`--amdproxy-gpu-scheduler-socket`, `pkg/sentry/devices/amdproxy/timeslice.go`),
+with nothing preloaded into the container; the LD_PRELOAD interposer it was
+ported from is no longer in the enforcement path. Measured there: 300:100 gives
+3.05:1, 500:100 gives 5.13:1, two tenants at equal weights Jain 1.0000, and a
+lone tenant reclaims the whole device. vLLM — multi-process, and so needing
+`--amdproxy-share-kfd-vm` — divides 2.38:1 for a 3:1 request. It runs on stock
+upstream HAMi, the weight coming from the admission webhook rather than from a
+forked scheduler, because a weight needs no coordinated allocation.
 
 **Memory quota** (`--amdproxy-gpu-memory-limit`). Admit-before-forward on
 `ALLOC_MEMORY_OF_GPU`; the synthetic KFD topology reports the sandbox's quota as
