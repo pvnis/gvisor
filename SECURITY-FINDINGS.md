@@ -291,6 +291,321 @@ when the real fix lands.
 Not weight-multiplication by pod count — two separate weight-25 pods did not
 double the share (291→312, not →582).
 
+### V4. The runlist enforcer is defeated by process packing — the V1 attack carries over (2026-08-19, A6000/GA102)
+
+**The mechanism that replaced the compute gate has the same class of hole.** The
+runlist timeslice binds a *channel group*, not a tenant, so a tenant that forks
+N processes gets N timeslices and multiplies its share linearly.
+
+Measured natively on `vm-nv-dmd1` (RTX A6000, GHOST driver, weights driven
+through `/proc/driver/nvidia/gpusched` as `ts <pid> <us>`; attacker A at 1000 µs,
+victim B at 3000 µs — a deliberate 1:3 disadvantage):
+
+| A's configuration | A total | B | aggregate | A:B |
+| --- | --- | --- | --- | --- |
+| honest, 1 process | 175.9 | 548.6 | 724.5 | 0.32:1 |
+| **A packs 4 processes** | **389.7** | **304.7** | 694.4 | **1.28:1** |
+
+**A gains 122%, B loses 44%, aggregate conserved within 4.2%** — theft, not
+gap-filling, and the same signature as V1 (145→312 while peers fell to 62).
+A tenant handed one third of the GPU took *more than its victim* by forking four
+times.
+
+**Root cause, and it is exact rather than inferred.** Share tracks
+`(number of TSGs) x (timeslice per TSG)`:
+
+| case | A budget | B budget | predicted A:B | measured |
+| --- | --- | --- | --- | --- |
+| honest | 1 x 1000 µs | 1 x 3000 µs | 0.333 | 0.32 |
+| packed | 4 x 1000 µs | 1 x 3000 µs | 1.333 | 1.28 |
+
+Both within ~4%. The primitive is per-channel-group and composes additively, so
+"weight" as issued is a *per-process* quantity, not a per-tenant one.
+
+**CONFIRMED ON THE INTEGRATED PATH (same day).** The above drove the driver
+primitive directly, so it was recorded as not yet showing `runsc gpu-scheduler
+--runlist-control` exploitable. It is. Re-run through the full production stack —
+`runsc gpu-scheduler --runlist-control=/proc/driver/nvidia/gpusched
+--measure-usage=false`, weights derived by the quota webhook from HAMi's
+`nvidia.com/gpucores`, cuBLAS SGEMM in gVisor sandboxes on k3s:
+
+| | burn-a (w=75, 1 proc) | burn-b (w=25) | aggregate | A:B |
+| --- | --- | --- | --- | --- |
+| honest | 126.8 | 40.7 | 167.5 | **3.12:1** (3:1 requested — correct) |
+| **burn-b packs 4 procs** | **70.5** | **90.9** (4 × 22.7) | 161.4 | **0.78:1** |
+
+**The tenant holding one third of the weight ended up with more throughput than
+its victim**, by running four processes in its own pod. Aggregate conserved
+within 3.6%.
+
+The scheduler does exactly what it was built to do and it is still not enough:
+the honest case lands on 3.12:1, and `enforcePlan` computes `minTimesliceUs * w /
+minW` **per sandbox pid** with no division by TSG count. dmesg shows the
+consequence directly — one sandbox pid receiving `SET_TIMESLICE = 1000 us` on
+**six distinct channel groups**, each getting the tenant's full slice. Under
+gVisor every sandboxed process shares the Sentry's host pid, so a tenant forking
+inside its own pod adds TSGs without adding pids, and the scheduler never sees
+the multiplication.
+
+The same per-TSG model predicts both stacks:
+
+| | A budget | B budget | predicted A:B | measured |
+| --- | --- | --- | --- | --- |
+| native, honest | 1 x 1000 | 1 x 3000 | 0.333 | 0.32 |
+| native, packed | 4 x 1000 | 1 x 3000 | 1.333 | 1.28 |
+| integrated, honest | 1 x 3000 | 1 x 1000 | 3.00 | 3.12 |
+| **integrated, packed** | 1 x 3000 | 4 x 1000 | **0.75** | **0.78** |
+
+**FIX ATTEMPTED AND MEASURED (2026-08-19) — it works on fairness and is
+disqualified on cost.** The driver's `ts <pid> <us>` was changed to mean a
+*tenant budget*, divided across the pid's channel groups
+(`tsPerGroup = arg / nGroups`, floored at `GHOST_MIN_TS_US`):
+
+| | A (w=75) | B (w=25) | aggregate | A:B |
+| --- | --- | --- | --- | --- |
+| honest, no fix | 126.8 | 40.7 | 167.5 | 3.12:1 |
+| **honest, with fix** | 73.3 | 23.5 | **96.8** | **3.12:1** |
+| packed x4, no fix | 70.5 | 90.9 | 161.4 | 0.78:1 |
+| **packed x4, with fix** | 42.3 | 33.6 | **75.9** | **1.26:1** |
+
+- **The ratio is preserved exactly when honest** (3.12:1 either way), so the
+  division is correct.
+- **The attack is blunted but not stopped**: 0.78 -> 1.26. The attacker no longer
+  *beats* its victim, but still takes far more than the 1:3 it was granted.
+- **It costs 42% of aggregate throughput even with nobody attacking** (167.5 ->
+  96.8). Shrinking the quantum to divide the share multiplies context switching.
+  That alone disqualifies it as a production fix.
+
+**Why it does not fully close: the floor binds.** dmesg from the run:
+
+    pid ... budget 3000 us over  6 TSG(s) -> 500 us each
+    pid ... budget 1000 us over 15 TSG(s) -> 128 us each (CLAMPED at floor)
+
+**Correction to the model above: TSG count is NOT process count.** A *single*-
+process pod already owns **6** channel groups; the 4-process attacker owns
+**15**. CUDA creates several TSGs per context, so "one process, one TSG" was
+wrong — the earlier per-TSG arithmetic happened to predict well only because TSG
+count scaled roughly with process count. With 15 groups the attacker's 1000 us
+budget divides to 66 us, is clamped up to 128, and it recovers
+15 x 128 = 1920 us against A's 6 x 500 = 3000 us — predicting 1.56:1 against
+1.26:1 measured.
+
+**What GVM actually does, and why it does not have this problem.** The paper
+("GVM: OS-Level GPU Virtualization", Berkeley/UCLA — note our older references
+called it "Ghost / Breaking the Tradeoff", a stale title) never encodes weight in
+the timeslice value:
+
+> Each container has a weight that encodes its target share. GVM uses a
+> lightweight weighted round-robin scheme: containers accumulate credit in
+> proportion to their weight, and any container with positive credit is
+> scheduled for a bounded timeslice; the time used is then deducted from its
+> credit.
+
+Weight drives **credit accrual per container**; the timeslice is only a bounded
+quantum for one turn; consumed time is **charged back to the container**. A
+container with 15 TSGs burns its shared credit 15x faster and gains nothing, and
+because the quantum stays large there is no context-switch tax. Their threat
+model covers this directly: *"Tenants are treated as mutually untrusted
+user-space processes."* Their isolation unit is explicit: *"Each GPU container
+... corresponds to one tenant (or tenant group). Kernels or streams within a
+container are not isolated or tracked separately."*
+
+**But the released GVM code does not implement that scheduler.** In
+`ovg-project/gvm-nvidia-driver-modules`, the debugfs surface is
+`compute.priority` / `compute.freeze` / `memory.*` — there is no weight, and no
+credit anywhere. `gvm_process_compute_priority_write` resolves a **pid** to its
+va_spaces and calls `uvm_debugfs_api_set_timeslice(va_space,
+GVM_MAX_TIMESLICE_US >> priority)`, and that helper iterates **every** GR channel
+group in the va_space writing the same value. That is the same shape as ours:
+share encoded as a per-TSG timeslice, keyed per process, with nothing aggregating
+across a tenant's processes. **So V4 plausibly applies to GVM-as-released too**,
+and the credit scheduler that would prevent it appears only in the paper. Not
+verified against their hardware — stated as a code reading, not a measurement.
+
+**FIXED (2026-08-19) — credit scheduling, measured on the integrated stack.**
+Implemented GVM's scheme in `pkg/gpusched/credit.go`: weight drives *credit
+accrual per tenant* (per Sentry pid), every tenant runs at one uniform large
+quantum, and the share actually consumed is charged back; a tenant that
+overdraws past a dead band is detached from the runlist and re-attached when it
+recovers. The driver now also reports each pid's channel-group count
+(`pid <p> active <0|1> tsgs <n>`) so the charge is weighted by the share a
+tenant genuinely takes — without that the packed attacker is under-charged,
+which is the entire bug.
+
+| | A (w=75, 1 proc) | B (w=25) | aggregate | A:B |
+| --- | --- | --- | --- | --- |
+| timeslice scheme, honest | 126.8 | 40.7 | 167.5 | 3.12:1 |
+| timeslice scheme, **B packs 4** | 70.5 | 90.9 | 161.4 | **0.78:1** ← theft |
+| divide-by-N, honest | 73.3 | 23.5 | 96.8 | 3.12:1 |
+| **credit, honest** | 100.9 | 35.3 | 136.2 | **2.86:1** |
+| **credit, B packs 4** | 93.9 | 41.4 | 135.3 | **2.27:1** |
+
+- **Packing is neutralized.** 0.78:1 → **2.27:1**. The attacker fell from 90.9 to
+  41.4 while still running four processes and holding 15 TSGs against the
+  victim's 6. It keeps a small edge (31% of the device against a granted 25%),
+  so this is blunted rather than perfect, but the theft — taking *more* than a
+  peer weighted 3x higher — is gone.
+- **Honest division still correct**: 2.86:1 against 3:1 requested.
+- **Work-conserving**: with the peer removed, A expands 93.9 → **139.3**.
+- **Unit tests** cover accrual, TSG-weighted charge-back, the cap, exhaustion →
+  detach, recovery → attach, the lone-tenant case, and steady-state quiet
+  (`pkg/gpusched/credit_test.go`).
+
+**Two design points that are load-bearing, both found by measurement:**
+
+- **A dead band is required.** Detaching on `credit <= 0` makes tenants that are
+  getting exactly their share flap on and off every tick, churning the runlist
+  for no division at all. The first implementation did this and only 20 of 50
+  steady ticks were silent.
+- **A detached tenant must still count as wanting to run.** Detaching stops its
+  GP_PUT advancing, so the driver's activity signal reads it idle forever;
+  deciding participation from that signal alone would never re-admit it. The
+  scheduler detached it, so the scheduler knows better.
+
+**The aggregate question is now settled, and it is not overhead.** Solo was
+measured both ways, which is what the earlier note said was missing:
+
+| | rate | vs solo |
+| --- | --- | --- |
+| solo, no scheduler at all | 139.4 | baseline |
+| **solo, credit scheduler** | **139.3** | **99.93%** |
+| two tenants, credit | 136.2 | 98% |
+| two tenants, timeslice scheme | 167.5 | **120%** |
+
+- **A lone tenant pays nothing** — 0.07%, and the driver logged zero detaches,
+  so the lone-tenant guard holds in production as well as in the unit test.
+- **The 167.5 was never a ceiling the credit scheme fell short of.** It is
+  *above* what one tenant achieves alone: two cuBLAS tenants interleave and fill
+  each other's gaps, because a single 4096³ SGEMM stream does not saturate an
+  A6000. Credit scheduling serializes them and gives that overlap bonus up,
+  landing at 98% of solo — near-perfect conservation of the single-tenant rate.
+
+So the trade is explicit: **~20% of an overlap bonus, in exchange for a share
+that cannot be stolen.** That is the rule this branch already recorded on the
+AMD side — time-slicing pays when tenants contend for a saturated resource and
+costs when they complement each other; here they complement each other. A
+tenant that genuinely saturates the device (a real LLM, a larger GEMM) should
+show a smaller bonus and so a smaller cost, and that is worth measuring before
+generalizing from one microbenchmark.
+
+**Confirmed on a second die — RTX 5070 (Blackwell GB205), 2026-08-20.** Same
+credit scheduler, same harness (cuBLAS SGEMM in gVisor pods on k3s, weights via
+annotation), driver rebuilt with the tsgs-report patch and confirmed loaded by
+the *functional* check (`pid … active 1 tsgs 3`), not srcversion.
+
+| | A (w75) | B (w25) | agg | A:B |
+| --- | --- | --- | --- | --- |
+| (a) solo, no scheduler | — | — | 171.4 | baseline |
+| (b) solo, credit scheduler | — | — | 173.3 | no measurable cost |
+| (c) two honest, 1 proc each | 131.4 | 40.0 | 171.4 | **3.29:1** |
+| (d) B packs 4 procs | 125.7 | 45.7 | 171.4 | **2.75:1** |
+
+- **Packing neutralized on Blackwell too.** The attacker's single Sentry pid held
+  **12 TSGs** (4 procs × 3) against the victim's 3, yet gained only ~14%
+  (B 40.0 → 45.7) while the victim held (A 131 → 126). Honest 3.29:1 → packed
+  2.75:1, versus the timeslice scheme's 0.78:1 theft. Credit binds the tenant.
+- **A lone tenant pays nothing** — (b) is within +1.1% of (a), i.e. noise, not a
+  speedup; read it as "no measurable cost," never as a rate above 100%.
+- **The overlap-bonus prediction above is confirmed.** On the 5070 one tenant
+  saturates the device, so there is no interleave slack: (c) agg 171.4 == (a)
+  baseline 171.4, and credit scheduling costs **~0%** here, where on the A6000 it
+  gave up ~20% of a bonus. The cost is die- and workload-shaped exactly as
+  predicted.
+- **The residual edge is the overlap bonus, not TSG under-charging — do not start
+  a fix there.** It moves *inversely* to the TSG ratio: A6000 attacker 15 vs 6
+  TSGs (ratio 2.5) → B took 30.6% vs a granted 25% (+5.6pp); 5070 12 vs 3
+  (ratio 4.0) → B took 26.7% (+1.7pp). A *bigger* TSG advantage extracted a
+  *smaller* edge, so under-counting the packer's instantaneous share cannot be
+  it. The edge instead tracks agg(c)/solo(a) across dies (A6000 1.20, 5070 1.00),
+  i.e. the slack a detached packer's freed capacity leaves that the survivor
+  cannot fully absorb. Prediction: a saturating workload on the A6000 (larger
+  GEMM, a real model) should shrink its edge toward the 5070's.
+- **TSG-per-context is a per-die constant — read the `tsgs` field, do not model
+  it from process count.** The 5070 is linear (1 proc → 3, 4 procs → 12); the
+  A6000 is not (6, then 15, not 24). A credit-burn model keyed on process count
+  breaks on GA102.
+- **Harness trap (recorded so no one repeats it):** per-process `rate=` lines are
+  instantaneous rates and must **not** be summed — doing so scales with how many
+  lines landed in the window (it read 33× high once). Measure completed work:
+  200 matmuls per line × lines ÷ window, which is correct for any process count
+  and so is the right measure precisely because packing changes the count.
+
+**Confirmed against the whole stack with a real serving workload — vCluster +
+HAMi + webhook + gVisor + credit scheduler, RTX 5070, 2026-08-21.** The 5070
+table above is the isolated harness (cuBLAS burn, bare k3s pods). This run puts
+the same conclusion through every production layer at once: four *separate
+vClusters* (own API server + NetworkPolicy each), three honest tenants serving
+**real vLLM (Qwen2.5-0.5B)** under continuous load at weights 100/50/25, and a
+fourth adversarial tenant in its own vCluster. Each pod's quota is derived by
+the gpushare webhook from its HAMi-admitted `nvidia.com/gpumem` and enforced by
+the Sentry; compute is divided by the credit scheduler in `--runlist-control`
+mode. Harness: `~/.claude/jobs/a05027b4/tmp/bigtest/` (`run2.sh`).
+
+| adversary state | its TSGs | honest agg tok/s | honest a:b:c | adversary matmul/s |
+| --- | --- | --- | --- | --- |
+| none | — | 7795 | 4.25 : 2.12 : 1 | — |
+| 1 process | 3 | 6466 | 3.56 : 1.98 : 1 | 31 |
+| **4 processes packed** | **12** | 6272 | 3.54 : 1.89 : 1 | **27** |
+
+- **Packing neutralized under a doorbell-submitting LLM server, not just the
+  synthetic burn.** The adversary quadrupled its channel groups (3 → 12, one
+  Sentry pid — the V4 signature, confirmed `active 1 tsgs 12` in the driver
+  view) and gained *no* compute (31 → 27 matmul/s) while the honest tenants lost
+  nothing beyond noise (agg 6466 → 6272). This is the credit scheme holding on
+  vLLM's CUDA-graph/cuBLAS workload — the same class the gate could never bind.
+- **Weight fidelity survives real tenancy.** 4.25:2.12:1 with no adversary and
+  3.5:1.9:1 with the packer present, both against a nominal 4:2:1 — a marked
+  improvement over the earlier *gate*-path vCluster result, which compressed
+  toward equal (`~/vllm-overhead/PLAN.md`). Aggregate ~7800 tok/s exceeds the
+  6704 tok/s a lone tenant reaches, i.e. work-conserving.
+- **The memory-grab attack is capped at the quota, live under contention.** A
+  fifth probe pod (own vCluster, 1024 MiB quota) whose code ignores the reported
+  free memory and `cudaMalloc`s until failure: `torch.cuda.mem_get_info()`
+  reported **total=1024 MiB, not the 12227 MiB device**, and it OOM'd at 832 MiB
+  (quota minus ~190 MiB context) — it could not reach the other ~11 GiB.
+- **A silent quota-escape prerequisite, worth flagging here.** The gpushare
+  webhook fires only on namespaces labelled `gvisor` (Exists), and the host
+  tenant namespaces that vCluster syncs pods into are **not** labelled by
+  default — so without `kubectl label ns … gvisor=`, every synced GPU pod is
+  admitted *unmutated* and runs at the node-wide ceiling (the whole card). Same
+  failure class as the `failurePolicy: Ignore` escape already recorded, reached
+  by a different route. Verified: labelled → per-pod 2560 MiB enforced; the
+  synced pod carries `nvproxy-gpu-memory-limit` only once the label is present.
+
+**Operational note: the scheduler is a hard dependency, fail-closed.** With
+`nvproxy-gpu-scheduler-socket` set in the runsc config, a GPU pod cannot start
+at all while `runsc-gpu-scheduler` is down — sandbox creation fails with
+`connecting to the GPU scheduler ... connect: connection refused`. Defensible
+for a quota mechanism, but it makes that service a single point of failure for
+every GPU pod on the node, and it is not documented elsewhere. Found while
+taking the baseline above.
+
+**Superseded fix direction.** Follow the paper, not the divide: keep a
+large timeslice and enforce shares by credit accounting at container
+granularity, using detach/attach when credit is exhausted rather than shrinking
+the quantum. gVisor makes the container identity *easier* than GVM's per-pid
+model: every sandboxed process already shares one Sentry host pid, so a tenant is
+unambiguous — the thing that made the attack invisible is the same thing that
+makes the correct accounting natural. The missing input is consumed GPU time per
+tenant; `--measure-usage`'s `nvidia-smi pmon` sampler is the wrong source (it is
+already recorded as defective), but the driver's GP_GET/GP_PUT channel-state
+signal is trusted and doorbell-aware and is a better basis.
+
+**Superseded fix direction.** Per-TSG timeslice = `tenant_weight / n_TSGs(tenant)`,
+recomputed as TSGs appear and vanish. This is strictly harder than the gate's
+problem: the set is dynamic and attacker-controlled, so a one-shot announcement
+at sandbox start cannot hold it — the same shape as the "one-shot best-effort pid
+announcement, no retry" gap in NVIDIA-COMPUTE-ISOLATION.md. The driver already
+knows every TSG per pid (it iterates them to apply `ts`), so the count is
+available where the division would have to happen.
+
+**Fix direction.** Per-TSG timeslice must be `tenant_weight / n_TSGs(tenant)`,
+recomputed on TSG creation and teardown. Note this is strictly harder than the
+gate's problem: the set of a tenant's TSGs is dynamic and attacker-controlled,
+so a one-shot announcement at sandbox start is not enough — exactly the
+"one-shot best-effort pid announcement, no retry" gap already recorded for the
+automatic path in NVIDIA-COMPUTE-ISOLATION.md.
+
 ## OPEN — low severity
 
 ### V3. GPU power-draw side-channel (disclosure, low)
@@ -306,6 +621,35 @@ NVML/smi rewrite the same way memory already is.
 Two `runsc gpu-scheduler` daemons were bound to the same socket path
 `/run/runsc-gpu-scheduler.sock`; the newer holds all client connections, the
 older is orphaned. Harmless here but worth a single-instance guard.
+
+## HELD — re-verified on the A6000 + GHOST driver (2026-08-19)
+
+Re-run of the tenant-side attacks on `vm-nv-dmd1` (GA102, GHOST driver, k3s +
+Cilium + HAMi + 3 vCluster tenants), launched from inside `tenant-nv-a` holding
+only its own API token. **7 passed, 0 failed, 0 inconclusive** —
+`ghost-experiment/adversarial-2-tenant.sh`.
+
+- **Quota escalation refused.** Pod requested `nvidia.com/gpumem: 1024` and
+  self-annotated `nvproxy-gpu-memory-limit: 42949672960` (40 GiB) from inside its
+  own vCluster, where it is cluster admin. Host pod carried `1073741824`, and the
+  sandbox saw **1024 MiB**. The 46068 MiB device size never appeared.
+- **Sandbox escape via `runtimeClassName: nvidia` refused.** The pod asked for
+  the host's runc+nvidia handler; the syncer overwrote it, the host pod shows
+  `runtimeClassName: gvisor`, and the container reported `4.19.0-gvisor`. This is
+  the escape `values/tenant.yaml` calls load-bearing, exercised directly.
+- **`/proc/driver/nvidia/gpusched` is NOT visible inside the sandbox.** This is
+  the surface the GHOST driver adds: the control is root-only via `NV_IS_SUSER`,
+  and a container routinely runs as root, so had gVisor's synthetic procfs
+  exposed it, one tenant could `detach` another's channels — a cross-tenant DoS.
+  It does not, so the lever stays host-side where it belongs. Worth re-checking
+  on any driver that adds a new `/proc/driver/nvidia/*` entry.
+- **No peer visibility** — `nvidia-smi` inside the sandbox listed no processes
+  and an empty `--query-compute-apps`.
+
+Note the shape of the day's results: **every containment boundary held, and the
+break was in the compute *share*** (V4 above). Isolation and fairness are
+failing independently, and a clean isolation result says nothing about whether a
+tenant can steal throughput.
 
 ## HELD — verified contained (2026-08-13)
 Every other surface held; recording so they are not re-litigated without cause.

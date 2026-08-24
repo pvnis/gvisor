@@ -35,8 +35,9 @@ at ~960 matmul/s of the ~1550 the card gives. If you ever reload the hooked
 build (`~/open-gpu-kernel-modules`, for a compute-isolation probe), it is *not*
 inert by default; pass `GhostTpcCount=54` to neutralise it, and restore the
 clean modules before running the k8s stack again. The GHOST hooks and their
-per-driver findings live in `NVIDIA-COMPUTE-ISOLATION.md` and
-`ghost-experiment/HANDOFF.md`.
+per-driver findings live in `NVIDIA-COMPUTE-ISOLATION.md` and the
+`ghost-experiment/` scripts; the driver changes themselves are described in
+`../open-gpu-kernel-modules/DRIVER-CHANGES.md`.
 
 ## Building runsc on a bare Ubuntu 24.04
 

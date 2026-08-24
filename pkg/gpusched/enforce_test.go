@@ -127,12 +127,12 @@ func (f *fakeEnforcer) Attach(pid int) error { f.calls = append(f.calls, "attach
 func TestRunlistEnforcerAppliesAndRemembers(t *testing.T) {
 	f := &fakeEnforcer{}
 	r := newRunlistEnforcer(f)
-	r.apply([]EnforceClient{{PID: 10, Weight: 3}, {PID: 20, Weight: 1}})
+	r.apply([]EnforceClient{{PID: 10, Weight: 1, TSGs: 1}, {PID: 20, Weight: 1, TSGs: 1}})
 	if len(f.calls) != 2 { // two ts
 		t.Fatalf("first apply: %v", f.calls)
 	}
 	f.calls = nil
-	r.apply([]EnforceClient{{PID: 10, Weight: 3}, {PID: 20, Weight: 1}})
+	r.apply([]EnforceClient{{PID: 10, Weight: 1, TSGs: 1}, {PID: 20, Weight: 1, TSGs: 1}})
 	if len(f.calls) != 0 {
 		t.Fatalf("steady apply should be silent: %v", f.calls)
 	}
@@ -142,11 +142,11 @@ func TestRunlistEnforcerReassertsPeriodically(t *testing.T) {
 	f := &fakeEnforcer{}
 	r := newRunlistEnforcer(f)
 	// First apply issues the two timeslices.
-	r.apply([]EnforceClient{{PID: 10, Weight: 3}, {PID: 20, Weight: 1}})
+	r.apply([]EnforceClient{{PID: 10, Weight: 1, TSGs: 1}, {PID: 20, Weight: 1, TSGs: 1}})
 	// Steady ticks until just before the re-assert boundary are silent.
 	for i := 0; i < reassertEveryTicks-2; i++ {
 		f.calls = nil
-		r.apply([]EnforceClient{{PID: 10, Weight: 3}, {PID: 20, Weight: 1}})
+		r.apply([]EnforceClient{{PID: 10, Weight: 1, TSGs: 1}, {PID: 20, Weight: 1, TSGs: 1}})
 		if len(f.calls) != 0 {
 			t.Fatalf("tick %d before re-assert should be silent: %v", i, f.calls)
 		}
@@ -154,7 +154,7 @@ func TestRunlistEnforcerReassertsPeriodically(t *testing.T) {
 	// The re-assert tick re-issues every timeslice even though nothing changed,
 	// so a TSG the workload created since the last write is re-bound.
 	f.calls = nil
-	r.apply([]EnforceClient{{PID: 10, Weight: 3}, {PID: 20, Weight: 1}})
+	r.apply([]EnforceClient{{PID: 10, Weight: 1, TSGs: 1}, {PID: 20, Weight: 1, TSGs: 1}})
 	if len(f.calls) != 2 {
 		t.Fatalf("re-assert tick should re-issue both timeslices, got %v", f.calls)
 	}
@@ -163,8 +163,9 @@ func TestRunlistEnforcerReassertsPeriodically(t *testing.T) {
 func TestPollActiveParsesDriverLines(t *testing.T) {
 	dir := t.TempDir()
 	p := dir + "/gpusched"
-	// The driver's read format: "pid <p> active <0|1>".
-	if err := os.WriteFile(p, []byte("pid 100 active 1\npid 200 active 0\ngarbage\n"), 0644); err != nil {
+	// The driver's read format: "pid <p> active <0|1> [tsgs <n>]". The older
+	// form without the count must still parse.
+	if err := os.WriteFile(p, []byte("pid 100 active 1 tsgs 6\npid 200 active 0\ngarbage\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	e := &ProcfsEnforcer{Path: p}
@@ -172,8 +173,14 @@ func TestPollActiveParsesDriverLines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PollActive: %v", err)
 	}
-	if !got[100] || got[200] {
-		t.Fatalf("parsed %v, want {100:true,200:false}", got)
+	if !got[100].Active || got[200].Active {
+		t.Fatalf("parsed %v, want {100:active,200:idle}", got)
+	}
+	if got[100].TSGs != 6 {
+		t.Fatalf("pid 100 TSGs = %d, want 6", got[100].TSGs)
+	}
+	if got[200].TSGs != 0 {
+		t.Fatalf("pid 200 (no tsgs field) TSGs = %d, want 0", got[200].TSGs)
 	}
 	// Only pids with an "active" line are reported; a pid never mentioned is
 	// absent (the caller treats absent as "keep the previous state").

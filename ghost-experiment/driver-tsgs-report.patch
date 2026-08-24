@@ -1,0 +1,52 @@
+# Driver change required by the credit scheduler (pkg/gpusched/credit.go).
+#
+# Reports each tenant's channel-group count alongside its activity flag:
+#     pid <p> active <0|1> tsgs <n>
+#
+# The credit planner charges a tenant for the share it ACTUALLY takes, and with
+# one uniform quantum per group that share is proportional to how many groups it
+# holds attached. Without this count every attached tenant is charged alike,
+# which under-charges exactly the packed attacker the scheduler exists to stop
+# (SECURITY-FINDINGS.md V4) -- the scheduler still runs, it just degrades to the
+# old behaviour.
+#
+# Apply on top of pvnis/open-gpu-kernel-modules branch ghost-experiment:
+#     git apply /path/to/gvisor/ghost-experiment/driver-tsgs-report.patch
+#
+# Also set GHOST_TOTAL_TPC in kernel_ctxshare.c to half your GPU's SM count
+# (A6000/GA102 = 42; RTX 5070/GB205 = 24). That knob only affects the spatial
+# probes, not this.
+diff --git a/src/nvidia/src/kernel/gpu/fifo/kernel_channel_group_api.c b/src/nvidia/src/kernel/gpu/fifo/kernel_channel_group_api.c
+index f8486758..0812599f 100644
+--- a/src/nvidia/src/kernel/gpu/fifo/kernel_channel_group_api.c
++++ b/src/nvidia/src/kernel/gpu/fifo/kernel_channel_group_api.c
+@@ -348,16 +348,22 @@ ghostSchedFormatActive_GHOST(char *buf, int cap)
+         if (dup)
+             continue;
+         seen[nSeen++] = g_ghostGroups[i].pid;
+-        // active if any group of this pid is active
++        // active if any group of this pid is active; nTsg is how many groups it
++        // owns, which with a fixed per-TSG quantum is proportional to the share
++        // it actually takes -- the scheduler charges credit by it.
+         act = NV_FALSE;
++        NvU32 nTsg = 0;
+         for (j = 0; j < g_ghostGroupCount; j++)
+-            if (g_ghostGroups[j].valid &&
+-                g_ghostGroups[j].pid == g_ghostGroups[i].pid &&
+-                g_ghostGroups[j].active)
+-            { act = NV_TRUE; break; }
++            if (g_ghostGroups[j].valid && g_ghostGroups[j].nCh > 0 &&
++                g_ghostGroups[j].pid == g_ghostGroups[i].pid)
++            {
++                nTsg++;
++                if (g_ghostGroups[j].active)
++                    act = NV_TRUE;
++            }
+         if (n < cap)
+-            n += nvDbgSnprintf(buf + n, cap - n, "pid %u active %d\n",
+-                               g_ghostGroups[i].pid, act ? 1 : 0);
++            n += nvDbgSnprintf(buf + n, cap - n, "pid %u active %d tsgs %u\n",
++                               g_ghostGroups[i].pid, act ? 1 : 0, nTsg);
+     }
+     return n;
+ }

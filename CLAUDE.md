@@ -3,6 +3,11 @@
 Dividing one GPU between mutually untrusting containers, for both vendors:
 `nvproxy` for NVIDIA and `amdproxy` for AMD, alongside `tpuproxy`.
 
+> **Docs.** `GPU-ISOLATION.md` is the top-level design overview and the map to
+> every other doc (and to the sibling projects `../open-gpu-kernel-modules` and
+> `../vcluster-multitenant`). This file (`CLAUDE.md`) is the running status log
+> of what is done and verified. Start a new reader at `GPU-ISOLATION.md`.
+
 **The governing constraint, and the reason this work exists:** *nothing may
 depend on changes inside the container.* Every limit is enforced in the Sentry,
 where ioctls are interpreted, and a hostile container cannot lift it. The
@@ -71,7 +76,7 @@ it before touching either node's Kubernetes setup.
 | ROCm | — | **7.2** | 7.1 |
 | `gpu_id` | — | **63860** (changes on reboot) | 40786 |
 | `/dev/kfd` major | — | **234** (dynamic) | **511** (dynamic) |
-| docker | **no** (containerd only) | yes | yes |
+| docker | **yes** (via `sudo`; containerd for k8s) | yes | yes |
 | kubernetes | **k3s control-plane**, Cilium, HAMi, vCluster | **k3s agent** + AMD device plugin | **yes, with the AMD device plugin** |
 | `sudo` | passwordless | passwordless | **passwordless (`(ALL) NOPASSWD: ALL`)** |
 
@@ -1088,7 +1093,23 @@ once and has no re-register loop, so after `systemctl restart k3s` the pod stays
 sits `Pending` with `Insufficient amd.com/gpu-vram-mib`. Delete the plugin pod to
 re-register.
 
-Two smaller ones, both of which cost real time:
+**The quota webhook's `failurePolicy: Fail` is a security property, not an
+availability preference.** The in-tree `webhook/pkg/gpushare` derives a pod's GPU
+quota from the request the scheduler admitted, so a pod admitted *without* being
+mutated carries no `dev.gvisor.flag.*-gpu-memory-limit` and runs at the node-wide
+ceiling — the whole device. Registered with `Fail`, an unreachable webhook blocks
+pod creation (fails closed, loudly — verified: `x509` error, pod `NotFound`);
+relaxed to `Ignore` (the common default) it becomes a **silent quota escape**.
+Keep it `Fail`. The webhook mints a fresh CA on every start and reconciles the
+`MutatingWebhookConfiguration`'s `caBundle` to match (so a restart no longer
+wedges admission), which needs `get`+`update` on `mutatingwebhookconfigurations`
+in its ClusterRole. It also needs `--port=8443` (defaults to 0), and an *empty*
+`--pod-namespace-labels` selector is rejected by the apiserver — label the target
+namespaces explicitly. The in-tree webhook is now two-vendor and narrow-only
+(clamps a higher self-annotation down); the standalone `gpu-quota-webhook` is
+retired.
+
+Three smaller ones, each of which cost real time:
 - `/var/log/pods/<pod>/gvisor.log` is the **user** log — compat events only.
   Sentry warnings go to `/var/log/runsc/`, and if that directory has no recent
   `*.boot.txt`, debug logging never reached runsc at all.
@@ -1098,6 +1119,13 @@ Two smaller ones, both of which cost real time:
   failure but arrives *after* the sandbox has already enumerated the GPU.
   `AMD_LOG_LEVEL=4` plus `LD_DEBUG=libs` in the pod env named it in one run.
   Compare both stores before believing any K8s-only bug.
+- **`docker save`/`docker push` silently emit blob-less stubs when docker uses the
+  containerd image store** — an ~8.5K tar, then `content digest … not found` on
+  `k3s ctr images import`, even though `docker info` shows `Storage Driver:
+  overlayfs`. The image is real (`docker image inspect` shows its true size); the
+  export just omits the layers. Route it into k3s another way: extract the binary
+  with `docker cp` and mount it into a stock image, or push through a throwaway
+  local registry. Cost real time on sensai.
 
 ## Context worth having
 
@@ -1167,6 +1195,21 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
    kernel-launch loop under identical weights measured 81,099/22,270 (3.64:1):
    the workload, not the GPU family alone, decides whether the *gate* binds —
    the runlist enforcer binds both. See `A100-CLUSTER.md`.
+   **But the per-TSG-timeslice runlist enforcer is defeated by process packing
+   (SECURITY-FINDINGS.md V4).** A low-weight tenant that forks N processes
+   multiplies its channel groups (TSGs) and steals share, because under gVisor
+   every sandboxed process shares one Sentry host pid, so the multiplication is
+   invisible to a per-pid timeslice. **Fixed by the credit scheduler**
+   (`pkg/gpusched/credit.go`): weight drives per-*tenant* credit accrual, one
+   large uniform quantum, whole-tenant detach/attach when credit is exhausted —
+   packing can't help because a tenant's TSGs share one credit pool and detach
+   together. Needs the driver `tsgs`-report patch so charge-back is TSG-weighted.
+   Measured to close packing on **both GA102 (A6000) and GB205 (RTX 5070)**:
+   honest ~3:1 holds, packed 4 procs goes 2.27–2.75:1 (blunted, not perfect; the
+   residual tracks the *overlap bonus*, not a scheduler bug — it moves inversely
+   to the TSG ratio), and a lone tenant pays nothing. Enable with
+   `runsc gpu-scheduler --runlist-control=/proc/driver/nvidia/gpusched`; note the
+   scheduler is then a fail-closed SPOF (a GPU pod won't start while it's down).
 3. **nvproxy must handle multiple NVIDIA GPU architectures, with runtime family
    detection.** One driver ABI spans Turing→Blackwell, and behaviour differs by
    generation — e.g. cuBLAS on a *Blackwell* GPU allocates a *Hopper* USERMODE
@@ -1224,7 +1267,7 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
 
    **Immediate next work: re-run the Step-3 playbook from the deferred call
    site on sensai's RTX 5070 and on the pro nodes (RTX A6000 GA102, RTX 6000
-   Pro Blackwell GB202)** — `ghost-experiment/HANDOFF.md` is the procedure and
+   Pro Blackwell GB202)** — the `ghost-experiment/` scripts are the procedure and
    `driver-hooks.patch` carries all the hooks. (Memory-quota isolation is
    separate and works everywhere.)
 4. **Send the two upstream fixes** (`797e29b80`, `6bfb3c267`) and file the KVM
@@ -1245,3 +1288,26 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
    is mandatory in Kubernetes. The GPU scheduler works around the same problem
    on the NVIDIA side by re-announcing devices from `StartSubcontainer`; the
    same trick may apply here.
+8. **Container suspend/resume — two different things, one gap.** Runtime
+   suspend/resume of a tenant's GPU *execution* already works and is exercised
+   every scheduling period: the compute gate revokes the submission mappings
+   (`pkg/sentry/devices/nvproxy/computegate.go` → `revokeMappings()`) and the app
+   faults them back in on resume, and the credit scheduler detaches a whole
+   tenant's TSGs from the runlist when it overdraws and reattaches on recovery
+   (`pkg/gpusched/credit.go`). A tenant that merely stops submitting is handled
+   too (idle → share reassigned, banked credit capped, never detach the last
+   runnable one). What does **not** work is checkpoint/restore of a GPU
+   container to disk (`runsc checkpoint`/`restore`, i.e. suspend-to-disk /
+   migration): `nvproxy.beforeSave()` panics on the first object that is not a
+   `restorableObjectImpl`, and only `rmAllocObject`/`rootClient` implement
+   `Restore` — `miscObject` and `osDescMem` do not, and those cover the OS
+   events, RM/heap allocations, duplicated handles, and pinned host descriptors
+   every CUDA context creates (`pkg/sentry/devices/nvproxy/save_restore.go`,
+   `object.go`). The mapping half is already solved (`InvalidateUnsavable` drops
+   device-memory mappings, the app re-faults on restore). Future work is
+   implementing `Restore` for `miscObject`/`osDescMem` — replaying each object's
+   creation with the right host FD and params, and re-pinning pages for
+   `osDescMem` — which is the one piece standing between this branch and
+   GPU-container migration. Upstream gVisor gap, not slicing-specific; see the
+   "Checkpointing a GPU sandbox does not work" section above and `runsc pause`
+   on a live GPU sandbox is untested (should follow from the same revoke path).

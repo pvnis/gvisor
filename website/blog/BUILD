@@ -190,6 +190,16 @@ doc(
     permalink = "/blog/2026/08/07/slicing-a-gpu-between-untrusted-containers/",
 )
 
+doc(
+    name = "gpu_compute_isolation",
+    src = "2026-08-19-gpu-compute-isolation.md",
+    authors = [
+        "dmd",
+    ],
+    layout = "post",
+    permalink = "/blog/2026/08/19/making-the-gpu-enforce-its-own-compute-shares/",
+)
+
 docs(
     name = "posts",
     deps = [

@@ -370,9 +370,15 @@ func (s *Server) Tick() {
 	// trusted, doorbell-aware idle signal, used in place of the fault count and
 	// nvidia-smi below when present.
 	var driverActive map[int]bool
+	var driverTSGs map[int]int
 	if s.activity != nil {
 		if a, err := s.activity.PollActive(); err == nil {
-			driverActive = a
+			driverActive = make(map[int]bool, len(a))
+			driverTSGs = make(map[int]int, len(a))
+			for pid, st := range a {
+				driverActive[pid] = st.Active
+				driverTSGs[pid] = st.TSGs
+			}
 		}
 	}
 
@@ -529,7 +535,7 @@ func (s *Server) Tick() {
 				continue
 			}
 			delete(s.warnedNoPID, id)
-			enforce = append(enforce, EnforceClient{PID: pid, Weight: sc.weight, Idle: idle[id]})
+			enforce = append(enforce, EnforceClient{PID: pid, Weight: sc.weight, Idle: idle[id], TSGs: driverTSGs[pid]})
 		}
 	}
 	enforcer := s.enforcer

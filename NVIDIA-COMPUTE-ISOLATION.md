@@ -403,7 +403,7 @@ workload has been divided by weight at all; the Sentry compute gate leaves it at
 sandbox. It requires the ghost-instrumented driver; without `--runlist-control`,
 only the gate enforces, exactly as before.
 
-The prior CORRECTION 2, the "not achievable" lines in CLAUDE.md/GHOST-PLAN, and
+The prior CORRECTION 2, the "not achievable" lines in CLAUDE.md, and
 the Reproducing-Ghost section above are superseded by this. The driver control
 (detach/attach/ts + RESTART_RUNLIST via an RM work item) is in the `ogkm-610`
 tree; the node is restored to clean 610 + the k8s stack.
@@ -868,7 +868,8 @@ actual mechanism.
 | die class | examples | MIG | TPC table | detach/timeslice/interleave | practical answer |
 | --- | --- | --- | --- | --- | --- |
 | **consumer** | RTX 5070 (GB205), 3090 (GA102) | no | **re-open — the probe that said no asked from the wrong call site** | measured ineffective (GB205) | unknown again; re-probe |
-| **pro/workstation** | **RTX A6000 (GA102)**, RTX 6000 Ada (AD102), **RTX 6000 Pro Blackwell (GB202)** | usually no† | **UNKNOWN — test it** | **UNKNOWN — test it** | **the open question** |
+| **pro/workstation** | **RTX A6000 (GA102) — measured** | **no** (`MIG M.: N/A`) | **UNKNOWN — spatial sweep still to run** | **works: `ts` 3:1 → 3.09:1, work-conserving, evict/restore clean** | temporal division works on a non-MIG pro die |
+| **pro/workstation, untested** | RTX 6000 Ada (AD102), **RTX 6000 Pro Blackwell (GB202)** | usually no† | UNKNOWN — test it | UNKNOWN — test it | untested; the A6000 predicts nothing about them |
 | **datacenter** | **A100 (GA100) — measured**, H100 (GH100), GB200 | yes | **`NV_OK` and enforced** | **inert** (all three, at kernel priv) | MIG, or an imposed TPC partition as a capped/proportional dial |
 
 † MIG has historically been datacenter-die-only, but NVIDIA has extended some
@@ -1001,7 +1002,7 @@ not differ at all.
 ## What the working control does and does not license
 
 On the A100 the spatial half is now live and the temporal half is dead, which
-is the opposite of what `GHOST-PLAN.md` was written to expect:
+is the opposite of what the original Ghost driver-broker plan was written to expect:
 
 - **Spatial (works on GA100).** Impose a per-sandbox TPC partition from the
   driver at ctxshare creation, weight → TPC count, laid out disjointly. nvproxy's
@@ -1023,8 +1024,8 @@ is the opposite of what `GHOST-PLAN.md` was written to expect:
 ## Artifacts and pointers
 
 - **This investigation's record**: `SECURITY-FINDINGS.md` (the full red-team +
-  every lever, with measurements), `GHOST-PLAN.md` (the driver-broker design +
-  Phase 0 results).
+  every lever, with measurements), `../open-gpu-kernel-modules/DRIVER-CHANGES.md`
+  (the driver-broker mechanisms the scheduler drives).
 - **Sentry-side scaffolding** (off by default, documents each lever's ceiling):
   `pkg/sentry/devices/nvproxy/smpart_unsafe.go` (TPC mode/table),
   `pkg/sentry/devices/nvproxy/computegate_unsafe.go` (timeslice/interleave/
@@ -1087,3 +1088,110 @@ deferred site). The only dies still carrying an unretested `0x57`-from-the-wrong
 site negative are the **pro parts (GA102 A6000, GB202 6000 Pro)**; both deserve
 the same clean re-probe from the deferred call site before any negative about
 them is believed.
+
+### The RTX A6000 (GA102) was probed — and the run is VOID
+
+Run on `vm-nv-dmd1` (2026-08-17) **before CORRECTION 5 was known**, using the
+committed `driver-hooks.patch` as it then stood — i.e. originating 0c/0d from
+inside `kctxshareapiConstruct_IMPL`, and 0b without the `RESTART_RUNLIST`
+companion. It reported:
+
+| probe | result | why it is void |
+| --- | --- | --- |
+| 0c `SET_TPC_PARTITION_TABLE` (21 of 42 TPCs) | `0x57`, burn 783 vs 773 solo | `0x57` from the constructor is `OBJECT_NOT_FOUND`, not a verdict — CORRECTION 5 |
+| 0d `SET_CWD_WATERMARK(MIN)` | `0x57`, readback 0 | same wrong call site |
+| 0b TSG force-detach | `NV_OK` on 3 TSGs, burn 773.4 vs 773 solo | no `RESTART_RUNLIST`, so the change was never committed — CORRECTION 3 |
+
+It was written up as "the A6000 matches the 5070, so pro dies do not unlock
+compute isolation, and MIG/SMC capability is the predictor." **Every part of
+that is withdrawn.** The status codes said nothing about the die, and the
+unchanged throughput is exactly what an un-applied control produces — it was
+read as evidence of absence when it was evidence of nothing. The MIG/SMC axis
+it proposed is refuted outright by GB205, which has no MIG and *does* honour
+the partition from the deferred site.
+
+**What does stand from that run**, and is worth not re-deriving:
+
+- **Hardware**: full GA102, **84 SMs = 42 TPCs**, sm_86, 46068 MiB, ECC on,
+  `MIG M.: N/A`. Half-partition test size is therefore 21 TPCs.
+- **Solo baseline, stock driver: 773 matmul/s** (770.1–774.2, ±0.3%) with
+  `ghost-experiment/burn.py`. Tight enough that a 21-TPC partition (~386) could
+  not hide, so the re-probe has a ready reference point.
+- **The open 610.43.02 build matches this box**: the apt candidate
+  (`nvidia-headless-610-open`) is exactly the tag the hooks were written
+  against, so firmware and modules agree with no version hunting.
+- **A stale-module trap that produces a false negative.** `rmmod nvidia` fails
+  while `nvidia_modeset` ← `nvidia_drm` still reference it, and `insmod` then
+  reports **"File exists" while the previous module stays resident** — so the
+  run silently measures the *old* build. For 0b that yields a full-rate burn,
+  indistinguishable from a genuine negative. `a6000-3-detach.sh` now unloads
+  `nvidia_drm`/`nvidia_modeset` first, hard-aborts if `nvidia` is still loaded,
+  and counts `GHOST 0b` dmesg lines — zero lines means the hook is not in the
+  loaded module and the rate must not be interpreted.
+
+`ghost-experiment/a6000-{1,2,3}-*.sh` carry the machine setup, driver swap and
+baseline and can be reused as-is; only the hook's call site needs to move to the
+deferred one before the numbers mean anything. **That re-probe has now been
+done — see below.**
+
+### The clean re-probe: GA102's temporal axis is POSITIVE
+
+Re-run 2026-08-19 on `vm-nv-dmd1` with the corrected driver
+(`pvnis/open-gpu-kernel-modules` branch `ghost-experiment`, base 610.43.02 to
+match the installed firmware, `GHOST_TOTAL_TPC` set to 42 for GA102): 0c/0d
+issued from the **deferred `GpFifoSchedule` site**, `SET_TIMESLICE`/detach paired
+with `RESTART_RUNLIST`, driven at runtime through
+`/proc/driver/nvidia/gpusched`. Driver identity confirmed by srcversion
+(`62EA0FAB…`, against stock DKMS `F9594124…`) and by the GHOST-only proc entry
+being present.
+
+| phase | A | B | aggregate | A:B |
+| --- | --- | --- | --- | --- |
+| solo, this driver | 614.4 | — | 614.4 | — |
+| unweighted | 282.7 | 282.7 | 565.4 | **1.00:1** |
+| **`ts` 3000/1000 µs** | **425.3** | **137.8** | 563.1 | **3.09:1** |
+| B `SIGSTOP`ped | **602.1** | idle | 602.1 | — |
+| B resumed | 424.6 | 137.7 | 562.3 | 3.08:1 |
+| B `detach`ed | **601.9** | evicted | 601.9 | — |
+| B `attach`ed back | 425.1 | 137.8 | 562.9 | 3.08:1 |
+
+- **The timeslice binds**: 3:1 requested → **3.09:1**, reproduced three times.
+  Unweighted is exactly 1.00:1, so the division is the lever's doing.
+- **It is work-conserving** — the design-decisive property. A rises 425 → 602
+  when B idles, **98% of solo**, rather than staying at its weighted share. True
+  for both `SIGSTOP` (channel-state idle detection) and explicit `detach`.
+- **Evict and restore both work**, returning to the same ratio, not drifting.
+- **The division is ~free**: 565.4 unweighted vs 563.1 weighted, ≈0.4%.
+
+So GA102 joins GB205 and GA100 on the temporal axis. The pro-die question the
+retraction reopened is answered for the temporal half: **the A6000 is not
+special, and the earlier negative really was the call site.**
+
+**Do not repeat the 20% as a finding.** Solo here is 614.4 against the 773
+measured earlier on the stock driver — a 20.5% gap that is **not attributed**.
+Either the hooks cost that, or the 773 predates k3s on this box and `burn.py`'s
+launch loop now contends for host CPU with k3s, Cilium, three vCluster control
+planes and six gVisor sandboxes. The second is at least as plausible. Every
+ratio above is internally consistent (one driver, one machine state), so the
+result does not depend on it — but settling it needs the stock driver
+re-measured under the current load.
+
+**Two harness lessons, both of which nearly produced a wrong result:**
+
+- **Never truncate a log the workload still holds open.** The first attempt
+  blanked each burn log with `: > file` between phases; python kept writing at
+  its old offset, the file grew a NUL hole, and `grep` reported *"binary file
+  matches"* and matched nothing — so **every tenant-B number came back `n/a`**
+  and the ratio, the whole point, was lost. Delimit windows by line offsets and
+  pass `grep -a`.
+- **Measure the solo reference on the driver under test.** Reusing the
+  stock-driver 773 would have made every ratio here wrong by 20%.
+
+And one that cost a false abort: **`modinfo -F filename nvidia` cannot tell you
+which module is loaded.** It resolves the module *name* against `/lib/modules`
+and reports what `modprobe` would pick, so it says `updates/dkms/…` even
+immediately after a successful `insmod` of a different build. Compare
+`/sys/module/nvidia/srcversion` against the candidate `.ko`, or test for a
+build-specific interface. `a6000-verify-loaded.sh` does both.
+
+The spatial axis on GA102 is still open.
