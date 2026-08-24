@@ -22,16 +22,20 @@ for *what* to enforce but never for *how*: enforcement moves to the Sentry.
 
 ---
 
-## Three projects, three layers
+## Four projects, four layers
 
-GPU isolation spans three repositories. Each has its own docs; together they form
+GPU isolation spans four repositories. Each has its own docs; together they form
 one stack.
 
 | Layer | Project | Role |
 | --- | --- | --- |
 | **Cluster tenancy** | [`vcluster-multitenant`](../vcluster-multitenant) | Each tenant gets its own Kubernetes API server (vCluster) and network isolation (Cilium) on shared bare metal. Answers "who may run what." |
+| **GPU-aware placement & admission** | [`HAMi-gvisor`](../HAMi-gvisor) (+ the in-tree webhook, [`webhook/`](webhook)) | A fork of HAMi: its scheduler and device plugin place each pod on a node/GPU and bin-pack by memory; the admission webhook restates the pod's GPU request as Sentry-enforced flags. Answers "which GPU, and what quota does it carry." |
 | **Sandbox enforcement** | **`gvisor`** (this repo) | The Sentry interprets each container's GPU `ioctl`s and enforces its memory quota and compute share. Answers "how much of the GPU may this container take." |
 | **Privileged driver broker** | [`open-gpu-kernel-modules`](../open-gpu-kernel-modules) | The open NVIDIA kernel driver, extended with hooks that let a trusted host component drive the hardware runlist and per-tenant UVM eviction — the things the Sentry cannot do from userspace. Answers "how is a compute/paging decision actually applied to the hardware." |
+
+Only the last two layers *enforce* isolation against a hostile tenant; the first
+two decide placement and translate requests, and are trusted infrastructure.
 
 The two enforcement layers are **orthogonal in what they guarantee** (verified:
 neither weakens the other) but interact in what they *deliver* — see
@@ -149,15 +153,30 @@ driver side is in `open-gpu-kernel-modules/DRIVER-CHANGES.md`.
 
 ---
 
-## Kubernetes integration
+## Kubernetes integration (HAMi-gvisor)
 
-HAMi's scheduler, webhook, and device plugin are reused **unchanged** — only the
-`libvgpu.so` in-container preload is dropped. The admission webhook restates each
-pod's request as Sentry flags *where the container cannot reach them*
-(`nvidia.com/gpumem` → memory limit, `nvidia.com/gpucores` → scheduler weight).
-`failurePolicy: Fail` is a **security property**: an unmutated pod would carry no
-quota and run at the whole-device ceiling. Full deployment: **`MULTI-TENANT-SETUP.md`**;
-the two-vendor cluster: **`vcluster-multitenant/TWO-VENDOR-CLUSTER.md`**.
+Placement and admission run on **`HAMi-gvisor`**, a fork of HAMi. HAMi's
+scheduler and device plugin place each pod on a node/GPU and bin-pack by memory
+exactly as upstream; on NVIDIA the fork is essentially stock — the one deletion
+is HAMi's `libvgpu.so` in-container preload, since that is the in-container
+enforcement this project replaces. On **AMD** the fork additionally assigns
+**disjoint CU masks** from a node-scoped allocation record (`cusForRequest`).
+
+Two admission webhooks run side by side:
+
+- **HAMi's own webhook** (`vgpu.hami.io`) — device scheduling, unchanged.
+- **The in-tree gVisor webhook** ([`webhook/pkg/gpushare`](webhook/pkg/gpushare)) —
+  restates each pod's admitted request as `dev.gvisor.flag.*` Sentry flags *where
+  the container cannot reach them* (`nvidia.com/gpumem` → memory limit,
+  `nvidia.com/gpucores` → scheduler weight; two-vendor, narrow-only, so a pod can
+  only clamp its own quota *down*). This replaces the retired standalone
+  `gpu-quota-webhook`.
+
+`failurePolicy: Fail` on the gVisor webhook is a **security property**, not an
+availability preference: an unmutated pod would carry no quota and run at the
+whole-device ceiling, so an unreachable webhook must fail closed. Full
+deployment: **`MULTI-TENANT-SETUP.md`**; the two-vendor cluster:
+**`vcluster-multitenant/TWO-VENDOR-CLUSTER.md`**.
 
 ---
 
@@ -172,5 +191,7 @@ the two-vendor cluster: **`vcluster-multitenant/TWO-VENDOR-CLUSTER.md`**.
 | `MULTI-TENANT-SETUP.md` | Standing up the whole stack |
 | `A100-CLUSTER.md` | The `gpu0-a` A100 node reference |
 | `UPSTREAM-NOTES.md` | Two general gVisor fixes bound for upstream |
+| `webhook/pkg/gpushare` | The admission webhook that restates a pod's request as Sentry flags |
 | `open-gpu-kernel-modules/DRIVER-CHANGES.md` | The privileged driver hooks the broker drives |
+| `HAMi-gvisor` | The GPU-aware placement/admission fork (scheduler, device plugin, AMD CU allocator) |
 | `vcluster-multitenant/README.md` | The cluster-tenancy layer above this one |
