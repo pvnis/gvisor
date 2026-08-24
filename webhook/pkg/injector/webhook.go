@@ -240,6 +240,7 @@ func updatePod(pod *v1.Pod) {
 	// against, and stand down the limiter that runs inside the container.
 	gpushare.InjectMemoryLimit(pod)
 	gpushare.InjectAMDMemoryLimit(pod)
+	gpushare.InjectAMDWeight(pod)
 	gpushare.InjectWeight(pod)
 	gpushare.StandDownHAMi(pod)
 

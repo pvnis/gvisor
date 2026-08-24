@@ -232,6 +232,78 @@ func TestInjectAMDMemoryLimitNarrows(t *testing.T) {
 	}
 }
 
+// TestInjectAMDWeight tests that the weight is the requested unit count,
+// unscaled.
+//
+// It is relative: what matters is that a pod asking for three times as much
+// memory gets three times the GPU time, and turning that into a percentage
+// first would need the size of a device admission has not chosen yet.
+func TestInjectAMDWeight(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		pod        v1.Pod
+		want       string
+		wantAbsent bool
+	}{
+		{
+			name: "the unit count is the weight",
+			pod:  v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{amdContainer(6)}}},
+			want: "6",
+		},
+		{
+			name: "containers sum",
+			pod:  v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{amdContainer(6), amdContainer(2)}}},
+			want: "8",
+		},
+		{
+			// A pod that asked for no GPU keeps the runtime's weight and
+			// competes evenly with the other unannotated pods.
+			name:       "no request",
+			pod:        v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{amdContainer(0)}}},
+			wantAbsent: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := test.pod
+			InjectAMDWeight(&pod)
+			got, ok := pod.Annotations[AMDWeightAnnotation]
+			if test.wantAbsent {
+				if ok {
+					t.Errorf("annotation = %q, want absent", got)
+				}
+				return
+			}
+			if got != test.want {
+				t.Errorf("annotation = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// TestInjectAMDWeightNarrows tests the case this exists to defend, now that the
+// weight comes from here rather than from a forked scheduler that recomputed
+// it: a pod claiming a larger share than it was placed for.
+func TestInjectAMDWeightNarrows(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		stated string
+		want   string
+	}{
+		{name: "keeps lower", stated: "2", want: "2"},
+		{name: "narrows higher", stated: "100", want: "6"},
+		{name: "zero is not lower", stated: "0", want: "6"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{amdContainer(6)}}}
+			pod.Annotations = map[string]string{AMDWeightAnnotation: test.stated}
+			InjectAMDWeight(&pod)
+			if got := pod.Annotations[AMDWeightAnnotation]; got != test.want {
+				t.Errorf("annotation = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 // TestVendorsAreIndependent tests that a pod asking one vendor for memory does
 // not acquire the other vendor's limit, since each is enforced by its own
 // proxy and an unasked-for limit would stop a pod that never requested one.
