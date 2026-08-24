@@ -28,12 +28,14 @@ difference in their behaviour follows from that.
 
 | | AMD (`amdproxy`) | NVIDIA (`nvproxy`) |
 | --- | --- | --- |
-| compute is divided in | **space** — CU masks | **time** — submission windows |
-| enforced by | the GPU's command processor | the Sentry, gating submission |
-| set at | queue creation, per ioctl | continuously, per period |
-| unused share goes to | nobody; it idles | whoever is asking (with the scheduler) |
-| granularity | 2 CUs on RDNA, fixed at start | a weight, re-divided every period |
+| compute is divided in | **space** — CU masks, **or time** — queue suspension, never both | **time** — submission windows |
+| enforced by | the GPU's command processor; or the Sentry, suspending queues | the Sentry, gating submission |
+| set at | queue creation, per ioctl; or continuously, per period | continuously, per period |
+| unused share goes to | CU masks: nobody. Time slices: whoever is asking | whoever is asking (with the scheduler) |
+| granularity | 2 CUs on RDNA fixed at start; or a weight, re-divided every period | a weight, re-divided every period |
 | memory quota | admit-before-forward on `ALLOC_MEMORY_OF_GPU` | admit-before-forward on the RM/VMM paths |
+| preempts running work | **yes** — CWSR saves in-flight waves | no — a long kernel outlives the window |
+| privileged host component | **none** | needed, for the runlist enforcer |
 
 **Why AMD gets a spatial partition and NVIDIA cannot.** Once an NVIDIA channel
 is set up, work is submitted by writing to a pushbuffer in mapped memory and
@@ -50,6 +52,13 @@ give an idle tenant's share to a busy one, and it cannot be changed once queues
 exist. The NVIDIA scheduler *can* reassign unused time and adjusts as tenants
 come and go, but it is a policy running every period, and it costs more to be
 right.
+
+**AMD now has both**, and they compose: the CU mask for a hard spatial floor,
+queue suspension for a work-conserving weighted share. Which to reach for
+follows from what the workload is bound on — masks partition compute pipeline
+occupancy but not memory bandwidth, which is why three vLLM tenants on disjoint
+masks still cost each other 35%. See "Time-slicing AMD from userspace" and "The
+Sentry now enforces it" below.
 
 ## Where the work runs
 
@@ -548,8 +557,355 @@ shape the Sentry is in, since it is itself the KFD process for the sandbox.
 `dbg_fd` wants a pollable fd; an `eventfd` works. `RUNTIME_ENABLE` must have
 succeeded first, which ROCr does during init well before creating a queue.
 
-gVisor models none of this today: `DBG_TRAP` is denied outright, with no struct
-and no op enum in `pkg/abi/amdgpu`.
+### The Sentry now enforces it, with nothing preloaded (2026-08-21)
+
+`pkg/sentry/devices/amdproxy/timeslice.go` drives the `dbg` lever from the
+Sentry, so the LD_PRELOAD interposer is no longer in the enforcement path at
+all. `--amdproxy-gpu-scheduler-socket` + `--amdproxy-gpu-weight`, served by the
+same `runsc gpu-scheduler` the NVIDIA side uses; `pkg/gpusched` was reused
+unchanged. **`DBG_TRAP` stays denied to the sandbox, and that denial is now
+load-bearing** — a sandbox able to issue it could resume the queues gating it.
+
+**There is no privileged host component in the AMD enforcement path.** The
+scheduler only advises; each Sentry suspends its own queues. That is strictly
+better than the NVIDIA arrangement, where the runlist enforcer needs kernel
+privilege.
+
+Measured on sens1 with `~/amdtest/tslice.sh`, gpuburn, no interposer anywhere:
+
+| configuration | result |
+| --- | --- |
+| one sandbox alone, unsliced | 11984 iters/s |
+| one sandbox alone, session open | 6869 iters/s |
+| two sandboxes, 100:100 | 3391 / 3398, **Jain 1.0000** |
+| two sandboxes, 300:100 | 5110 / 1673, **3.05:1** |
+| two sandboxes, 500:100 | 5676 / 1106, **5.13:1** |
+| `vecadd` sliced against a burner | `RESULT CORRECT`, 3/3 |
+| a neighbour leaving | 1400 → 3440 → 6850 iters/s |
+
+Aggregate under contention is 6782–6790 against one tenant's 6869, so slicing
+on top of the session is work-conserving and nearly free. Zero driver faults.
+
+**This is the first exact proportional divider on the AMD side.** CU masks give
+2:1 → 1.84:1 and 3:1 → 2.67:1, and cannot be changed once queues exist; this
+gives 3:1 → 3.05:1 and 5:1 → 5.13:1 and re-divides every period.
+
+**Measure over the contended interval, not the whole run.** The two tenants are
+staggered and each spends a second or two in ROCr's initialisation, so at one
+edge of every run a tenant is alone on the device. Averaged into a short run
+that is several percent, always favouring the smaller share, and it reads
+exactly like an imprecise divider — the same configuration measured **2.8:1**
+untrimmed and **3.05:1** trimmed. `tslice.sh -t` trims it; this cost an hour
+chasing a bias in the scheduler that was never there.
+
+**Four bugs, each silent, all of which cost real time:**
+
+- **`EC_QUEUE_NEW` must be drained after every queue creation, not just before
+  a suspend.** Subscribing to an exception tells the driver a debugger is
+  watching, and a queue whose exception nobody collects *does not run*. A lone
+  tenant holding the whole period is never suspended, so it never drained, so
+  it never started.
+- **The session must be closed before the app's `RUNTIME_ENABLE` disable
+  reaches the driver.** The driver raises a runtime event to the debugger there
+  and waits forever for an answer. The app blocked inside the ioctl with no
+  error and nothing in `dmesg`; `--strace --strace-syscalls=ioctl` found it in
+  one run by showing an ioctl entered and never left. The interposer never hit
+  this because its `atexit` handler happened to close the session first.
+- **Opening a session leaves the queues stopped**, so the state to assume after
+  it is *suspended*, and the first resume is what starts them.
+- **The window arithmetic has to wrap.** `resumeSlack` moves the opening edge
+  back, so a window at phase 0 begins in the *previous* period; computing that
+  as a non-positive interval left the phase-0 tenant suspended an extra period
+  each time. It still divided the GPU, just at half the granted share — 1.57:1
+  for a 3:1 request, with the *other* tenant landing exactly on its own share.
+  The unit test missed it by only ever testing phase 50 ms.
+
+**`resumeSlack` shifts the window, it does not widen it.** Adding it to only
+the closing edge gives every tenant `allowance + slack` of running time, which
+is a far larger relative gift to a small share than to a large one and quietly
+compresses the division toward equal. Fixed by shifting both edges, which keeps
+the windows tiling the period exactly once — `TestWindowsTileThePeriod` checks
+that no instant has two tenants running or none.
+
+### Telling a busy tenant from an idle one: wave state, not queue pointers
+
+The Sentry cannot count submissions — they never enter the kernel, which is the
+whole reason this gates the *queue*. So it asks how much wave state each
+suspension had to save: `GET_QUEUE_WAVE_STATE`'s `save_area_used_size`, taken
+right after `SUSPEND_QUEUES`, for free from a preemption already happening.
+
+**Do not use the queue read/write pointers.** They measure *submission*: the
+command processor advances RPTR when it *consumes* a dispatch packet, not while
+the kernel runs. A tenant executing one long kernel has `wptr == rptr`
+throughout and reads as idle — and since CWSR lets amdproxy preempt mid-kernel,
+throttling it to the 5 ms floor would actually succeed. Measured with a single
+31.8 s dispatch.
+
+| workload | wave state says busy | correct |
+| --- | --- | --- |
+| `gpuburn`, continuous short kernels | 82% of samples | busy |
+| `longkernel`, one 10 s dispatch | **100%** | busy |
+| `idler`, queue open, nothing submitted | **0%** | idle |
+
+The reading is **one-sided**: idle is never wrong; busy can be missed when a
+stream of short kernels has nothing in flight at the instant of preemption. The
+scheduler's `idleTicksBeforeYielding = 3` makes a spurious yield a 0.18³ event.
+Cost 0.1%.
+
+End to end under gVisor, `gpuburn` against a neighbour at equal weights:
+busy → 3391 iters/s (splits), `idler` → **6878** (reclaims the device),
+`longkernel` → **2960** (correctly does not reclaim).
+
+**Everything else the driver offers was checked and is unusable.**
+`cu_occupancy` in KFD's per-process sysfs would have been ideal — kernel-
+maintained, per-process, measures execution — but **it is not implemented on
+RDNA**: `rocm-smi --showpids` reports `UNKNOWN` on both sens1's Navi 32 and
+sensnucbox2's gfx1103. Worth re-checking on CDNA/MI, where it may exist. DRM
+fdinfo carries full memory accounting but **no `drm-engine-*` lines**, because
+KFD queues bypass the DRM scheduler entirely. The KFD SMI event stream is
+exceptional events only (vmfault, throttle, reset, migrate, evict/restore,
+process start/end) — nothing per-submission.
+
+`~/amdtest/src/{idler,longkernel}.hip` are the probes that pin this down, and
+`QSLICE_WAVESTATE=1` reports the signal from the interposer.
+
+### Adversarial multi-tenant: the compute share holds, unlike NVIDIA's
+
+`~/amdtest/adversary.sh` runs N well-behaved tenants and one hostile one under
+the Sentry-side slicer; `src/evilburn.hip` is the attacker. This is the AMD
+counterpart to `NVIDIA-COMPUTE-ISOLATION.md`'s gpu0-a section, where the
+compute *share* is the one boundary that does **not** hold: a hostile tenant
+submitting through cuBLAS rings a doorbell nvproxy cannot revoke and takes an
+equal split whatever weight it was given (weight-25 attacker vs weight-75
+victim measured 1:1).
+
+**On AMD it holds.** The lever is the queue lifecycle, not the submission path,
+so how the attacker submits is irrelevant.
+
+| the attack | result |
+| --- | --- |
+| `DBG_TRAP TRAP_ENABLE` on itself | **refused** (EINVAL) — amdproxy does not dispatch DBG_TRAP |
+| `DBG_TRAP RESUME_QUEUES` over guessed ids | **refused** (EINVAL) |
+| `CREATE_PROCESS` for a second KFD context | **refused** (EINVAL) |
+| `UPDATE_QUEUE queue_percentage=100` | allowed, and does not lift the suspension — the two mechanisms share no state. It corrupts the caller's *own* ring, since the struct carries `ring_base_address`/`ring_size` and a container does not know its own |
+| `RUNTIME_ENABLE(disable)` to dismantle the session | allowed, and **stops the attacker's own GPU work**. Identical with slicing off entirely, so it is the driver halting the process, not an escape |
+
+| configuration | good : adversary | adversary's share |
+| --- | --- | --- |
+| 2 good @300, evil @100 | **3.00:1** (asks 3:1) | 14.3% vs 14.3% entitled |
+| 3 good @200, evil @100 | **1.93:1** (asks 2:1) | 14.7% vs 14.3% entitled |
+| before vs after attacking | ratio 0.996 | **CONTAINED** |
+| an *honest* tenant in its place | 953.3 iters/s | adversary got 947.0 — **within 0.6%** |
+
+#### Through the full Kubernetes stack, 3 good tenants and 1 attacker (2026-08-22)
+
+`~/amdtest/k8s/adversary-k8s.sh`. Everything above was runsc invoked directly;
+this is the webhook, the HAMi fork's weight assignment and amdproxy's
+enforcement together. The attacker requests the *smallest* slice and then
+annotates itself the whole card and the largest weight it can name.
+
+**Two defences, in two different places, and both hold:**
+
+| the attack | asked for | got |
+| --- | --- | --- |
+| annotate `amdproxy-gpu-memory-limit` = 12868124672 (whole card) | 2 slices | **1073741824** — clamped by the webhook, narrow-only |
+| annotate `amdproxy-gpu-weight` = 100 | 2 slices | **9** — overwritten by the scheduler, which derives it from the request |
+| `DBG_TRAP TRAP_ENABLE` on itself | | **refused** (EINVAL) |
+| `DBG_TRAP RESUME_QUEUES` over guessed ids | | **refused** (EINVAL) |
+| `CREATE_PROCESS` | | **refused** (EINVAL) |
+| `UPDATE_QUEUE queue_percentage=100` | | allowed, does not lift the suspension |
+
+| tenant | weight | iters/s |
+| --- | --- | --- |
+| good1 / good2 / good3 | 27 each | 1807.7 / 1811.8 / 1786.4 |
+| **adversary** | 9 | **555.3** |
+
+**3.25:1** against the 3:1 the weights ask; the adversary took **9.3%** of the
+aggregate where its weight entitles it to 10.0%. Its own before/after ratio was
+**0.963 — CONTAINED**: attacking made it slightly *worse* off. Zero driver
+faults during the run.
+
+The weight defence is worth naming separately from the memory one, because it
+is not the webhook's: the webhook has no AMD weight injector, and runsc's
+narrow-only check has nothing to compare against when the runtime sets no
+weight. What stops the escalation is that the scheduler *computes* the weight
+from the resource request and overwrites whatever the pod claimed.
+
+That last row is the statement: the attacker gains nothing over a well-behaved
+tenant of the same weight.
+
+**Measure the contended interval.** The adversary's own before/after verdict
+read `ESCAPED` at ratio 1.187 purely because the good tenants finished first
+and left it alone at the end. Same trap as `tslice.sh -t`.
+
+### Time-slicing and CU masks cannot both be applied on gfx11
+
+**Root cause found in the kernel source, and it is not what the symptom
+suggested.** The Ubuntu source for the exact running kernel is at
+`~/kernel-source/linux-7.0` (`linux-hwe-7.0` 7.0.0-28.28~24.04.1, verified: its
+changelog names that version, `KFD_IOCTL_MINOR_VERSION` is 22, and its
+`kfd_ioctl_create_queue_args` computes to the 96 bytes that make the ioctl
+`0xc0604b02`). `drivers/gpu/drm/amd/amdkfd/kfd_debug.c:310`:
+
+```c
+static int kfd_dbg_set_queue_workaround(struct queue *q, bool enable)
+{
+	if (!kfd_dbg_has_cwsr_workaround(q->device))
+		return 0;
+	if (enable && q->properties.is_user_cu_masked)
+		return -EBUSY;
+```
+
+and `kfd_dbg_has_cwsr_workaround()` is `GC_VERSION >= IP_VERSION(11,0,0) &&
+<= IP_VERSION(11,0,3)` — which includes sens1's Navi 32. **On gfx11 the driver
+refuses to put a debug session's CWSR workaround on a queue that carries a user
+CU mask.** The two mechanisms this branch enforces with, spatial and temporal,
+are mutually exclusive on this ASIC, by the driver's own rule.
+
+The chain, every step measured:
+
+1. amdproxy opens the debug session, which time-slicing needs.
+2. `CREATE_QUEUE` succeeds.
+3. amdproxy applies the sandbox's CU mask, as it always has —
+   `SET_CU_MASK` sets `is_user_cu_masked` and returns **`EBUSY`**.
+4. `kfdCreateQueue` destroys the queue and returns that error as the
+   *`CREATE_QUEUE`* result: `amdproxy: applying CU mask to queue 0 failed
+   (device or resource busy); destroying it`.
+5. ROCr does not handle a failed queue creation and dereferences null —
+   `Signal 11 ... fault addr: 0x34`. **The same ROCr bug already recorded above
+   for a CU mask that splits a workgroup processor.**
+
+Reproduced in one command, no Kubernetes and no vLLM:
+
+| `gpuburn` under | result |
+| --- | --- |
+| `--amdproxy-cu-mask=0xfffff` alone | 4550 iters/s |
+| `--amdproxy-cu-mask=0xfffff` + scheduler socket | **dies at the first queue** |
+| scheduler socket alone | 6869 iters/s |
+
+**vLLM was a red herring.** It failed only because HAMi's allocator assigns
+every pod a CU mask (`0xfffff`, 20 CUs, visible in the pod annotations). Three
+earlier hypotheses are now dead, and all three were plausible: it is not the
+session attaching to an `ENABLED_BUSY` runtime, not the file descriptor the
+session is opened on, and **not multi-process sharing at all** — the
+`--amdproxy-share-kfd-vm` guard now in the code is aimed at the wrong thing.
+
+**The combination is now refused, in two places.** `Config.Validate()` catches
+it in runsc itself, so the operator is told directly; without that the refusal
+reaches them as `cannot read client sync file: EOF` with the real message a log
+deep, because `Register` runs inside the sandbox. `checkSliceOrMask` in
+`amdproxy.go` refuses it again where the reason lives, for callers that do not
+come through the flag path.
+
+    $ runsc --amdproxy-cu-mask=0xfffff --amdproxy-gpu-scheduler-socket=... ...
+    amdproxy-cu-mask and amdproxy-gpu-scheduler-socket are mutually exclusive:
+    a sandbox may be given a share of the GPU in space (a compute unit mask) or
+    in time (a weight) ... unset one, including any node-wide default in
+    /etc/runsc/config.toml
+
+Verified on hardware: mask only 4561 iters/s, weight only 6898, both refused.
+
+Neither is silently preferred. Which one a sandbox should get is a real choice
+— a mask is a hard partition that idles when its tenant does, a weight is
+work-conserving and exactly proportional — and it belongs to whoever places the
+sandbox.
+
+Consequences worth stating plainly:
+
+- **Kubernetes now works, in either mode.** The HAMi fork takes
+  `amd.timeSlice` in the `hami-scheduler-device` ConfigMap and writes a weight
+  *or* a mask, never both (`~/HAMi`, branch `gvisor-amd-timeslice`, `d409e9e`).
+  The weight is derived from the memory request and scaled to a percentage of
+  the device, the same proportion `cusForRequest` uses for compute units, since
+  memory is the only thing an AMD pod asks for. Verified on sens1: a pod
+  requesting 8 of 23 slices got `amdproxy-gpu-weight: "35"` and **no**
+  `amdproxy-cu-mask`, and `--amdproxy-gpu-weight=35` appears in the sandbox's
+  `boot.txt`.
+
+  **The node config must match the scheduler's mode.** `/etc/runsc/config.toml`
+  on sens1 now carries `amdproxy-gpu-scheduler-socket` and deliberately *no*
+  `amdproxy-cu-mask` — not even a full-device one, since any mask makes runsc
+  refuse a weighted sandbox. The previous file is at
+  `config.toml.bak-preslice`. A `runsc gpu-scheduler` must be running or every
+  gVisor sandbox on the node fails to start.
+
+  **Memory quota and time slice compose.** The same pod, with the in-tree
+  webhook also injecting a quota: `amdproxy-gpu-memory-limit: 4294967296` and
+  `amdproxy-gpu-weight: 35` together, and memprobe saw 4096 MiB and stopped at
+  exactly 4096. Without the webhook (namespace not labelled `gvisor`) it saw
+  the node ceiling and took 12032 MiB — the quota is the webhook's doing, not
+  the scheduler's.
+- The refusal is unconditional, though the driver's rule is gfx11-only. CDNA
+  and gfx12 fall outside `IP_VERSION(11,0,0)..(11,0,3)` and should permit both;
+  nothing here can test that, and refusing an untested combination known to
+  crash the runtime elsewhere is the safe direction. Narrow it when there is an
+  MI part to try.
+- **vLLM is time-sliced, measured** — see below. The claim that multi-process
+  workloads cannot be is withdrawn; it rested entirely on the CU mask.
+
+### vLLM time-sliced under gVisor, straight from runsc (2026-08-22)
+
+`~/amdtest/vllm-runsc.sh` runs a vLLM server in a gVisor sandbox with no
+Kubernetes, no HAMi, no device plugin and **no CU mask**; the image is exported
+once to `/var/lib/vllm-rootfs` and shared read-only, so two tenants cost one
+copy. `vllm-bench-runsc.sh` drives each server from inside its own sandbox via
+`runsc exec`, so no networking is in the measurement.
+
+Qwen2.5-0.5B-Instruct, 0.30 utilization each, concurrency 16, 45 s:
+
+| configuration | result |
+| --- | --- |
+| one tenant alone, sliced | 1808.6 tok/s |
+| two tenants, weights 300:100 | **1296.8 / 546.0 = 2.38:1** (asked 3:1) |
+| aggregate under contention | 1842.8 tok/s — **102% of one tenant alone** |
+| two tenants, neither actually gated | 2508 tok/s |
+
+So the division is real and work-conserving against a single tenant, and costs
+about 27% against two *ungated* tenants — the same sign and size the interposer
+measured, and for the same reason: neither vLLM tenant saturates the device, so
+ungated they interleave and fill each other's gaps, and slicing destroys that
+overlap. Precision is lower than gpuburn's 3.05:1 for the same reason.
+
+**Two things about the harness, both of which produced a wrong number first.**
+
+- **Drive the tenants concurrently.** A weighted slice only binds a tenant that
+  wants more than its share. One request at a time, a 0.5B model leaves the GPU
+  mostly idle, a 25% window exceeds the tenant's demand, and 3:1 measures
+  0.90:1 while the scheduler grants exactly 75 ms and 25 ms. That is the load
+  being too light to divide, not the divider failing.
+- **`--network=none`, not the default.** vLLM's engine core reaches its own API
+  server over torch.distributed's TCPStore on loopback. The default sandbox
+  netstack has no loopback address at all — `bind(("127.0.0.1", 0))` returns
+  `EADDRNOTAVAIL`, with or without a network namespace in the spec — while both
+  `none` and `host` provide one. `none` also gives each tenant its own, so two
+  servers cannot collide on a port. `VLLM_HOST_IP=127.0.0.1` is needed besides,
+  or vLLM falls back to `0.0.0.0`, which Linux treats as loopback and gVisor's
+  netstack does not.
+
+**The activity signal has to fail towards "active", and the reason is a
+feedback loop.** Wave state exists only where a suspension put it, so a sandbox
+that is not being suspended cannot be measured — and a sandbox granted the
+whole period is never suspended. Reporting idle on no evidence therefore
+latches: the tenant is granted everything, stops being suspended, never samples
+again, and can never be seen to resume. Measured: two vLLM tenants weighted 3:1
+held the correct 75/25 windows for **0.7 seconds**, then both latched idle,
+were each granted the whole period, and finished **0.88:1** having been
+suspended **six times in forty seconds**. With no-evidence reading as active
+the same run suspends 864 times and divides 2.38:1.
+
+The other half of the same problem is the opposite failure: acting on a single
+quiet sample. A suspension catches whatever is resident at that instant, and a
+decode loop is between kernels more often than inside one, so one sample makes
+a busy tenant look idle and the two tenants trade places every few periods.
+`activeMemory` requires five consecutive quiet samples before yielding.
+
+**A lesson worth keeping: `desired()` and the transition test are two booleans
+and both were wrong.** The transition test was inverted (`suspended == !want`),
+which issues a resume for queues that were never suspended; the driver counts
+suspends against resumes, so that unmatched resume stopped the queue entirely.
+Both now have named helpers (`needsTransition`, `inWindow`, `until`) and tests,
+because in this area a wrong boolean produces a *plausible* number rather than
+an error.
 
 Three traps worth keeping:
 - **`strace` cannot symbolize `CREATE_QUEUE` on this host.** ABI 1.22 grew the
@@ -808,10 +1164,13 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
 
 ## Next
 
-1. **Document the AMD half in `g3doc/user_guide/gpu.md`.** That file is
-   1054 lines and entirely NVIDIA; amdproxy has no user-facing documentation at
-   all. This is the largest remaining gap in making the branch genuinely
-   two-vendor.
+1. ~~**Document the AMD half in `g3doc/user_guide/gpu.md`.**~~ **Done
+   (2026-08-22).** `## AMD GPUs {#amdproxy}` covers the three limits and the
+   rule that a sandbox gets a CU mask *or* a weight, the seven-step runbook for
+   dividing a device in time, the pod annotations and which component derives
+   each of them, what the slicing costs, and the known limitations. The
+   remaining gap is narrower: nothing there is generated or tested, so the
+   measured figures in it will go stale.
 2. **Fix or default off `--measure-usage`.** It is on by default and makes an
    ordinary two-pod split *worse* than no scheduler at all (31/618 against
    324/324). The documented setup works around it; the code should not need the

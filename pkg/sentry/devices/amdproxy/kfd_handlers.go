@@ -104,6 +104,20 @@ func kfdRuntimeEnable(ki *kfdIoctlState) (uintptr, error) {
 	} else if share.leave(tgid) {
 		// Someone else is still using it.
 		return 0, nil
+	} else {
+		// The last user is taking the debug runtime down, and the driver will
+		// not let it go while a debug session is open: it raises a runtime
+		// event to the debugger and waits, indefinitely, for the debugger to
+		// answer. Nothing in this package answers it, so the time slicer's
+		// session has to be closed first.
+		//
+		// Found the hard way. The application blocked inside RUNTIME_ENABLE
+		// with no error and no driver message; only a syscall trace showed
+		// which ioctl had been entered and never left. The interposer this was
+		// ported from never hit it because it closed its session from an
+		// atexit handler, which happens to run before the runtime is taken
+		// down.
+		ki.fd.dev.amdp.timeSlicer.shutdown()
 	}
 	n, err := kfdIoctlInvoke(ki, &params)
 	if err != nil {
@@ -111,6 +125,11 @@ func kfdRuntimeEnable(ki *kfdIoctlState) (uintptr, error) {
 			share.enterFailed(tgid)
 		}
 		return n, err
+	}
+	if enabling {
+		// The one moment at which a debug session may be opened: the debug
+		// runtime is up, and has not yet become busy. See openSession.
+		ki.fd.dev.amdp.timeSlicer.openSession(ki.fd.hostFD)
 	}
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err

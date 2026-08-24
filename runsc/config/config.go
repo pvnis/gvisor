@@ -440,6 +440,14 @@ type Config struct {
 	// address space, so that more than one of them can use the GPU.
 	AMDProxyShareKFDVM bool `flag:"amdproxy-share-kfd-vm"`
 
+	// AMDProxyGPUWeight is this sandbox's share of an AMD GPU relative to the
+	// others scheduled alongside it.
+	AMDProxyGPUWeight uint64 `flag:"amdproxy-gpu-weight"`
+
+	// AMDProxyGPUSchedulerSocket is the path of a GPU scheduler dividing an
+	// AMD GPU between the sandboxes sharing it.
+	AMDProxyGPUSchedulerSocket string `flag:"amdproxy-gpu-scheduler-socket"`
+
 	// TPUProxy enables support for TPUs.
 	TPUProxy bool `flag:"tpuproxy"`
 
@@ -567,6 +575,18 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("amdproxy-cu-mask: %w", err)
 	} else if c.AMDProxyCUMask != "" && mask.Empty() {
 		return fmt.Errorf("amdproxy-cu-mask=%q selects no compute units", c.AMDProxyCUMask)
+	}
+	// A sandbox may be divided in space or in time, not both. amdproxy refuses
+	// the combination too, since that is where the reason lives, but by then
+	// the sandbox is already starting and the refusal reaches the operator as
+	// "cannot read client sync file: EOF" with the real message a log deep.
+	// This runs in runsc itself, so the operator is told directly.
+	if c.AMDProxyCUMask != "" && c.AMDProxyGPUSchedulerSocket != "" {
+		return fmt.Errorf("amdproxy-cu-mask and amdproxy-gpu-scheduler-socket are mutually exclusive: "+
+			"a sandbox may be given a share of the GPU in space (a compute unit mask) or in time (a weight), "+
+			"and the amdgpu driver refuses a time slice's debug session on a CU-masked queue. "+
+			"Got mask %q and scheduler %q; unset one, including any node-wide default in /etc/runsc/config.toml",
+			c.AMDProxyCUMask, c.AMDProxyGPUSchedulerSocket)
 	}
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
