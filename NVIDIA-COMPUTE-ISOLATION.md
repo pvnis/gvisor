@@ -403,7 +403,7 @@ workload has been divided by weight at all; the Sentry compute gate leaves it at
 sandbox. It requires the ghost-instrumented driver; without `--runlist-control`,
 only the gate enforces, exactly as before.
 
-The prior CORRECTION 2, the "not achievable" lines in CLAUDE.md/GHOST-PLAN, and
+The prior CORRECTION 2, the "not achievable" lines in CLAUDE.md, and
 the Reproducing-Ghost section above are superseded by this. The driver control
 (detach/attach/ts + RESTART_RUNLIST via an RM work item) is in the `ogkm-610`
 tree; the node is restored to clean 610 + the k8s stack.
@@ -1002,7 +1002,7 @@ not differ at all.
 ## What the working control does and does not license
 
 On the A100 the spatial half is now live and the temporal half is dead, which
-is the opposite of what `GHOST-PLAN.md` was written to expect:
+is the opposite of what the original Ghost driver-broker plan was written to expect:
 
 - **Spatial (works on GA100).** Impose a per-sandbox TPC partition from the
   driver at ctxshare creation, weight → TPC count, laid out disjointly. nvproxy's
@@ -1024,8 +1024,8 @@ is the opposite of what `GHOST-PLAN.md` was written to expect:
 ## Artifacts and pointers
 
 - **This investigation's record**: `SECURITY-FINDINGS.md` (the full red-team +
-  every lever, with measurements), `GHOST-PLAN.md` (the driver-broker design +
-  Phase 0 results).
+  every lever, with measurements), `../open-gpu-kernel-modules/DRIVER-CHANGES.md`
+  (the driver-broker mechanisms the scheduler drives).
 - **Sentry-side scaffolding** (off by default, documents each lever's ceiling):
   `pkg/sentry/devices/nvproxy/smpart_unsafe.go` (TPC mode/table),
   `pkg/sentry/devices/nvproxy/computegate_unsafe.go` (timeslice/interleave/

@@ -684,3 +684,107 @@ const (
 	KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK    = 1
 	KFD_RUNTIME_ENABLE_MODE_TTMP_SAVE_MASK = 2
 )
+
+// Operations selected by KFDIoctlDbgTrapArgs.Op, from the KFD_IOC_DBG_TRAP_*
+// enum. Only the ones amdproxy issues are named.
+const (
+	KFD_IOC_DBG_TRAP_ENABLE             = 0
+	KFD_IOC_DBG_TRAP_DISABLE            = 1
+	KFD_IOC_DBG_TRAP_SUSPEND_QUEUES     = 6
+	KFD_IOC_DBG_TRAP_RESUME_QUEUES      = 7
+	KFD_IOC_DBG_TRAP_QUERY_DEBUG_EVENT  = 11
+	KFD_IOC_DBG_TRAP_GET_QUEUE_SNAPSHOT = 13
+)
+
+// Exception codes, from the kfd_dbg_trap_exception_code enum, and the mask a
+// code becomes. KFD_EC_MASK is the KFD_EC_MASK macro: note that it subtracts
+// one, so code 31 is bit 30.
+const (
+	EC_QUEUE_NEW = 31
+
+	// KFD_EC_MASK_QUEUE_NEW is KFD_EC_MASK(EC_QUEUE_NEW).
+	//
+	// KFD raises this on every queue created while a debug session is open,
+	// and a queue still carrying it cannot be suspended: SUSPEND_QUEUES
+	// reports it invalid, silently and forever. The exception has to be
+	// consumed with QUERY_DEBUG_EVENT first; passing the bit in the suspend
+	// call's own exception_mask does not clear it.
+	KFD_EC_MASK_QUEUE_NEW = 1 << (EC_QUEUE_NEW - 1)
+)
+
+// Bits SUSPEND_QUEUES and RESUME_QUEUES set on the queue ids passed to them,
+// to report per-queue failure in place, from the KFD_DBG_QUEUE_*_MASK macros.
+// The call's return value counts the queues it acted on, so a partial success
+// is reported here rather than through errno.
+const (
+	KFD_DBG_QUEUE_ERROR_MASK   = 1 << 30
+	KFD_DBG_QUEUE_INVALID_MASK = 1 << 31
+)
+
+// KFDRuntimeInfo is struct kfd_runtime_info, which DBG_TRAP_ENABLE fills in.
+type KFDRuntimeInfo struct {
+	_            structs.HostLayout
+	RDebug       uint64
+	RuntimeState uint32
+	TTMPSetup    uint32
+}
+
+// The DBG_TRAP argument structs below are unions in the kernel header: one
+// ioctl number carries a different payload per operation, all padded to
+// SizeofKFDIoctlDbgTrapArgs. Go has no unions, so each operation amdproxy
+// issues gets its own struct of that exact size, with the leading pid and op
+// spelled out rather than shared.
+//
+// None of them carry +marshal. DBG_TRAP is denied to the sandbox -- these are
+// only ever issued by the Sentry against its own KFD process, from Sentry
+// memory, so they are never copied to or from application memory.
+
+// KFDIoctlDbgTrapEnableArgs is kfd_ioctl_dbg_trap_args with its enable member.
+type KFDIoctlDbgTrapEnableArgs struct {
+	_             structs.HostLayout
+	PID           uint32
+	Op            uint32
+	ExceptionMask uint64
+	RInfoPtr      uint64
+	RInfoSize     uint32
+	DbgFD         uint32
+}
+
+// KFDIoctlDbgTrapSuspendQueuesArgs is kfd_ioctl_dbg_trap_args with its
+// suspend_queues member.
+type KFDIoctlDbgTrapSuspendQueuesArgs struct {
+	_             structs.HostLayout
+	PID           uint32
+	Op            uint32
+	ExceptionMask uint64
+	QueueArrayPtr uint64
+	NumQueues     uint32
+	// GracePeriod is in units of 1K GPU clocks, and is how long waves are
+	// given to reach a preemption point before being forced.
+	GracePeriod uint32
+}
+
+// KFDIoctlDbgTrapResumeQueuesArgs is kfd_ioctl_dbg_trap_args with its
+// resume_queues member. That member is shorter than the union, so this is
+// padded out to keep the struct the size the ioctl number encodes.
+type KFDIoctlDbgTrapResumeQueuesArgs struct {
+	_             structs.HostLayout
+	PID           uint32
+	Op            uint32
+	QueueArrayPtr uint64
+	NumQueues     uint32
+	Pad           uint32
+	UnionPad      uint64
+}
+
+// KFDIoctlDbgTrapQueryDebugEventArgs is kfd_ioctl_dbg_trap_args with its
+// query_debug_event member, padded for the same reason.
+type KFDIoctlDbgTrapQueryDebugEventArgs struct {
+	_             structs.HostLayout
+	PID           uint32
+	Op            uint32
+	ExceptionMask uint64
+	GPUID         uint32
+	QueueID       uint32
+	UnionPad      uint64
+}

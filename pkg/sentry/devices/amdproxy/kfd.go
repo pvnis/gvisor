@@ -164,6 +164,10 @@ type kfdIoctlState struct {
 // ioctls carrying file descriptors (IMPORT_DMABUF, EXPORT_DMABUF, SMI_EVENTS);
 // and ioctls with variable-length or otherwise unvalidated parameters
 // (SVM, CRIU_OP, DBG_TRAP).
+//
+// DBG_TRAP's denial is load-bearing rather than incidental: timeslice.go
+// issues it to hold this sandbox to its share of the GPU, and a sandbox able
+// to issue it too could resume the queues that gate it.
 func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	if fd.isRestored() {
 		return 0, linuxerr.EBADF
@@ -183,7 +187,7 @@ func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 	case amdgpu.AMDKFD_IOC_GET_VERSION:
 		return kfdIoctlSimple[amdgpu.KFDIoctlGetVersionArgs](ki)
 	case amdgpu.AMDKFD_IOC_DESTROY_QUEUE:
-		return kfdIoctlSimple[amdgpu.KFDIoctlDestroyQueueArgs](ki)
+		return kfdDestroyQueue(ki)
 	case amdgpu.AMDKFD_IOC_UPDATE_QUEUE:
 		return kfdIoctlSimple[amdgpu.KFDIoctlUpdateQueueArgs](ki)
 	case amdgpu.AMDKFD_IOC_SET_MEMORY_POLICY:

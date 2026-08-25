@@ -87,6 +87,10 @@ const (
 	// MemoryLimitAnnotation, and is subject to the same ceiling.
 	AMDMemoryLimitAnnotation = "dev.gvisor.flag.amdproxy-gpu-memory-limit"
 
+	// AMDWeightAnnotation is amdproxy's counterpart to WeightAnnotation: the
+	// sandbox's share of GPU *time* relative to the others on the device.
+	AMDWeightAnnotation = "dev.gvisor.flag.amdproxy-gpu-weight"
+
 	// mibPerAMDUnit is the size of one unit of AMDMemoryResourceName. It must
 	// match the AMD device plugin's --slice-mib, whose default this is;
 	// reading it as mebibytes would under-count a pod's quota 512-fold.
@@ -189,6 +193,38 @@ func InjectWeight(pod *v1.Pod) {
 
 	setAnnotation(pod, WeightAnnotation, narrow(pod, WeightAnnotation, peak))
 	log.Debugf("Injected GPU weight of %d from %q requests", peak, CoresResourceName)
+}
+
+// InjectAMDWeight has runsc give the pod a share of an AMD GPU's time.
+//
+// The weight is the number of memory units the pod asked for, used directly.
+// That looks crude beside the NVIDIA side's percentage and is in fact the more
+// exact of the two, because a weight is *relative*: a pod asking for six units
+// beside one asking for two gets three times the GPU, which is the whole of
+// what the scheduler needs to know. Turning it into a percentage first would
+// require the size of a device that has not been chosen yet -- admission runs
+// before placement -- and would then be rounded back to a ratio anyway.
+//
+// Memory is the only thing an AMD pod asks for; there is no counterpart to
+// nvidia.com/gpucores. So memory stands in for demand, the same assumption
+// HAMi's own allocator makes when it sizes a compute unit mask.
+//
+// A pod that asks for no GPU memory gets no annotation and keeps whatever the
+// runtime configures, so it competes evenly with the other unannotated pods.
+//
+// This exists so that stock upstream HAMi is enough. Nothing upstream knows
+// what dev.gvisor.flag.amdproxy-gpu-weight is; without this the weight could
+// only come from a forked scheduler, which is a large thing to maintain for
+// one annotation -- and unlike a compute unit mask, a weight needs no
+// coordinated allocation, so there is nothing a cluster scheduler has to
+// decide.
+func InjectAMDWeight(pod *v1.Pod) {
+	peak := peakRequest(pod, AMDMemoryResourceName)
+	if peak <= 0 {
+		return
+	}
+	setAnnotation(pod, AMDWeightAnnotation, narrow(pod, AMDWeightAnnotation, peak))
+	log.Debugf("Injected AMD GPU weight of %d from %q requests", peak, AMDMemoryResourceName)
 }
 
 // narrow returns the value to write for an annotation the pod may already have

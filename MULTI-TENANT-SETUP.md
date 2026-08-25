@@ -10,13 +10,18 @@ NVIDIA, `sens1` = AMD, one k3s control plane). A single-vendor setup is a strict
 subset: build the same gVisor, skip the other vendor's driver/device-plugin, and
 follow the matching column below.
 
-> **Scope of what works today.** Memory-quota isolation (both vendors), AMD
-> spatial CU-mask partitioning, and NVIDIA temporal compute scheduling via the
-> Sentry compute gate are all deployed and verified. **Imposable compute
-> isolation against doorbell/cuBLAS workloads on NVIDIA** (the driver-resident
-> broker in Part 8) is a *research prototype* — optional, not wired into
-> `nvproxy` yet, and separable from everything else. Set up Parts 1–7 for the
-> production stack; add Part 8 only to experiment with imposed compute shares.
+> **Scope of what works today.** All deployed and verified: memory-quota
+> isolation (both vendors); AMD spatial CU-mask partitioning **and** AMD
+> work-conserving time-slicing (mutually exclusive per device on RDNA3 — Part 8b);
+> and NVIDIA compute scheduling by weight — the Sentry gate for kernel-launch
+> workloads, and the **driver-runlist broker** for doorbell/cuBLAS/ML workloads
+> (Part 8a), validated on GA100, GA102, and GB205. The runlist broker needs the
+> open-driver fork (Part 4) and `runsc gpu-scheduler --runlist-control`; memory
+> quota alone needs none of the compute machinery. A single-vendor stack skips
+> the other vendor's driver/plugin.
+>
+> **Companion:** [`../vcluster-multitenant/SETUP.md`](../vcluster-multitenant/SETUP.md)
+> is the same recipe from the cluster repo's side; keep the two in sync.
 
 ---
 
@@ -28,8 +33,9 @@ is named so you can see the delta. Clone the fork, not upstream.
 | Component | Repo (fork) | Branch | Upstream | What it provides |
 | --- | --- | --- | --- | --- |
 | **Modified gVisor** | `github.com/pvnis/gvisor` | `gpuslicing` | `google/gvisor` | `runsc` with `nvproxy`, `amdproxy`, `pkg/gpusched`, the `runsc gpu-scheduler` daemon, and the in-tree `webhook/`. The core of everything. |
-| **NVIDIA open kernel modules** *(experimental, Part 8 only)* | `github.com/pvnis/open-gpu-kernel-modules` | `ghost-experiment` | `NVIDIA/open-gpu-kernel-modules` | The driver-resident compute broker: `/proc/driver/nvidia/gpusched`, deferred TPC-partition + `RESTART_RUNLIST`, registry knobs. **Base stack does not need this** — a stock NVIDIA driver is fine for memory quota + the Sentry compute gate. |
-| **HAMi (scheduler/plugin/webhook)** | `github.com/pvnis/HAMi` | `gvisor-amd-cumask` | `Project-HAMi/HAMi` | `hami-scheduler` (placement + per-device accounting), `hami-device-plugin` (advertises `nvidia.com/gpu`), and the AMD CU-mask allocator (`pkg/device/amd/cumask.go`). Used mostly unchanged; the fork adds AMD CU-mask assignment and drops the `libvgpu.so` preload. |
+| **NVIDIA open driver fork** *(Part 4; NVIDIA compute isolation)* | `github.com/pvnis/open-gpu-kernel-modules` | `gpuslicing` | `NVIDIA/open-gpu-kernel-modules` | The driver broker: `/proc/driver/nvidia/gpusched` (runlist detach/attach + per-TSG timeslice + `RESTART_RUNLIST` + the per-tenant `tsgs` report) and per-tenant UVM eviction. Required for NVIDIA *compute* isolation (Part 8a); memory quota alone runs on a stock 610.43.02 driver. See `../open-gpu-kernel-modules/DRIVER-CHANGES.md`. |
+| **HAMi** | **upstream `projecthami/hami:v2.9.0`** | — | — | `hami-scheduler` (placement), `hami-device-plugin` (advertises `nvidia.com/gpu`), `hami-webhook`. Runs the whole NVIDIA path and the AMD *time-slicing* path unmodified. |
+| **HAMi fork** *(AMD spatial CU masks only)* | `github.com/pvnis/HAMi` | `gvisor-amd-timeslice` | `Project-HAMi/HAMi` | Adds automatic **disjoint AMD CU-mask** assignment (`pkg/device/amd/cualloc.go`, `cusForRequest`); emits a weight **or** a mask, never both. The only reason to run the fork instead of upstream — needed only for AMD spatial partitioning. |
 | **Quota-translation webhook** | in-tree: `github.com/pvnis/gvisor` → `webhook/` | `gpuslicing` | — | Mutating admission webhook (`webhook/pkg/gpushare`) that restates a pod's GPU request — **both vendors** — as `dev.gvisor.flag.*` annotations (narrow-only) so the sandbox quota comes from what the scheduler admitted, and drops HAMi's `libvgpu.so`. Built from the gVisor tree; no separate repo. (The standalone `pvnis/gpu-quota-webhook` was the predecessor and is retired.) |
 | **AMD device plugin** *(AMD node only)* | `/home/dmd/amdgpu-device-plugin` | `master` | `ROCm/k8s-device-plugin` | Advertises `amd.com/gpu-vram-mib`. Its `Allocate()` env vars are **not** used for enforcement — gVisor reads annotations. Topology code treats VRAM `heap_type` 1 and 2 alike (needed for RDNA). |
 | **Cluster config / vCluster** | `/home/dmd/vcluster-multitenant` | — | — | k3s config, Cilium values, containerd drop-ins, vCluster tenant values + network policies, and the reference manifests. `TWO-VENDOR-CLUSTER.md` + `CILIUM-DESIGN.md` are the authoritative runbooks. |
@@ -59,7 +65,8 @@ broker).
 | GPU | RTX 5070, driver **610.43.02**, 12 GiB | Navi 32 (gfx1101), 54 CUs, 12 GiB; **ROCm 7.2** |
 | gVisor platform | `systrap` (or `kvm`) | **`kvm`** (required — see note) |
 | container runtime | containerd only (no docker) | docker + containerd |
-| GPU scheduler role | `hami-scheduler` | `default-scheduler` |
+| GPU scheduler role | `hami-scheduler` | `hami-scheduler` (or `default-scheduler` for bare-annotation spatial) |
+| `runsc gpu-scheduler` | required (runlist enforcement) | required (time-slicing coordination) |
 
 **Why AMD requires `--platform=kvm`.** `/dev/kfd` binds each mapping to the
 process holding the KFD context; systrap maps from a stub process, so the mapping
@@ -114,15 +121,20 @@ cp bazel-bin/runsc/runsc_/runsc ~/amdtest/runsc      # (sens1 convenience copy)
 ### The compute scheduler daemon
 
 `runsc gpu-scheduler` is one host daemon per GPU node; sandboxes connect to it
-over a Unix socket and it hands each a weighted time window. Run it as a systemd
-unit listening on the socket the runsc config names
-(`/run/runsc-gpu-scheduler.sock`):
+over a Unix socket and it hands each a weighted time window. It is required on
+**both** GPU nodes — the NVIDIA node for runlist enforcement, and the AMD node to
+coordinate work-conserving time-slicing (a Sentry cannot see how many other
+tenants compete, so the coordinator must). Run it as a systemd unit on the socket
+the runsc config names (`/run/runsc-gpu-scheduler.sock`):
 
 ```ini
-# /etc/systemd/system/runsc-gpu-scheduler.service
+# /etc/systemd/system/runsc-gpu-scheduler.service   (on EVERY GPU node)
 [Service]
+# NVIDIA node — drive the hardware runlist:
 ExecStart=/usr/local/bin/runsc gpu-scheduler --socket /run/runsc-gpu-scheduler.sock \
     --measure-usage=false --runlist-control=/proc/driver/nvidia/gpusched
+# AMD node — same daemon WITHOUT --runlist-control (amdproxy drives DBG_TRAP itself):
+# ExecStart=/usr/local/bin/runsc gpu-scheduler --socket /run/runsc-gpu-scheduler.sock --measure-usage=false
 Restart=always
 ```
 
@@ -130,15 +142,17 @@ Restart=always
 two-tenant case (see `SECURITY-FINDINGS.md` / the GPU blog); the documented setup
 passes `--measure-usage=false` until that is fixed.
 
-**`--runlist-control` (NVIDIA, needs the Part-8 ghost driver).** Empty, the
+**`--runlist-control` (NVIDIA, needs the Part-4 open-driver fork).** Empty, the
 scheduler enforces via the Sentry compute gate — which on Volta+ **cannot bind a
 doorbell/cuBLAS workload at all**, so a real ML tenant is unisolated. Set to the
-ghost driver's `/proc/driver/nvidia/gpusched`, it drives the hardware runlist
-(the credit scheduler: per-tenant credit accrual, whole-tenant detach/attach),
-which does bind cuBLAS. This is the only mode that actually divides compute
-between adversarial NVIDIA tenants; it requires the Part-8 driver (with the
-`tsgs`-report patch, so charge-back is TSG-weighted). Measured to close the
-process-packing share-theft on both GB205 and GA102 (`SECURITY-FINDINGS.md` V4).
+fork's `/proc/driver/nvidia/gpusched`, it drives the hardware runlist (the credit
+scheduler: per-tenant credit accrual weighted by the driver's `tsgs` report,
+whole-tenant detach/attach), which does bind cuBLAS. This is the only mode that
+actually divides compute between adversarial NVIDIA tenants; see Part 8a. Measured
+to close the process-packing share-theft on GA100, GA102, and GB205
+(`SECURITY-FINDINGS.md` V4). On the **AMD** node, leave `--runlist-control` unset:
+amdproxy performs the DBG_TRAP suspend/resume itself and the scheduler only places
+the windows.
 
 > **Operational SPOF — the scheduler is a hard, fail-closed dependency.** With
 > `nvproxy-gpu-scheduler-socket` set in the runsc config, a GPU pod **cannot
@@ -153,13 +167,27 @@ process-packing share-theft on both GB205 and GA102 (`SECURITY-FINDINGS.md` V4).
 
 ## 4. NVIDIA driver
 
-For the **base stack** (memory quota + the Sentry compute gate), the stock
-NVIDIA driver **610.43.02** is all you need — proprietary or open, either works.
-Install it however you normally would and confirm `nvidia-smi` sees the card.
+For **memory quota only**, the stock NVIDIA **610.43.02** driver (proprietary or
+open) is all you need — install it normally and confirm `nvidia-smi` sees the card.
 
-The modified open driver in **Part 8** is *only* for the experimental
-compute-isolation broker. Do not install it unless you are running that
-experiment; it is a research prototype and reverts on reboot by design.
+For **NVIDIA compute isolation** (Part 8a — the only thing that binds a
+doorbell/cuBLAS ML tenant) and for GPU-memory overcommit, install the open-driver
+fork:
+
+```sh
+git clone git@github.com:pvnis/open-gpu-kernel-modules.git
+cd open-gpu-kernel-modules && git checkout gpuslicing
+# per-GPU spatial knob (TPCs = SMs / 2): RTX 5070 = 24, A6000 = 42, A100 = 54
+#   src/nvidia/src/kernel/gpu/fifo/kernel_ctxshare.c: #define GHOST_TOTAL_TPC <N>
+make modules -j$(nproc)
+sudo bash ../gvisor/ghost-experiment/reload.sh   # unload + insmod, restart k3s + the scheduler
+```
+
+The fork is *unpackaged* — it reverts on reboot unless the modules are placed in
+`/lib/modules/.../updates`. Sandboxes then run with
+`--nvproxy-allow-unsupported-driver`. Confirm it loaded
+(`cat /sys/module/nvidia_uvm/srcversion`; count `GHOST` lines in `dmesg`, 0 = hook
+absent). Details: `../open-gpu-kernel-modules/DRIVER-CHANGES.md`.
 
 ---
 
@@ -183,14 +211,18 @@ log_level = "info"
   debug-log = "/var/log/runsc/%ID%/"
 ```
 
-`sens1:/etc/runsc/config.toml` (AMD) — same shape with:
+`sens1:/etc/runsc/config.toml` (AMD) — same shape. The AMD side now also carries a
+weight + scheduler socket for time-slicing; a CU mask is the mutually-exclusive
+spatial alternative (Part 8b), never both:
 
 ```toml
 [runsc_config]
   platform = "kvm"
   amdproxy = "true"
   amdproxy-gpu-memory-limit = "..."          # node ceiling; webhook lowers per-pod
-  amdproxy-cu-mask = "0xfff"                  # node ceiling; scheduler narrows per-pod
+  amdproxy-gpu-scheduler-socket = "/run/runsc-gpu-scheduler.sock"   # time-slicing
+  amdproxy-gpu-weight = "100"                 # node ceiling; webhook lowers per-pod
+  # amdproxy-cu-mask = "0xfff"                # spatial INSTEAD of time-slicing (not both)
 ```
 
 **(b) The containerd runtime handler** — register `runsc` and, critically,
@@ -267,19 +299,26 @@ Config files: `manifests/twovendor/sensai-k3s-config.yaml`,
 
 ## 7. HAMi, the AMD device plugin, and the quota webhook
 
-### 7a. HAMi (control plane, from the fork)
+### 7a. HAMi (control plane)
 
-Deploy `hami-scheduler`, `hami-device-plugin`, and `hami-webhook` from
-`github.com/pvnis/HAMi` (`gvisor-amd-cumask`). Keep the scheduler, plugin, and
-webhook — they do placement and per-device accounting well and run far from the
-workload. **The one thing to remove is the `libvgpu.so` preload:** blank the
-device-plugin ConfigMap key that installs it, so it is gone from the node
-entirely rather than merely silenced.
+Deploy **upstream** `projecthami/hami:v2.9.0` — `hami-scheduler`,
+`hami-device-plugin`, `hami-webhook`. It runs the NVIDIA path and the AMD
+time-slicing path unmodified. Keep the scheduler, plugin, and webhook — they do
+placement and run far from the workload. **Remove the `libvgpu.so` preload:** blank
+the device-plugin ConfigMap key that installs it, so it is gone from the node
+entirely rather than merely silenced (the webhook also stands it down with
+`CUDA_DISABLE_CONTROL`).
 
-- NVIDIA pods must set `schedulerName: hami-scheduler`.
-- Pods routed through `hami-scheduler` also get **automatic disjoint CU-mask
-  assignment** on AMD (the fork's `cusForRequest`, proportional to the VRAM
-  request); it **overrides** a manually supplied `amd.com/cu-mask`.
+- NVIDIA (and AMD, for uniform placement) pods set `schedulerName: hami-scheduler`.
+- **AMD spatial CU masks only:** run the **fork** instead
+  (`github.com/pvnis/HAMi`, `gvisor-amd-timeslice`) — it adds automatic disjoint
+  CU-mask assignment (`cusForRequest`, proportional to the VRAM request) and
+  overrides a manual `amd.com/cu-mask`. AMD **time-slicing** needs no fork.
+- Switching fork↔upstream is a shared-cluster change: snapshot first and keep a
+  `runsc gpu-scheduler` up throughout, or GPU pods fail to start. (On upstream,
+  HAMi does no AMD-level accounting — the AMD plugin advertises only
+  `amd.com/gpu-vram-mib`, so ordinary Kubernetes extended-resource accounting
+  refuses oversubscription and the Sentry enforces the real limit.)
 
 ### 7b. AMD device plugin (AMD node only)
 
@@ -303,6 +342,7 @@ translates, at admission:
 | request | annotation written |
 | --- | --- |
 | `amd.com/gpu-vram-mib: N` | `amdproxy-gpu-memory-limit = N × 512 MiB` — the AMD plugin advertises VRAM in **512-MiB units** (~23 for a 12 GiB card), not MiB |
+| `amd.com/gpu-vram-mib: N` (time-slicing) | `amdproxy-gpu-weight = N` — the requested unit count *is* the ratio (admission runs before placement, so no device size is known and a ratio is all the scheduler needs) |
 | `nvidia.com/gpumem: M` (MiB) | `nvproxy-gpu-memory-limit = M × 1 MiB` |
 | `nvidia.com/gpucores: C` | `nvproxy-gpu-weight = min(C, 100)` |
 
@@ -337,55 +377,56 @@ needs placement state admission cannot see — it lives in the HAMi scheduler,
 
 ---
 
-## 8. (Optional, experimental) The NVIDIA compute-isolation driver broker
+## 8. Compute isolation
 
-**Skip this for the production stack.** It imposes a *compute* share on an
-arbitrary (doorbell/cuBLAS/graph-replay) CUDA workload — which the Sentry
-compute gate cannot, because those workloads never re-fault the gated buffer.
-It is a research prototype: a patched host kernel driver, keyed on the Sentry's
-process, not yet driven by `nvproxy`. See `GHOST-PLAN.md`,
-`NVIDIA-COMPUTE-ISOLATION.md`, and `ghost-experiment/HANDOFF.md`.
+Memory quota (Parts 5, 7) is independent of this. This part is how a *compute*
+share is imposed on an adversarial tenant, per vendor.
 
-```sh
-git clone git@github.com:pvnis/open-gpu-kernel-modules.git
-cd open-gpu-kernel-modules && git checkout ghost-experiment      # 610.43.02 base
-# set the half-partition size for THIS GPU (TPCs = SMs / 2):
-#   src/nvidia/src/kernel/gpu/fifo/kernel_ctxshare.c: #define GHOST_TOTAL_TPC <N>
-#   RTX 5070 = 24, A6000 = 42, A100 = 54
-make modules -j$(nproc)
-```
+### 8a. NVIDIA — the driver-runlist broker (production)
 
-Swap proprietary → open (reversible by reboot; `insmod`, not `modules_install`).
-Quiesce everything holding the GPU first (`sudo fuser -v /dev/nvidia*`; gVisor
-sandboxes appear as `exe`), then:
+The Sentry compute gate holds a kernel-launch workload to a wall-clock fraction,
+but on Volta+ it **cannot bind a doorbell/cuBLAS/graph-replay workload** — those
+never re-fault the gated buffer, i.e. a real ML tenant is unisolated. The
+driver-runlist broker does bind them: with the Part-4 open-driver fork installed
+and `runsc gpu-scheduler --runlist-control=/proc/driver/nvidia/gpusched` (Part 3),
+the **credit scheduler** (`pkg/gpusched/credit.go`) charges per-tenant credit
+weighted by the driver's per-tenant TSG count and detaches/attaches whole tenants
+from the runlist. This closes the process-*packing* share-theft (a low-weight
+tenant forking N processes to multiply its channel groups), verified on GA100,
+GA102, GB205. Nothing pod-side changes — it is all host scheduler + driver.
+
+Manual runlist control (for probing):
 
 ```sh
-sudo rmmod nvidia_drm nvidia_modeset nvidia_uvm nvidia_peermem nvidia
-sudo insmod .../kernel-open/nvidia.ko NVreg_OpenRmEnableUnsupportedGpus=1 \
-    NVreg_RegistryDwords="GhostTpcCount=24;GhostDisjoint=1"
-sudo insmod .../kernel-open/nvidia-uvm.ko
-nvidia-smi                                                       # GPU alive on open driver
-```
-
-> **Stale-module trap.** `rmmod nvidia` fails while `nvidia_modeset`←`nvidia_drm`
-> hold refs; a following `insmod` then says "File exists" while the **old**
-> module stays resident and you silently measure the previous build. Unload
-> drm/modeset first, hard-abort if `nvidia` is still resident, and confirm the
-> new build loaded by counting `GHOST` lines in `dmesg` (0 = hook not present).
-
-Runtime control (both axes measured working on the RTX 5070):
-
-```sh
-# TEMPORAL — weighted runlist timeslices (SET_TIMESLICE + RESTART_RUNLIST):
-echo poll   | sudo tee /proc/driver/nvidia/gpusched   # list tenant PIDs
+echo poll            | sudo tee /proc/driver/nvidia/gpusched   # list tenant PIDs + tsgs
 echo "ts <pid> 3000" | sudo tee /proc/driver/nvidia/gpusched   # weight → timeslice µs
 echo "detach <pid>"  | sudo tee /proc/driver/nvidia/gpusched   # evict / restore with attach
-# SPATIAL — imposed TPC partition via GhostTpcCount at insmod (AMD-CU-mask analog).
 ```
 
-Under gVisor+KVM the driver attributes a sandbox's objects to the
-`runsc-sandbox`/Sentry PID (which appears as `exe`), so that PID is the per-
-sandbox handle the broker keys on.
+Under gVisor+KVM the driver attributes a sandbox's objects to the Sentry PID
+(which appears as `exe`), so that PID is the per-sandbox handle the broker keys
+on. Full record: `NVIDIA-COMPUTE-ISOLATION.md`,
+`../open-gpu-kernel-modules/DRIVER-CHANGES.md`.
+
+### 8b. AMD — spatial CU masks XOR temporal time-slicing
+
+On RDNA3 a sandbox may carry a CU mask **or** a time slice, **never both** — the
+amdgpu driver refuses a debug session's CWSR workaround on a CU-masked queue
+(`kfd_dbg_set_queue_workaround`, `-EBUSY`, GC 11.0.0–11.0.3), and a time slice is
+enforced through exactly such a session. runsc rejects a sandbox configured with
+both at startup. Memory quota composes with either.
+
+- **Spatial (CU masks):** `amdproxy-cu-mask` (Part 5); tenants run concurrently on
+  disjoint CUs, 2-CU granularity. Automatic disjoint assignment needs the HAMi
+  fork (Part 7a); otherwise supply `amd.com/cu-mask` manually and the Sentry
+  narrows to it.
+- **Temporal (time-slice):** `amdproxy-gpu-weight` + `amdproxy-gpu-scheduler-socket`
+  (Parts 3, 5); tenants take turns on the whole device by weighted duty cycle,
+  work-conserving via `runsc gpu-scheduler`, on **upstream** HAMi. Measured
+  300:100 → 3.05:1, Jain 1.0000 at equal weights; `vecadd` stays correct while
+  sliced (CWSR preempts mid-kernel).
+
+See `GPU-ISOLATION.md` and `CLAUDE.md` ("Time-slicing AMD from userspace").
 
 ---
 
@@ -460,15 +501,22 @@ than it is:
 - **AMD CU masks must select whole workgroup processors** on RDNA — an odd mask
   like `0x7` is rejected at startup with a suggested valid mask; granularity is
   2 CUs. `AMDKFD_IOC_SVM` is denied deliberately (forwarding it crashes ROCr).
+- **AMD CU mask and time slice are mutually exclusive on RDNA3** (Part 8b) — the
+  driver refuses the combination; runsc rejects a sandbox that requests both.
+- **`runsc gpu-scheduler` is a fail-closed SPOF on every GPU node** — no gVisor
+  GPU pod starts while it is down. Never `pgrep -f gpu-scheduler | kill` (it
+  matches and kills your own shell); kill by explicit pid.
 
 ---
 
 ## Pointers
 
+- `GPU-ISOLATION.md` — the top-level design overview (start here).
 - `CLAUDE.md` — the project's own running record of what is done and verified.
 - `NVIDIA-COMPUTE-ISOLATION.md` — compute-isolation findings + per-GPU playbook.
-- `GHOST-PLAN.md` — the driver-broker design (Part 8).
+- `../open-gpu-kernel-modules/DRIVER-CHANGES.md` — the driver-broker mechanisms.
 - `SECURITY-FINDINGS.md` — the red-team and every compute lever measured.
 - `UPSTREAM-NOTES.md` — the two gVisor bugs to send upstream + the KVM issue.
-- `vcluster-multitenant/{TWO-VENDOR-CLUSTER,CILIUM-DESIGN}.md` — the cluster.
+- `../vcluster-multitenant/SETUP.md` — the same recipe from the cluster repo (companion; keep in sync).
+- `../vcluster-multitenant/{TWO-VENDOR-CLUSTER,CILIUM-DESIGN}.md` — the cluster.
 - The GPU sharing blog posts under `website/blog/2026-08-*-gpu-*.md`.

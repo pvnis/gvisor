@@ -241,6 +241,7 @@ func updatePod(pod *v1.Pod) {
 	gpushare.InjectMemoryLimit(pod)
 	gpushare.InjectHostSwapLimit(pod)
 	gpushare.InjectAMDMemoryLimit(pod)
+	gpushare.InjectAMDWeight(pod)
 	gpushare.InjectWeight(pod)
 	gpushare.StandDownHAMi(pod)
 

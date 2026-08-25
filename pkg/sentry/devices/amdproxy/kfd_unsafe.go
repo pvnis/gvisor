@@ -427,6 +427,29 @@ func kfdCreateQueue(ki *kfdIoctlState) (uintptr, error) {
 			return 0, err
 		}
 	}
+	ki.fd.dev.amdp.timeSlicer.trackQueue(ki.fd.hostFD, params.QueueID, params.QueueType, params.CtlStackSize)
+	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// kfdDestroyQueue handles AMDKFD_IOC_DESTROY_QUEUE.
+//
+// It exists only for the time slicer: the driver refuses to destroy a queue
+// that is not running, so the sandbox's queues have to be resumed first, and
+// nothing may suspend them again between that and the destroy.
+func kfdDestroyQueue(ki *kfdIoctlState) (uintptr, error) {
+	var params amdgpu.KFDIoctlDestroyQueueArgs
+	if _, err := params.CopyIn(ki.t, ki.argAddr); err != nil {
+		return 0, err
+	}
+	release := ki.fd.dev.amdp.timeSlicer.beforeDestroyQueue(params.QueueID)
+	n, err := kfdIoctlInvoke(ki, &params)
+	release()
+	if err != nil {
+		return n, err
+	}
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err
 	}

@@ -60,6 +60,7 @@ const (
 	flagAMDProxyCUMask           = "amdproxy-cu-mask"
 	flagAMDProxyGPUMemLimit      = "amdproxy-gpu-memory-limit"
 	flagAMDProxyShareKFDVM       = "amdproxy-share-kfd-vm"
+	flagAMDProxyGPUWeight        = "amdproxy-gpu-weight"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
 	defaultQDiscTBFRate  = uint64(0)
@@ -209,7 +210,9 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("amdproxy", false, "WIP: enable support for AMD GPUs. AMD GPU support gets automatically enabled if /dev/kfd is present in the OCI spec.")
 	flagSet.Uint64(flagAMDProxyGPUMemLimit, 0, "maximum number of bytes of AMD GPU device memory that the sandbox may allocate at once. The limit is applied where the application's ioctls are interpreted, so sandboxed code cannot bypass it. 0 means no limit.")
 	flagSet.Bool(flagAMDProxyShareKFDVM, false, "let the processes of one sandbox share a single AMD GPU address space. The driver binds one address space per process and the Sentry is the process it sees, so without this only the first process in a sandbox to initialise the GPU succeeds and the rest fail with EBUSY; multi-process runtimes such as vLLM need it. The trade is that those processes then allocate from one address space, so an allocation that would overlap another process's is refused rather than aliased. Nothing is shared between sandboxes, so this does not weaken isolation between containers.")
-	flagSet.String(flagAMDProxyCUMask, "", "hexadecimal bitmask of the GPU compute units the sandbox may run on, one bit per unit. The mask is applied to every queue the sandbox creates, and is enforced by the GPU rather than by anything the sandbox can reach. Empty means every compute unit. Masks are only a partition if they do not overlap, which whatever assigns GPUs to sandboxes is responsible for.")
+	flagSet.String("amdproxy-gpu-scheduler-socket", "", "path of a `runsc gpu-scheduler` socket that divides an AMD GPU between the sandboxes sharing it. When set, the sandbox's queues are suspended outside the window the scheduler grants it. Unlike the NVIDIA side, no privileged host component is in the enforcement path: the Sentry suspends its own queues. Mutually exclusive with --amdproxy-cu-mask, including a node-wide default.")
+	flagSet.Uint64(flagAMDProxyGPUWeight, 0, "this sandbox's share of an AMD GPU relative to the others scheduled alongside it. Only meaningful with --amdproxy-gpu-scheduler-socket, which is what turns slicing on; 0 is treated as 1 rather than leaving the sandbox unsliced. Unlike the CU mask, which partitions the device in space and cannot hand an idle tenant's share to a busy one, this divides it in time and is work-conserving. MUTUALLY EXCLUSIVE with --amdproxy-cu-mask: the amdgpu driver refuses a debug session's CWSR workaround on a CU-masked queue, so a sandbox configured with both is refused at startup.")
+	flagSet.String(flagAMDProxyCUMask, "", "hexadecimal bitmask of the GPU compute units the sandbox may run on, one bit per unit. The mask is applied to every queue the sandbox creates, and is enforced by the GPU rather than by anything the sandbox can reach. Empty means every compute unit. Masks are only a partition if they do not overlap, which whatever assigns GPUs to sandboxes is responsible for. MUTUALLY EXCLUSIVE with --amdproxy-gpu-scheduler-socket: a sandbox may be divided in space or in time, not both, and one configured with both is refused at startup.")
 	flagSet.Bool("rdmaproxy", false, "WIP: enable RDMA support for containers with /dev/infiniband/uverbs* devices.")
 	flagSet.Bool("tpuproxy", false, "LEGACY: enable support for TPU devices. TPU support gets automatically enabled if TPU devices are present in the OCI spec.")
 
@@ -256,6 +259,7 @@ var overrideAllowlist = map[string]struct {
 	flagNVProxyGPUUnschedule:     {check: checkNVProxyGPUUnschedule},
 	flagAMDProxyCUMask:           {check: checkAMDProxyCUMask},
 	flagAMDProxyGPUMemLimit:      {check: checkAMDProxyGPUMemoryLimit},
+	flagAMDProxyGPUWeight:        {check: checkAMDProxyGPUWeight},
 	// Sharing an address space grants a container nothing at anyone else's
 	// expense: it neither widens the compute units nor raises the memory limit
 	// it was given, and no address space crosses a sandbox boundary. What it
@@ -341,6 +345,29 @@ func checkNVProxyGPUWeight(c *Config, name string, value string) error {
 		return fmt.Errorf("%s=%q: a weight of zero would exclude the container from scheduling", name, value)
 	}
 	runtime := c.NVProxyGPUWeight
+	if runtime == 0 {
+		// The runtime states no weight, so there is nothing to exceed.
+		return nil
+	}
+	if weight > runtime {
+		return fmt.Errorf("%s=%q exceeds the weight of %d configured on the runtime; annotations may only lower it", name, value, runtime)
+	}
+	return nil
+}
+
+// checkAMDProxyGPUWeight ensures that a container may reduce its share of an
+// AMD GPU but not increase it, for the same reason as checkNVProxyGPUWeight:
+// a weight is relative, so raising one takes GPU time from every other
+// container sharing the device.
+func checkAMDProxyGPUWeight(c *Config, name string, value string) error {
+	weight, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid %s annotation %q: %w", name, value, err)
+	}
+	if weight == 0 {
+		return fmt.Errorf("%s=%q: a weight of zero would exclude the container from scheduling", name, value)
+	}
+	runtime := c.AMDProxyGPUWeight
 	if runtime == 0 {
 		// The runtime states no weight, so there is nothing to exceed.
 		return nil
