@@ -138,14 +138,16 @@ detach and re-attach needed to reclaim it.
 
 **Spatial — an imposed TPC partition.** `SET_TPC_PARTITION_TABLE`, issued from
 the deferred site, pins a sandbox to a specific set of texture/processing
-clusters. This is the hard spatial partition — the direct analog of the CU mask
-that the AMD side (`amdproxy`) has had all along, and the thing the first post's
-NVIDIA half explicitly could not do. AMD got a spatial partition because the CU
-mask is an argument to an ioctl the Sentry already interprets and the hardware
-honors thereafter; NVIDIA's equivalent lives behind an admin-gated control the
-Sentry cannot issue. The driver broker is what lets NVIDIA reach it — closing,
-from the other direction, the "the two mechanisms are not the same shape" gap
-between the two proxies.
+clusters. This is a hard spatial *cap* — NVIDIA's nearest answer to the CU mask
+that the AMD side (`amdproxy`) has had all along, and a control the first post's
+NVIDIA half explicitly could not reach. AMD got its spatial partition because the
+CU mask is an argument to an ioctl the Sentry already interprets and the hardware
+honors thereafter; NVIDIA's lives behind an admin-gated control the Sentry cannot
+issue. The driver broker is what lets NVIDIA reach it — *narrowing* the "the two
+mechanisms are not the same shape" gap between the proxies, though not closing it:
+as the A100 later showed, the AMD mask runs disjoint tenants *concurrently* while
+the TPC partition is a ceiling each tenant hits inside its own time-slice (see
+below).
 
 ## Measured, on the card we had written off
 
@@ -182,8 +184,15 @@ share, imposing a TPC partition and measuring the burn rate:
 
 About 20 matmul/s per TPC, roughly linear. `SET_TPC_PARTITION_TABLE` returns
 `NV_OK` **and** confines throughput to the granted fraction — a real hardware
-partition, not a control that is accepted and ignored. That is the AMD-CU-mask
-analog, working on NVIDIA.
+partition, not a control that is accepted and ignored.
+
+One caveat, measured later on the A100: this is a *ceiling*, not concurrency. Two
+tenants on disjoint TPC halves measure the same as two on the same half, because
+their CUDA contexts time-slice the engine regardless — so the partition caps each
+tenant inside its own slice rather than running them side by side. That is the
+real difference from AMD's CU mask, which genuinely runs disjoint tenants at once.
+The NVIDIA control is a spatial *cap*, not spatial *concurrency* — useful as a
+ceiling, but not the same primitive.
 
 The die-class story we had written down — "only datacenter MIG silicon does
 this" — was an artifact of the three measurement errors, not a fact about the
@@ -191,30 +200,35 @@ hardware. Both axes work on a consumer card with no MIG at all.
 
 ## What is honestly true, and what is not yet
 
-- **The weighted division is not adversary-proof yet — a tenant can steal share
-  by packing processes.** The measurements above are with honest tenants, one
-  process each. The scheduler assigns a timeslice per *sandbox*, and under gVisor
-  every process in a sandbox shares one host identity — so a tenant that forks
-  N processes multiplies its channel groups without the scheduler seeing it, and
-  takes more than its weight. Measured on the integrated stack: a weight-25
-  tenant running four processes beat its weight-75 victim **0.78:1**, against the
-  3.12:1 the honest weights produce. The naive fix — divide a tenant's timeslice
-  across its channel groups — costs ~42% of aggregate throughput to context
-  switching and only *blunts* the attack. The correct design is the one GVM's
-  paper actually specifies: credit accounting at tenant granularity with a large
-  quantum, charging back consumed GPU time; the one-Sentry-process-per-sandbox
-  property that *hid* the attack is what makes that accounting unambiguous — but
-  it is not built yet. So the temporal axis divides a GPU correctly between
-  *cooperative* tenants today; closing it against *adversarial* ones is open
-  work. (Memory-quota and network isolation held throughout — the break was
-  purely in the share.)
-- **This is a driver-resident broker, not a drop-in `nvproxy` flag.** It is a
-  prototype extending the open kernel modules, deployed on the host. The
-  enforcement axis is proven on hardware; the productization — `nvproxy` setting
-  broker parameters per sandbox, mapping weight to timeslice and weight to TPC
-  count — is the remaining engineering. The Sentry-side scaffolding
-  (`smpart_unsafe.go`, `computegate_unsafe.go`, `pkg/gpusched`) is already in the
-  tree; the broker finishes what privilege blocked it from doing there.
+- **The weighted division survives the packing attack — now.** When this post
+  first went up it did not. The scheduler assigned a timeslice per *sandbox*, and
+  under gVisor every process in a sandbox shares one host identity — so a tenant
+  that forked N processes multiplied its channel groups without the scheduler
+  seeing it and took more than its weight. Measured then: a weight-25 tenant
+  running four processes beat its weight-75 victim **0.78:1**, against the 3.12:1
+  the honest weights produce. The naive fix — divide a tenant's timeslice across
+  its channel groups — cost ~42% of aggregate throughput to context switching and
+  only *blunted* it. The fix that worked is the one GVM's paper specifies:
+  **credit accounting at tenant granularity** (`pkg/gpusched/credit.go`), one
+  large uniform quantum, charging consumed GPU time back per tenant, and detaching
+  a whole tenant's channel groups together when it overdraws — so packing cannot
+  help, because a tenant's groups share one credit pool. It needs one small driver
+  change: the runlist reports each tenant's channel-group count, so charge-back is
+  weighted by it. The one-Sentry-process-per-sandbox property that *hid* the
+  attack is exactly what makes the credit accounting unambiguous. Measured on
+  **GA102 (RTX A6000) and GB205 (RTX 5070)**: packing a weight-25 tenant from 3 to
+  12 channel groups now buys it nothing, and the honest ~3:1 holds. (Memory-quota
+  and network isolation held throughout — the break was only ever in the share,
+  and it is closed.)
+- **This is a driver-resident broker, not a drop-in `nvproxy` flag — but it now
+  runs automatically, end to end.** `runsc gpu-scheduler`, given the broker's
+  control file (`--runlist-control`), drives per-tenant runlist timeslices from
+  the same `pkg/gpusched` policy the Sentry gate used, with no manual step: two
+  cuBLAS pods weighted 3:1 divide **1067 / 344 = 3.10:1** on their own, at the
+  unenforced aggregate throughput (work-conserving). It is still a prototype
+  extending the open kernel modules, and still a heavier deployment than a stock
+  driver — that part of the caveat stands — but "wire the weight through to the
+  broker" is done, not remaining.
 - **The trusted base is larger than the first post's.** That mechanism lived
   entirely in the Sentry. This one adds a trusted host *driver* component — still
   outside the container, so the governing constraint holds, but a heavier
@@ -223,15 +237,15 @@ hardware. Both axes work on a consumer card with no MIG at all.
   frequently, the Sentry mapping gate still works with no driver changes; the
   broker handles the doorbell case the gate could not. They are not competing
   answers.
-- **The die-class battery is still filling in.** The temporal axis has now been
-  confirmed on a second die — the RTX A6000 (Ampere GA102), same 3:1 division and
-  work-conserving reclaim as the 5070 — after an earlier A6000 run was retracted
-  as a method error (the same three we made on the 5070). The A6000 spatial sweep
-  and the datacenter/pro parts (A100, RTX 6000 Pro Blackwell) are still to run. We
-  are deliberately **not** predicting those from the die class — predicting from
-  the die class is precisely the mistake that cost us here. Each GPU gets
-  measured, with the status codes read correctly and the controls issued from the
-  right place.
+- **The die-class battery is still filling in.** The temporal axis is now confirmed
+  on three dies — the RTX 5070 (Blackwell GB205), the RTX A6000 (Ampere GA102), and
+  the **A100 (GA100)**, where the automatic runlist path and the packing defense
+  both hold — after an earlier A6000 run was retracted as a method error (the same
+  three we made on the 5070). Still to run: the A6000 spatial sweep and the RTX
+  6000 Pro Blackwell (GB202). We are deliberately **not** predicting those from the
+  die class — predicting from the die class is precisely the mistake that cost us
+  here. Each GPU gets measured, with the status codes read correctly and the
+  controls issued from the right place.
 - **Memory-quota isolation is unaffected and unchanged.** It was always a
   separate, solved problem — admit-before-forward accounting with
   `cuMemGetInfo`/NVML rewritten — and it works on every GPU regardless of any of
