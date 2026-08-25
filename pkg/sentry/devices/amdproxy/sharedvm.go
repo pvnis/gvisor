@@ -339,8 +339,15 @@ type eventShare struct {
 
 	mu sync.Mutex `state:"nosave"`
 
-	// denied is the set of thread groups whose signal page the driver
-	// refused, and which therefore cannot be woken by an event.
+	// pageOwner is the thread group whose buffer became the KFD process's
+	// signal page, and zero if none has yet. Only that process may propose
+	// one; a proposal from any other is dropped rather than forwarded, since
+	// the driver answers it by refusing the whole ioctl.
+	// +checklocks:mu
+	pageOwner kernel.ThreadID
+
+	// denied is the set of thread groups that do not own the signal page, and
+	// which therefore cannot be woken by an event.
 	// +checklocks:mu
 	denied map[kernel.ThreadID]struct{}
 
@@ -349,6 +356,12 @@ type eventShare struct {
 	// a line per wait.
 	// +checklocks:mu
 	capsLogged map[kernel.ThreadID]int
+
+	// dropsLogged counts how many dropped page proposals have been reported
+	// per thread group. A runtime proposes a page once, but a process that
+	// restarts its runtime proposes again, and one line each is enough.
+	// +checklocks:mu
+	dropsLogged map[kernel.ThreadID]int
 }
 
 func (es *eventShare) init(enabled bool) {
@@ -357,6 +370,79 @@ func (es *eventShare) init(enabled bool) {
 	defer es.mu.Unlock()
 	es.denied = make(map[kernel.ThreadID]struct{})
 	es.capsLogged = make(map[kernel.ThreadID]int)
+	es.dropsLogged = make(map[kernel.ThreadID]int)
+}
+
+// claimPage reports whether tgid may propose a signal page: true for the first
+// process to ask and for that process thereafter, false for every other.
+//
+// A false answer must not become an error to the caller. The driver's
+// CREATE_EVENT returns before it creates anything if the page proposal fails
+// (kfd_chardev.c: `if (args->event_page_offset) { err = kfd_kmap_event_page();
+// if (err) return err; }`), so forwarding a doomed proposal costs the caller
+// its event, not just its page. Dropping the proposal instead leaves the ioctl
+// to allocate a slot on the page the owner already registered, which is what
+// the caller needed; it just cannot be woken through it. See mustPoll.
+func (es *eventShare) claimPage(tgid kernel.ThreadID) bool {
+	if !es.enabled {
+		return true
+	}
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	if es.pageOwner == 0 {
+		es.pageOwner = tgid
+		return true
+	}
+	if es.pageOwner == tgid {
+		return true
+	}
+	es.denied[tgid] = struct{}{}
+	return false
+}
+
+// maxDropLogsPerTG bounds how many dropped page proposals are reported per
+// thread group.
+const maxDropLogsPerTG = 2
+
+// logDrop reports the first few page proposals dropped for a thread group.
+func (es *eventShare) logDrop(ctx context.Context, tgid kernel.ThreadID, owner kernel.ThreadID) {
+	es.mu.Lock()
+	n := es.dropsLogged[tgid]
+	if n < maxDropLogsPerTG {
+		es.dropsLogged[tgid] = n + 1
+	}
+	es.mu.Unlock()
+	if n < maxDropLogsPerTG {
+		ctx.Infof("amdproxy: thread group %d proposed a KFD signal page, but thread group %d already registered this "+
+			"sandbox's one page; dropping the proposal so the event is still created. Its waits will poll instead. "+
+			"This is inherent to --amdproxy-share-kfd-vm: a KFD process has one signal page",
+			tgid, owner)
+	}
+}
+
+// owner returns the thread group holding the signal page, or zero if none does.
+func (es *eventShare) owner() kernel.ThreadID {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	return es.pageOwner
+}
+
+// releasePage drops tgid's claim on the signal page if it held it, so that a
+// later process can register one after the owner exits. The driver frees the
+// page with the KFD process, which outlives any one of these processes, so
+// this only keeps the Sentry's view from naming a thread group that is gone.
+func (es *eventShare) releasePage(tgid kernel.ThreadID) {
+	if !es.enabled {
+		return
+	}
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	if es.pageOwner == tgid {
+		es.pageOwner = 0
+	}
+	delete(es.denied, tgid)
+	delete(es.capsLogged, tgid)
+	delete(es.dropsLogged, tgid)
 }
 
 // maxCapLogsPerTG bounds how many capped waits are reported per thread group.
@@ -376,15 +462,6 @@ func (es *eventShare) logCap(ctx context.Context, tgid kernel.ThreadID, timeout 
 		ctx.Infof("amdproxy: capping a WAIT_EVENTS of %d ms from thread group %d to %d ms; it has no signal page and cannot be woken by an event",
 			timeout, tgid, pollingWaitCapMS)
 	}
-}
-
-func (es *eventShare) markDenied(tgid kernel.ThreadID) {
-	if !es.enabled {
-		return
-	}
-	es.mu.Lock()
-	defer es.mu.Unlock()
-	es.denied[tgid] = struct{}{}
 }
 
 // mustPoll reports whether tgid can only learn of completion by reading its

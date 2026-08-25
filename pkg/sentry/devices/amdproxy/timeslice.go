@@ -348,7 +348,8 @@ func (ts *timeSlicer) beforeDestroyQueue(queueID uint32) func() {
 	}
 }
 
-// forgetHostFD is called when one of the sandbox's KFD descriptors is closed.
+// forgetHostFD is called when one of the sandbox's KFD descriptors is closed,
+// with another of its still-open descriptors, or -1 if that was the last.
 //
 // The debug session was opened on whichever descriptor created the first
 // queue, and that descriptor can be released while others remain -- a sandbox
@@ -358,10 +359,19 @@ func (ts *timeSlicer) beforeDestroyQueue(queueID uint32) func() {
 // and at worst names a file this package never opened; either way the sandbox
 // stops being sliced without anything saying so.
 //
-// There is nothing to move the session to: it belongs to the KFD process, but
-// the *descriptor* it was opened on is gone. So the session is torn down and
-// the next queue creation opens a new one on a descriptor known to be live.
-func (ts *timeSlicer) forgetHostFD(hostFD int32) {
+// The session itself survives, so it is moved rather than torn down. It lives
+// on the kfd_process, which the driver takes from the open file's private_data
+// and creates once per calling mm -- and every process in this sandbox is the
+// one Sentry, so all of its KFD descriptors name the same kfd_process. The
+// descriptor is only the way in.
+//
+// Tearing it down instead was worse than losing the division, because the
+// teardown could not run either: DBG_TRAP on the closed descriptor fails with
+// EBADF, so the driver kept a debugger attached that no longer existed, and the
+// next process to call RUNTIME_ENABLE(disable) blocked forever waiting for that
+// debugger to answer. Measured as a hung sandbox holding the GPU after its
+// first process exited.
+func (ts *timeSlicer) forgetHostFD(hostFD, replacement int32) {
 	if !ts.enabled() {
 		return
 	}
@@ -370,8 +380,16 @@ func (ts *timeSlicer) forgetHostFD(hostFD int32) {
 		ts.mu.Unlock()
 		return
 	}
+	if replacement >= 0 {
+		ts.hostFD = replacement
+		ts.mu.Unlock()
+		log.Debugf("amdproxy: the KFD descriptor holding the debug session was closed; moving the session to another "+
+			"descriptor of the same kfd_process (%d -> %d)", hostFD, replacement)
+		return
+	}
 	ts.mu.Unlock()
-	log.Debugf("amdproxy: the KFD descriptor holding the debug session was closed; restarting the session on the next queue")
+	log.Debugf("amdproxy: the KFD descriptor holding the debug session was closed and no other is open; " +
+		"restarting the session on the next queue")
 	ts.shutdown()
 	ts.mu.Lock()
 	ts.hostFD = -1

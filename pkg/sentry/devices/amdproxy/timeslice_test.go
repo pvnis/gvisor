@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/amdgpu"
 	"gvisor.dev/gvisor/pkg/gpusched"
 	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy/amdconf"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 )
 
 // TestDbgTrapArgSizes tests that every DBG_TRAP parameter struct is the size
@@ -376,9 +377,121 @@ func TestDisabledSlicerIsInert(t *testing.T) {
 	// None of these may touch the driver, start a goroutine, or panic.
 	ts.trackQueue(7, 1, amdgpu.KFD_IOC_QUEUE_TYPE_COMPUTE, 24576)
 	ts.beforeDestroyQueue(1)()
-	ts.forgetHostFD(7)
+	ts.forgetHostFD(7, 8)
 	ts.shutdown()
 	if len(ts.queues) != 0 {
 		t.Errorf("queues = %v, want none tracked", ts.queues)
+	}
+}
+
+// TestSessionMovesToASurvivingFD tests that closing the descriptor a debug
+// session was opened on moves the session to another of the sandbox's
+// descriptors rather than abandoning it.
+//
+// Every descriptor reaches the same kfd_process, so the session is still
+// there; what would be lost is the Sentry's way of naming it. Tearing it down
+// instead left the driver with a debugger attached that could no longer be
+// reached, and the next RUNTIME_ENABLE(disable) blocked forever.
+func TestSessionMovesToASurvivingFD(t *testing.T) {
+	var ts timeSlicer
+	ts.init(100, 3, "test")
+	defer func() { ts.schedFD = -1 }()
+	ts.mu.Lock()
+	ts.hostFD = 7
+	ts.dbgFD = 9
+	open := ts.sessionOpenLocked()
+	ts.mu.Unlock()
+	if !open {
+		t.Fatal("test setup did not produce an open session")
+	}
+
+	ts.forgetHostFD(7, 8)
+
+	ts.mu.Lock()
+	got, stillOpen := ts.hostFD, ts.sessionOpenLocked()
+	ts.mu.Unlock()
+	if got != 8 {
+		t.Errorf("hostFD = %d, want 8 (the surviving descriptor)", got)
+	}
+	if !stillOpen {
+		t.Error("the session was closed, but another descriptor of the same kfd_process was open")
+	}
+}
+
+// TestForgetHostFDIgnoresOtherFDs tests that closing a descriptor the session
+// was not opened on leaves it alone. Every process in a sharing sandbox holds
+// its own, so most closes are of no interest.
+func TestForgetHostFDIgnoresOtherFDs(t *testing.T) {
+	var ts timeSlicer
+	ts.init(100, 3, "test")
+	defer func() { ts.schedFD = -1 }()
+	ts.mu.Lock()
+	ts.hostFD = 7
+	ts.dbgFD = 9
+	ts.mu.Unlock()
+
+	ts.forgetHostFD(11, 12)
+
+	ts.mu.Lock()
+	got := ts.hostFD
+	ts.mu.Unlock()
+	if got != 7 {
+		t.Errorf("hostFD = %d, want 7 unchanged", got)
+	}
+}
+
+// TestSignalPageGoesToOneProcess tests that exactly one process may register
+// the sandbox's signal page, and that the rest are told to drop the proposal
+// rather than have it forwarded and refused.
+//
+// The distinction is the whole bug: the driver handles the page before it
+// creates the event and returns early if the page fails, so forwarding a
+// doomed proposal costs the caller its event and ROCr then dereferences null.
+func TestSignalPageGoesToOneProcess(t *testing.T) {
+	var es eventShare
+	es.init(true)
+
+	if !es.claimPage(2) {
+		t.Fatal("the first process was refused the signal page")
+	}
+	if !es.claimPage(2) {
+		t.Error("the owner was refused its own page on a second proposal")
+	}
+	if es.claimPage(6) {
+		t.Error("a second process was allowed to propose a signal page")
+	}
+	if es.owner() != 2 {
+		t.Errorf("owner = %d, want 2", es.owner())
+	}
+	if !es.mustPoll(6) {
+		t.Error("the refused process is not marked as needing to poll")
+	}
+	if es.mustPoll(2) {
+		t.Error("the page owner was marked as needing to poll")
+	}
+
+	// The owner leaving lets a later process register a page, since the
+	// driver's own page belongs to the KFD process, not to any one of them.
+	es.releasePage(2)
+	if es.owner() != 0 {
+		t.Errorf("owner = %d after release, want none", es.owner())
+	}
+	if !es.claimPage(6) {
+		t.Error("no process could claim the page after the owner left")
+	}
+}
+
+// TestSignalPageUnsharedIsUnrestricted tests that without sharing every
+// process may propose a page, because each has its own kfd_process.
+func TestSignalPageUnsharedIsUnrestricted(t *testing.T) {
+	var es eventShare
+	es.init(false)
+	for _, tgid := range []int32{2, 6, 10} {
+		if !es.claimPage(kernel.ThreadID(tgid)) {
+			t.Errorf("thread group %d was refused a signal page with sharing off", tgid)
+		}
+	}
+	if es.mustPoll(6) {
+		t.Error("a process must not be made to poll when sharing is off")
 	}
 }

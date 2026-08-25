@@ -301,16 +301,27 @@ func (amdp *amdproxy) trackFD(fd *kfdFD) {
 func (amdp *amdproxy) untrackFD(fd *kfdFD) {
 	amdp.fdsMu.Lock()
 	last := false
+	successor := int32(-1)
 	if _, ok := amdp.kfdFDs[fd]; ok {
 		delete(amdp.kfdFDs, fd)
 		last = len(amdp.kfdFDs) == 0
 	}
+	if !last {
+		// Any descriptor still open reaches the same kfd_process, so any of
+		// them can carry a debug session opened on the one going away.
+		for other := range amdp.kfdFDs {
+			if other.hostFD >= 0 {
+				successor = other.hostFD
+				break
+			}
+		}
+	}
 	amdp.fdsMu.Unlock()
 	if !last {
 		// This descriptor is going away but the sandbox is still using the
-		// GPU. If the debug session was opened on it, it has to be given up:
-		// the number is about to be reused.
-		amdp.timeSlicer.forgetHostFD(fd.hostFD)
+		// GPU. If the debug session was opened on it, it has to be moved: the
+		// number is about to be reused.
+		amdp.timeSlicer.forgetHostFD(fd.hostFD, successor)
 		return
 	}
 	if last {
