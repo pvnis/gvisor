@@ -102,6 +102,19 @@ The two nodes reach each other **only over Tailscale** — sensai is NAT'd behin
 192.168.0.0/24 and is unreachable from sens1 — so both use their Tailscale
 address as the k3s `node-ip`. Do not "fix" a node IP back to a LAN address.
 
+**`vm-nv-dmd1` is a fifth machine and is the one with a pro die**: an
+**RTX A6000 (GA102, 46068 MiB)**, Ubuntu, single-node k3s with **Cilium**
+(1.19.5, kube-proxy replacement), traefik, HAMi, the in-tree quota webhook, and
+`runsc gpu-scheduler --runlist-control` already running. Node IP 10.30.30.196.
+It is where the credit scheduler's GA102 numbers were taken, and since
+2026-09-28 it also runs a full third-party inference + agent stack on the
+slicing path — see "A real third-party stack on the slicing path" below. Its
+runsc CRI config is `/etc/containerd/runsc.toml` plus the containerd drop-in
+`/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.d/10-runsc.toml`
+(which carries the `pod_annotations` line). One stale comment in
+`runsc.toml` claims `nvproxy-gpu-scheduler-socket` is "deliberately NOT set
+yet"; it *is* set on the line above. Do not trust that comment.
+
 sens1 was rebooted into kernel **7.0.0-28** on 2026-08-10, so the KVM bug below
 no longer applies on either host.
 
@@ -1085,6 +1098,90 @@ It is still blocked. Only `rmAllocObject` and `rootClient` implement `Restore`;
 objects recorded as `miscObject` or `osDescMem` do not, and those cover the OS
 events every CUDA context creates. Both obstacles predate this branch.
 
+## A real third-party stack on the slicing path (2026-09-28, vm-nv-dmd1)
+
+Everything above is this branch's own harnesses. This is someone else's
+production stack, deployed unmodified onto the slicing path: **Phoenix Serving**
+(`github.com/midokura/phoenix-serving` — KServe `LLMInferenceService` +
+Gateway API + AgentGateway + a GAIE endpoint picker) serving Qwen3.5-4B, and
+**MidoClaw** (`github.com/midokura/phoenix-claw` — an agent platform whose
+per-user sandboxes run LLM-authored code), both in the tenant namespace
+`tenant-nv-a`.
+
+Neither repository was modified. Everything below is values files and
+NetworkPolicies, kept in `~/pc-build/`.
+
+**The model server is a gVisor sandbox holding a Sentry-enforced slice**, set by
+one line in the chart's own hook (`vllm.runtimeClassName: gvisor`) plus
+`nvidia.com/gpumem: 20480` and `nvidia.com/gpucores: 60` in the container's
+resources, which the in-tree webhook turns into the runsc flags.
+
+| evidence | value |
+| --- | --- |
+| `nvidia-smi` inside the sandbox | `NVIDIA RTX A6000, 20480 MiB` |
+| `nvidia-smi` on the host | `NVIDIA RTX A6000, 46068 MiB` |
+| vLLM's own profiling | `Free memory on device (19.74/20.0 GiB)` |
+| KV cache it therefore sized | 252,646 tokens, 7.71x concurrency |
+| runsc boot args | `--nvproxy-gpu-memory-limit=21474836480 --nvproxy-gpu-weight=60` |
+| credit scheduler | the sandbox's Sentry pid registered, `tsgs 3` |
+
+**That is the result worth keeping: an unmodified third-party serving stack
+sized itself to the quota without knowing gVisor existed.** `cuMemGetInfo` is
+rewritten, so `--gpu-memory-utilization=0.9` means 0.9 *of the slice*. Inference
+works end to end through the gateway.
+
+**The agent sandboxes are gVisor too**, which is the more interesting half:
+they run model-authored code, so an escape would be an escape to the host
+kernel. OpenShell has exactly the right hook — `server.defaultRuntimeClassName`,
+applied to any sandbox whose creation request names no RuntimeClass, and
+agentic-api names none. Set it to `gvisor` in the agentic-platform chart's
+`lifecycle.openshell.values` and every agent pod comes up on the Sentry
+(`uname -r` → `4.19.0-gvisor`), while the OpenShell *server* stays on runc as
+trusted control plane. No patching of either chart.
+
+### What it took, and what is still open
+
+- **A tenant's `default-deny-ingress` is load-bearing and the deployment spans
+  it.** Phoenix Serving's control plane (Gateway, AgentGateway, llmisvc
+  controller) installs cluster-wide in `inference-platform`, while the model
+  server and endpoint picker live in the tenant, so every generation request
+  crosses the boundary. Without an explicit allow the gateway answers
+  `ext_proc failed: no more response messages` **while `/v1/models` keeps
+  working**, because that one is served by the gateway itself and never enters
+  the tenant — so routing looks healthy. The better tenancy shape is a Gateway
+  *inside* each tenant namespace; the platform chart installs one per cluster.
+- **KServe's base preset gives the endpoint picker `limits.memory: 16Gi`**,
+  which a tenant quota sized for one model refuses. The visible symptom is the
+  LLMInferenceService sitting at `RouterReady=False / WaitingForGateway`, which
+  reads like a Gateway fault. It is the ReplicaSet's `FailedCreate`. The chart
+  documents `epp.resources` for exactly this.
+- **`agentSandbox.install: true` in the agentic-platform chart is inert.** The
+  key appears only in `values.yaml` — no template, no `crds/`, no subchart —
+  although its comment says the CRDs are "vendored so this chart installs
+  standalone". Install `kubernetes-sigs/agent-sandbox` separately, as the
+  README's manual step does.
+- **`reconcile.sh` opens the agent gateway port to the wrong peer.** It appends
+  `SANDBOX_INGRESS_PORTS` to `/spec/ingress/0/ports/-` of the openshell chart's
+  `<ns>-sandbox-ssh` policy, but that rule's `from` selects the OpenShell
+  *server* pod — not the platform namespace its own comment names. Both worth
+  reporting upstream to midokura.
+- **Open: the agent's own gateway port is not reachable at the pod IP.**
+  `POST /sandboxes/{id}/chat/completions` returns 502 "Could not connect to
+  agent" although `openclaw-gateway` is running inside the sandbox and
+  `/proc/net/tcp` shows `00000000:4965` (0.0.0.0:18789) in state `0A` (LISTEN),
+  and the API dials that pod IP directly. A probe gets `exit=7` (refused) even
+  **from the same namespace**, and NetworkPolicy is ruled out: both the chart's
+  policy and a hand-written copy select `openshell.ai/managed-by=openshell`
+  while the pods carry only `agents.x-k8s.io/sandbox-name-hash`, so *neither
+  selects anything*. Other gVisor pods here (vLLM, the API, the UI) accept
+  inbound traffic normally. Leading hypothesis, **not confirmed**: the OpenShell
+  supervisor runs the agent in a nested network namespace
+  (`OPENSHELL_NETWORK_RUNTIME_CAPABILITIES`; an in-sandbox proxy is also
+  listening on 3128), so 0.0.0.0 there is not the pod's address, and
+  `kubectl exec` sees the listener because it lands in the same nested
+  namespace. `inference.local` not resolving inside a sandbox is likely the same
+  root.
+
 ## Two fixes that belong upstream, not here
 
 Both are gVisor bugs with nothing vendor-specific about them; they affect any
@@ -1164,6 +1261,55 @@ Three smaller ones, each of which cost real time:
   export just omits the layers. Route it into k3s another way: extract the binary
   with `docker cp` and mount it into a stock image, or push through a throwaway
   local registry. Cost real time on sensai.
+
+**A gVisor pod cannot reach a ClusterIP when Cilium's socket LB covers pod
+namespaces.** This is the largest of these traps: on `vm-nv-dmd1` *every*
+service VIP was unreachable from every gVisor pod, while external IPv4 and
+pod-to-pod both worked — so it reads as a DNS fault and is not one.
+
+Cilium with `kubeProxyReplacement: true` translates east-west traffic at the
+**socket** layer, in the pod's cgroup at `connect()` time. A sandboxed
+application never makes that call: the Sentry's netstack builds the packet
+itself. The packet therefore reaches the datapath still addressed to the VIP,
+`cil_from_container` resolves the destination to the `world` identity because a
+service CIDR is not a pod CIDR, and passes it to the host stack — where
+kube-proxy has been replaced and nothing catches it. `cilium-dbg monitor` names
+it in one line:
+
+    -> stack flow 0x0 , identity 30243->world state new ifindex 0: 10.0.0.82:23349 -> 10.43.0.10:53 udp
+
+The matched control settles it: for a **runc** pod the datapath never sees the
+VIP at all, only the reply from the backend pod IP, because socket LB already
+rewrote it.
+
+Fix: `socketLB.hostNamespaceOnly=true` (configmap `bpf-lb-sock-hostns-only`),
+which confines socket LB to host-namespace sockets and moves pod service
+translation into the veth datapath, where gVisor's packets do arrive. The agent
+then reports `Socket LB Coverage: Hostns-only` instead of `Full`. runc pods are
+unaffected. This is the same knob Cilium documents for Istio, and for the same
+reason — something between the application and the wire is bypassing the host
+socket layer.
+
+**And the trap inside the trap: changing a ConfigMap rolls nothing.** The helm
+upgrade that set this reported nothing amiss and `kubectl rollout status
+ds/cilium` printed "successfully rolled out" — while the 42-day-old agent pod
+kept running, because the DaemonSet *spec* had not changed. The fix only took
+effect after an explicit `kubectl rollout restart ds/cilium`. Hit twice in one
+session, the second time on the webhook's `TENANT_MAP`, where the symptom was a
+403 from a token the API had accepted. **Check the pod's age, not the rollout
+message** — the same shape as "check the hash, not bazel's summary".
+
+**`kubectl port-forward` cannot reach a gVisor pod.** It enters the pod's
+network namespace and dials `127.0.0.1:<port>` from the host side, but the
+listening socket lives in the Sentry's netstack, so nothing is bound on the
+host-visible loopback:
+
+    failed to connect to localhost:8000 inside namespace "…": dial tcp4 127.0.0.1:8000: connect: connection refused
+
+Inbound traffic to the pod *IP* works normally — this is specific to
+port-forward's loopback assumption. Reach the workload through a Service or an
+Ingress instead. Not vendor-specific and nothing to do with GPUs; it bites any
+gVisor pod.
 
 ## Context worth having
 
