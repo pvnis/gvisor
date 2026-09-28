@@ -98,10 +98,8 @@ func startWebhookHTTPS(clientset kubernetes.Interface) error {
 		*address = ip.String()
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/", http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			injector.Admit(w, r)
-		}))
+	admitter := injector.NewAdmitter(clientset)
+	mux.Handle("/", http.HandlerFunc(admitter.Admit))
 	server := &http.Server{
 		// Listen on all addresses.
 		Addr:      net.JoinHostPort(*address, strconv.Itoa(*port)),

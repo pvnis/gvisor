@@ -38,6 +38,13 @@ rules:
 - apiGroups: [ admissionregistration.k8s.io ]
   resources: [ mutatingwebhookconfigurations ]
   verbs: [ create, get, update ]
+# A pod asking for a fraction of more than one GPU is refused unless the
+# namespace it is created in is labelled to accept it, so admission has to be
+# able to read that label. The lookup runs only for a pod that would otherwise
+# be refused; ordinary GPU pods cause no API call.
+- apiGroups: [ "" ]
+  resources: [ namespaces ]
+  verbs: [ get ]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -874,6 +874,9 @@ pod states.
 | *n* whole GPUs | `n` | omit | omit |
 | *n* GPUs, a fraction of each | `n` | the MiB **per device** | its weight, 0-100 |
 
+**The last row is refused by default**, and needs a label on the namespace to
+be allowed. See [Fractions of several GPUs](#multi-device-fractions).
+
 **Omitting `gpumem` is what asks for the whole of each device.** The webhook
 writes no memory-limit annotation for a pod that requests none, so the sandbox
 runs at the node-wide ceiling in the runtime config — which is the whole device
@@ -891,6 +894,56 @@ sandboxes on that device.
 > covering every device it holds, so it is given the smallest window any of its
 > devices granted. A pod that holds one GPU to itself and shares another is
 > throttled on both. See [Nodes with several GPUs](#kubernetes).
+
+#### Fractions of several GPUs {#multi-device-fractions}
+
+A pod may take a fraction of one GPU, or whole GPUs however many it likes. What
+it may not do by default is hold several devices and state a `gpumem` request
+against them; the webhook refuses that pod, naming what to change:
+
+```
+Error from server (Forbidden): admission webhook
+"gvisor-injection-admission-webhook.e2e.svc" denied the request: a pod may hold
+a fraction of one GPU or whole GPUs, not fractions of several: this one holds 2
+devices and asks for nvidia.com/gpumem against 2 of them.
+```
+
+Two reasons, one about this implementation and one about the workload.
+
+**It is not enforced correctly.** A sandbox spanning several devices is held to
+the narrowest window any of them granted, so a pod sharing one busy card and one
+quiet one is throttled on both. And the credit scheduler that divides a
+runlist-enforced GPU accounts per tenant rather than per *(tenant, device)*, so
+a multi-device tenant is charged against a single device's period and can be
+detached over contention on a card it does not hold. Neither has been measured,
+because no machine this has run on has more than one GPU.
+
+**It is not what a multi-GPU workload wants.** One that uses collectives
+synchronises on its slowest rank, so holding a quarter of four cards inherits
+the *worst* neighbour on any of them rather than the average of them:
+interference compounds with the device count instead of averaging out, which
+makes this the worst shape for the workload that most needs several GPUs. One
+that does *not* use collectives is better expressed as several pods holding one
+fraction each, which packs better and fails independently.
+
+The case that does want it is a model sharded across cards for capacity whose
+compute does not fill them -- a sparse or mixture-of-experts model, where the
+weights force the device count and the activations leave most of each card's
+compute idle. A cluster with such a workload allows it per namespace:
+
+```
+kubectl label namespace <ns> dev.gvisor.gpu-multi-device-fractions=allow
+```
+
+It is a namespace label rather than a pod annotation because the pod spec is
+written by the workload being limited -- inside a vCluster, by a tenant with
+full control of it -- while the host namespace the pod is synced into is not
+something that tenant can reach. The same reasoning puts a tenant's
+`ResourceQuota` on the host side.
+
+The webhook needs `get` on `namespaces` to read the label. The lookup runs only
+for a pod that would otherwise be refused, and the answer is cached for 30
+seconds, so a newly labelled namespace may refuse pods for that long.
 
 Without the webhook, state the two annotations directly:
 

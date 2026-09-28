@@ -157,8 +157,24 @@ func GetTLSConfig() *tls.Config {
 	}
 }
 
+// Admitter answers admission requests for pods.
+//
+// It holds the state admission needs beyond the request itself -- today, a
+// reader for the labels of the namespace a pod is being created in, which
+// decide whether a request shape the enforcement cannot handle is permitted
+// there anyway.
+type Admitter struct {
+	namespaces *nsLabels
+}
+
+// NewAdmitter returns an Admitter that resolves namespace labels through
+// clientset.
+func NewAdmitter(clientset kubeclientset.Interface) *Admitter {
+	return &Admitter{namespaces: newNSLabels(clientset)}
+}
+
 // Admit performs admission checks and mutations on Pods.
-func Admit(writer http.ResponseWriter, req *http.Request) {
+func (a *Admitter) Admit(writer http.ResponseWriter, req *http.Request) {
 	review := &admv1.AdmissionReview{}
 	if err := json.NewDecoder(req.Body).Decode(review); err != nil {
 		log.Infof("Failed with error (%v) to decode Admit request: %+v", err, *req)
@@ -168,7 +184,7 @@ func Admit(writer http.ResponseWriter, req *http.Request) {
 
 	log.Debugf("admitPod: %+v", review)
 	var err error
-	review.Response, err = admitPod(review.Request)
+	review.Response, err = a.admitPod(req.Context(), review.Request)
 	if err != nil {
 		log.Warningf("admitPod failed: %v", err)
 		review.Response = &admv1.AdmissionResponse{
@@ -202,7 +218,7 @@ func sendResponse(writer http.ResponseWriter, response any) {
 	writer.Write(b)
 }
 
-func admitPod(req *admv1.AdmissionRequest) (*admv1.AdmissionResponse, error) {
+func (a *Admitter) admitPod(ctx context.Context, req *admv1.AdmissionRequest) (*admv1.AdmissionResponse, error) {
 	// Verify that the request is indeed a Pod.
 	resource := metav1.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
 	if req.Resource != resource {
@@ -213,6 +229,34 @@ func admitPod(req *admv1.AdmissionRequest) (*admv1.AdmissionResponse, error) {
 	pod := &v1.Pod{}
 	if err := json.Unmarshal(req.Object.Raw, pod); err != nil {
 		return nil, fmt.Errorf("failed to decode pod object %s/%s", req.Namespace, req.Name)
+	}
+
+	// Refuse a request this stack cannot enforce, unless the namespace is
+	// labelled to accept it. This runs before the mutations below because a
+	// pod that is going to be refused should not first be given annotations
+	// that describe a limit nobody will hold it to.
+	if err := gpushare.CheckMultiDeviceFractions(pod); err != nil {
+		allowed, lookupErr := a.namespaces.allowsMultiDeviceFractions(ctx, req.Namespace)
+		if lookupErr != nil {
+			// Fail closed, for the same reason the webhook registers with
+			// FailurePolicy: Fail. Not knowing whether a namespace opted in is
+			// not the same as knowing it did.
+			return nil, fmt.Errorf("cannot decide pod %s/%s (generateName: %s): %v: %w", req.Namespace, req.Name, pod.GenerateName, err, lookupErr)
+		}
+		if !allowed {
+			log.Infof("Refusing pod %s/%s (generateName: %s): %v", req.Namespace, req.Name, pod.GenerateName, err)
+			return &admv1.AdmissionResponse{
+				Allowed: false,
+				Result: &metav1.Status{
+					Status:  metav1.StatusFailure,
+					Code:    http.StatusForbidden,
+					Reason:  metav1.StatusReasonForbidden,
+					Message: err.Error(),
+				},
+			}, nil
+		}
+		log.Infof("Namespace %q is labelled %s=%s, so admitting pod %s (generateName: %s) despite: %v",
+			req.Namespace, gpushare.MultiDeviceFractionLabel, gpushare.MultiDeviceFractionAllowed, req.Name, pod.GenerateName, err)
 	}
 
 	// Copy first to change it.

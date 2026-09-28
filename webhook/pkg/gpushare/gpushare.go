@@ -34,6 +34,7 @@
 package gpushare
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -65,6 +66,22 @@ const (
 	// memreq and records it per device. A pod's GPU memory quota is therefore
 	// the product of the two, not the memory request alone.
 	CountResourceName = "nvidia.com/gpu"
+
+	// MultiDeviceFractionLabel is the namespace label by which a cluster
+	// administrator permits the pods of a namespace to hold a *fraction* of
+	// more than one GPU. Only MultiDeviceFractionAllowed permits it; any other
+	// value, and the absence of the label, refuse it.
+	//
+	// It is a namespace label rather than a pod annotation deliberately. The
+	// pod spec is written by the workload being limited -- inside a vCluster,
+	// by a tenant with full control of it -- while the host namespace the pod
+	// is synced into is not something the tenant can reach. This is the same
+	// reasoning that puts a tenant's ResourceQuota on the host side.
+	MultiDeviceFractionLabel = "dev.gvisor.gpu-multi-device-fractions"
+
+	// MultiDeviceFractionAllowed is the one value of MultiDeviceFractionLabel
+	// that permits the request shape it guards.
+	MultiDeviceFractionAllowed = "allow"
 
 	// MemoryLimitAnnotation is the annotation runsc reads to limit the GPU
 	// memory a sandbox may allocate, in bytes. The value configured on the
@@ -203,6 +220,84 @@ func InjectAMDWeight(pod *v1.Pod) {
 	}
 	setAnnotation(pod, AMDWeightAnnotation, narrow(pod, AMDWeightAnnotation, peak))
 	log.Debugf("Injected AMD GPU weight of %d from %q requests", peak, AMDMemoryResourceName)
+}
+
+// CheckMultiDeviceFractions returns an error if a pod asks for a fraction of
+// more than one GPU. A pod may take a fraction of a single device, or whole
+// devices however many it likes; what it may not do is hold several devices and
+// name a memory request against them.
+//
+// The shape is refused because nothing in this stack enforces it correctly, and
+// because no real workload is asking for it.
+//
+// It is not enforced: a sandbox spanning several devices is held to the
+// narrowest window any of them granted (gpusched.narrowest), so a pod sharing
+// one contended card and one quiet one is throttled on both; and the credit
+// planner that divides a runlist-enforced GPU accounts per tenant rather than
+// per (tenant, device), so a multi-device tenant is charged against a single
+// device's period and can be detached over contention on a card it does not
+// even hold. Neither has been measured, because every machine this branch runs
+// on has exactly one GPU.
+//
+// It is not wanted: a multi-GPU workload that uses collectives synchronises on
+// its slowest rank, so holding a quarter of four cards inherits the worst
+// neighbour on any of them rather than the average of them -- interference
+// compounds with the device count instead of averaging out, which makes this
+// the worst possible shape for the workload that most needs several GPUs. A
+// multi-GPU workload that does *not* use collectives is better expressed as
+// several pods holding one fraction each, which packs better, fails
+// independently, and works today.
+//
+// The case that does want it is a model sharded across cards for capacity whose
+// compute does not fill them -- a sparse or mixture-of-experts model, where the
+// weights force the device count and the activations leave most of each card's
+// compute unused. That is a real request, and it is why this is an opt-in
+// refused by default rather than a rule: a namespace labelled
+// MultiDeviceFractionLabel=MultiDeviceFractionAllowed may ask for it, and
+// accepts the enforcement above as it stands.
+func CheckMultiDeviceFractions(pod *v1.Pod) error {
+	// The pod's containers run together and share one sandbox, so they hold
+	// their devices at the same time.
+	if err := checkDevicePhase(pod.Spec.Containers); err != nil {
+		return err
+	}
+	// Init containers run one at a time, and before the rest, so each is its
+	// own phase and is judged alone.
+	for i := range pod.Spec.InitContainers {
+		if err := checkDevicePhase(pod.Spec.InitContainers[i : i+1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkDevicePhase applies the rule to a set of containers that hold their
+// devices simultaneously.
+func checkDevicePhase(cs []v1.Container) error {
+	var devices, fractional int64
+	for i := range cs {
+		c := &cs[i]
+		n := containerRequest(c, CountResourceName)
+		mem := containerRequest(c, MemoryResourceName)
+		if mem > 0 && n < 1 {
+			// Memory asked for without a device count still gets a device,
+			// which is the same reading containerDeviceMemory takes.
+			n = 1
+		}
+		devices += n
+		if mem > 0 {
+			fractional += n
+		}
+	}
+	if devices <= 1 || fractional == 0 {
+		return nil
+	}
+	return fmt.Errorf("a pod may hold a fraction of one GPU or whole GPUs, not fractions of several: this one holds %d devices and asks for %s against %d of them. "+
+		"Drop %s to take each device whole, or ask for %s: 1 to take a fraction of a single device. "+
+		"To allow it anyway, label the namespace %s=%s -- a multi-device sandbox is then held to its most contended device's share",
+		devices, MemoryResourceName, fractional,
+		MemoryResourceName, CountResourceName,
+		MultiDeviceFractionLabel, MultiDeviceFractionAllowed)
 }
 
 // narrow returns the value to write for an annotation the pod may already have

@@ -16,6 +16,7 @@ package gpushare
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -573,5 +574,120 @@ func TestInjectWeightIgnoresDeviceCount(t *testing.T) {
 	InjectWeight(&pod)
 	if got, want := pod.Annotations[WeightAnnotation], "30"; got != want {
 		t.Errorf("%s = %q, want %q (a weight is per device, not a total)", WeightAnnotation, got, want)
+	}
+}
+
+// A pod may take a fraction of one GPU, or whole GPUs however many; what it
+// may not do is hold several devices and name a memory request against them,
+// because a sandbox spanning several devices is held to the narrowest window
+// any of them granted and is charged against a single device's period.
+func TestCheckMultiDeviceFractions(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		pod     v1.Pod
+		wantErr bool
+	}{
+		{
+			name: "fraction of one device",
+			pod:  v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(1, 2048)}}},
+		},
+		{
+			// No device count at all still means one device.
+			name: "fraction without a device count",
+			pod:  v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{gpuContainer(2048)}}},
+		},
+		{
+			// Whole devices carry no memory request, so there is no fraction
+			// to spread across them.
+			name: "two whole devices",
+			pod:  v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(2, 0)}}},
+		},
+		{
+			name: "no gpu at all",
+			pod:  v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{gpuContainer(0)}}},
+		},
+		{
+			name:    "fraction of two devices",
+			pod:     v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(2, 2048)}}},
+			wantErr: true,
+		},
+		{
+			// Containers of a pod share one sandbox, so a device each is a
+			// sandbox spanning two devices just the same.
+			name: "a fractional device in each of two containers",
+			pod: v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{
+				multiGPUContainer(1, 2048),
+				multiGPUContainer(1, 1024),
+			}}},
+			wantErr: true,
+		},
+		{
+			// One container taking a whole device beside another taking a
+			// fraction is the same shape: the sandbox holds two devices and a
+			// fraction of one of them.
+			name: "a whole device beside a fractional one",
+			pod: v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{
+				multiGPUContainer(1, 0),
+				multiGPUContainer(1, 2048),
+			}}},
+			wantErr: true,
+		},
+		{
+			// Init containers run one at a time, so two of them holding a
+			// device each never hold both at once.
+			name: "init containers are judged alone",
+			pod: v1.Pod{Spec: v1.PodSpec{
+				InitContainers: []v1.Container{multiGPUContainer(1, 2048), multiGPUContainer(1, 1024)},
+				Containers:     []v1.Container{multiGPUContainer(1, 2048)},
+			}},
+		},
+		{
+			name: "an offending init container is caught",
+			pod: v1.Pod{Spec: v1.PodSpec{
+				InitContainers: []v1.Container{multiGPUContainer(2, 2048)},
+				Containers:     []v1.Container{gpuContainer(0)},
+			}},
+			wantErr: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := CheckMultiDeviceFractions(&test.pod)
+			if gotErr := err != nil; gotErr != test.wantErr {
+				t.Errorf("CheckMultiDeviceFractions() = %v, want error: %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+// The refusal must name what the operator has to change, since it is the only
+// thing a tenant sees when a pod is rejected.
+func TestCheckMultiDeviceFractionsMessageIsActionable(t *testing.T) {
+	pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(3, 2048)}}}
+	err := CheckMultiDeviceFractions(&pod)
+	if err == nil {
+		t.Fatalf("CheckMultiDeviceFractions() = nil, want an error")
+	}
+	for _, want := range []string{
+		MemoryResourceName,
+		CountResourceName,
+		MultiDeviceFractionLabel,
+		MultiDeviceFractionAllowed,
+		"3 devices",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("CheckMultiDeviceFractions() = %q, want it to mention %q", err, want)
+		}
+	}
+}
+
+// A pod refused by policy must not have been given annotations first: they
+// would describe a limit nothing is going to hold it to.
+func TestCheckMultiDeviceFractionsRunsBeforeInjection(t *testing.T) {
+	pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(2, 2048)}}}
+	if err := CheckMultiDeviceFractions(&pod); err == nil {
+		t.Fatalf("CheckMultiDeviceFractions() = nil, want an error")
+	}
+	if got := len(pod.Annotations); got != 0 {
+		t.Errorf("pod has %d annotations after a refused check, want 0: %v", got, pod.Annotations)
 	}
 }

@@ -9,6 +9,7 @@ go_library(
     name = "injector",
     srcs = [
         "certs.go",
+        "policy.go",
         "webhook.go",
     ],
     visibility = ["//:sandbox"],
