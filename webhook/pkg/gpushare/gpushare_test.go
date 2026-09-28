@@ -15,6 +15,7 @@
 package gpushare
 
 import (
+	"strconv"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -476,5 +477,101 @@ func TestStandDownHAMiKeepsExplicit(t *testing.T) {
 	env := pod.Spec.Containers[0].Env
 	if len(env) != 1 || env[0].Value != "false" {
 		t.Errorf("env = %+v, want the container's own value left alone", env)
+	}
+}
+
+// multiGPUContainer returns a container asking for devices distinct GPUs, each
+// with mib mebibytes of GPU memory.
+func multiGPUContainer(devices, mib int64) v1.Container {
+	c := gpuContainer(mib)
+	if c.Resources.Limits == nil {
+		c.Resources.Limits = v1.ResourceList{}
+	}
+	c.Resources.Limits[CountResourceName] = *resource.NewQuantity(devices, resource.DecimalSI)
+	return c
+}
+
+// A pod holding several GPUs is admitted its memory request on *each* of them,
+// so the sandbox's quota is the product. Charging it the memory request alone
+// caps it below what the scheduler already granted.
+func TestInjectGPUMemoryLimitMultipliesByDeviceCount(t *testing.T) {
+	const mib = 1 << 20
+	for _, test := range []struct {
+		name      string
+		pod       v1.Pod
+		wantLimit string
+	}{
+		{
+			name:      "two devices double the quota",
+			pod:       v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(2, 4096)}}},
+			wantLimit: strconv.FormatInt(2*4096*mib, 10),
+		},
+		{
+			name:      "eight devices",
+			pod:       v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(8, 1024)}}},
+			wantLimit: strconv.FormatInt(8*1024*mib, 10),
+		},
+		{
+			// One device is the same answer the old single-GPU path gave, so
+			// the common case is unchanged.
+			name:      "one device is unchanged",
+			pod:       v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(1, 512)}}},
+			wantLimit: strconv.FormatInt(512*mib, 10),
+		},
+		{
+			// No device count at all still means one device, not none.
+			name:      "absent count means one device",
+			pod:       v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{gpuContainer(512)}}},
+			wantLimit: strconv.FormatInt(512*mib, 10),
+		},
+		{
+			// Containers run together, so their products add.
+			name: "containers sum their products",
+			pod: v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{
+				multiGPUContainer(2, 1024), multiGPUContainer(1, 512),
+			}}},
+			wantLimit: strconv.FormatInt((2*1024+512)*mib, 10),
+		},
+		{
+			// Init containers run before the others, so only the largest matters.
+			name: "init container takes the max",
+			pod: v1.Pod{Spec: v1.PodSpec{
+				InitContainers: []v1.Container{multiGPUContainer(4, 4096)},
+				Containers:     []v1.Container{multiGPUContainer(1, 1024)},
+			}},
+			wantLimit: strconv.FormatInt(4*4096*mib, 10),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := test.pod
+			InjectMemoryLimit(&pod)
+			if got := pod.Annotations[MemoryLimitAnnotation]; got != test.wantLimit {
+				t.Errorf("%s = %q, want %q", MemoryLimitAnnotation, got, test.wantLimit)
+			}
+		})
+	}
+}
+
+// A device count with no memory request means "the whole of each device" in
+// HAMi's model. Inventing a limit for it would contradict the scheduler, so
+// the pod is left to the node ceiling exactly as a single whole-GPU pod is.
+func TestInjectGPUMemoryLimitWholeDevicesAreUnlimited(t *testing.T) {
+	for _, devices := range []int64{1, 2, 8} {
+		pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(devices, 0)}}}
+		InjectMemoryLimit(&pod)
+		if got, ok := pod.Annotations[MemoryLimitAnnotation]; ok {
+			t.Errorf("%d whole devices: %s = %q, want no annotation", devices, MemoryLimitAnnotation, got)
+		}
+	}
+}
+
+// The weight is a share of each device the sandbox holds, not a budget spread
+// across them, so it must NOT be multiplied by the device count.
+func TestInjectWeightIgnoresDeviceCount(t *testing.T) {
+	pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(4, 1024)}}}
+	pod.Spec.Containers[0].Resources.Limits[CoresResourceName] = *resource.NewQuantity(30, resource.DecimalSI)
+	InjectWeight(&pod)
+	if got, want := pod.Annotations[WeightAnnotation], "30"; got != want {
+		t.Errorf("%s = %q, want %q (a weight is per device, not a total)", WeightAnnotation, got, want)
 	}
 }

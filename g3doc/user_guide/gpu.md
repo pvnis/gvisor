@@ -849,9 +849,48 @@ spec:
           nvidia.com/gpucores: 30    # share of the GPU, relative
 ```
 
-`nvidia.com/gpu: 1` asks for one of the plugin's slots rather than a whole
-device; HAMi advertises `deviceSplitCount` (10 by default) of them per GPU, and
-that is what allows several pods onto one device.
+`nvidia.com/gpu: 1` asks for **one whole device**, and `nvidia.com/gpumem` is
+the share of it this pod may use. HAMi advertises `deviceSplitCount` (10 by
+default) units of the resource per physical GPU, which is what lets ten pods
+each hold `nvidia.com/gpu: 1` on the same card — but the number a pod writes is
+a count of distinct GPUs, not of shares. Its scheduler compares it against the
+node's device list and refuses the node if it asks for more than the node has
+(`pkg/scheduler/score.go`: `if int(k.Nums) > len(node.Devices.DeviceLists)`).
+
+So `nvidia.com/gpu: 2` is two separate cards, and **the memory request is
+charged against each of them** — a pod asking for 2 devices and 2000 MiB is
+admitted 2000 MiB on both, and the sandbox's quota is the product. See
+[Several GPUs in one pod](#several-gpus-in-one-pod) below.
+
+### A fraction, a whole GPU, or several {#several-gpus-in-one-pod}
+
+The same three fields cover all three cases; what changes is which of them the
+pod states.
+
+| the pod wants | `nvidia.com/gpu` | `nvidia.com/gpumem` | `nvidia.com/gpucores` |
+| --- | --- | --- | --- |
+| a fraction of one GPU | `1` | the MiB it may use | its weight, 0-100 |
+| one whole GPU | `1` | omit | omit |
+| *n* whole GPUs | `n` | omit | omit |
+| *n* GPUs, a fraction of each | `n` | the MiB **per device** | its weight, 0-100 |
+
+**Omitting `gpumem` is what asks for the whole of each device.** The webhook
+writes no memory-limit annotation for a pod that requests none, so the sandbox
+runs at the node-wide ceiling in the runtime config — which is the whole device
+unless that config sets a limit of its own. It is deliberate that this is a
+silence rather than a keyword: a pod that states no quota is not one the
+scheduler agreed to bound.
+
+**The memory request is per device, and so is the weight.** A pod asking for
+4 devices and 2000 MiB is admitted 2000 MiB on *each*, so the sandbox's quota
+is 8000 MiB; the webhook computes that product. A weight is not multiplied —
+it is this sandbox's share of each device it holds, relative to the other
+sandboxes on that device.
+
+> **A multi-GPU pod is held to one window.** The sandbox has a single gate
+> covering every device it holds, so it is given the smallest window any of its
+> devices granted. A pod that holds one GPU to itself and shares another is
+> throttled on both. See [Nodes with several GPUs](#kubernetes).
 
 Without the webhook, state the two annotations directly:
 

@@ -53,6 +53,19 @@ const (
 	// particular share.
 	CoresResourceName = "nvidia.com/gpucores"
 
+	// CountResourceName is the extended resource by which a container asks for
+	// GPU *devices*, and it is a count of whole distinct GPUs rather than of
+	// shares of one. HAMi's scheduler compares it against the number of
+	// devices on the node -- `if int(k.Nums) > len(node.Devices.DeviceLists)`
+	// in pkg/scheduler/score.go -- and refuses the node if it asks for more,
+	// then allocates that many separate cards.
+	//
+	// It matters here because MemoryResourceName is charged against *each* of
+	// them: HAMi's Fit loop tests every candidate device against the same
+	// memreq and records it per device. A pod's GPU memory quota is therefore
+	// the product of the two, not the memory request alone.
+	CountResourceName = "nvidia.com/gpu"
+
 	// MemoryLimitAnnotation is the annotation runsc reads to limit the GPU
 	// memory a sandbox may allocate, in bytes. The value configured on the
 	// runtime is a ceiling that this may lower but not raise; a pod asking for
@@ -94,7 +107,7 @@ const (
 // is the pod's peak demand: containers run together and their requests add up,
 // while init containers run before them and only their largest matters.
 func InjectMemoryLimit(pod *v1.Pod) {
-	peak := peakRequest(pod, MemoryResourceName)
+	peak := peakDeviceMemory(pod)
 	if peak <= 0 {
 		// No container asked for GPU memory, so there is nothing to enforce.
 		// Adding a limit here would restrict a pod that never requested one.
@@ -104,7 +117,7 @@ func InjectMemoryLimit(pod *v1.Pod) {
 	// The resource counts mebibytes, and cannot express a total large enough to
 	// overflow this.
 	setAnnotation(pod, MemoryLimitAnnotation, narrow(pod, MemoryLimitAnnotation, peak*bytesPerMiB))
-	log.Debugf("Injected GPU memory limit of %d MiB from %q requests", peak, MemoryResourceName)
+	log.Debugf("Injected GPU memory limit of %d MiB from %q across %q devices", peak, MemoryResourceName, CountResourceName)
 }
 
 // InjectAMDMemoryLimit is InjectMemoryLimit for amdproxy.
@@ -208,6 +221,51 @@ func narrow(pod *v1.Pod, key string, computed int64) string {
 		return strconv.FormatInt(n, 10)
 	}
 	return strconv.FormatInt(computed, 10)
+}
+
+// peakDeviceMemory returns the most GPU memory a pod may hold at one time
+// across every device it was allocated, in mebibytes, or 0 if it asks for
+// none.
+//
+// This is peakRequest's shape -- containers run together so they add up, init
+// containers run before them so only the largest matters -- applied to the
+// *product* of each container's memory request and its device count, because
+// that is what HAMi admits. A pod asking for 2 devices and 4096 MiB was
+// granted 4096 MiB on each, and charging the sandbox 4096 in total would cap
+// it at half of what the scheduler already agreed to, so it would fail an
+// allocation the cluster believed it had room for.
+func peakDeviceMemory(pod *v1.Pod) int64 {
+	var concurrent int64
+	for i := range pod.Spec.Containers {
+		concurrent += containerDeviceMemory(&pod.Spec.Containers[i])
+	}
+	peak := concurrent
+	for i := range pod.Spec.InitContainers {
+		if v := containerDeviceMemory(&pod.Spec.InitContainers[i]); v > peak {
+			peak = v
+		}
+	}
+	return peak
+}
+
+// containerDeviceMemory is one container's GPU memory across all the devices
+// it asked for.
+//
+// A container that asks for memory without naming a device count still gets
+// one device, so it is charged once rather than not at all. A container that
+// asks for no memory is charged nothing however many devices it holds: that
+// combination means "the whole of each device" in HAMi's model, and inventing
+// a limit for it would silently contradict the scheduler.
+func containerDeviceMemory(c *v1.Container) int64 {
+	mem := containerRequest(c, MemoryResourceName)
+	if mem <= 0 {
+		return 0
+	}
+	devices := containerRequest(c, CountResourceName)
+	if devices < 1 {
+		devices = 1
+	}
+	return mem * devices
 }
 
 // peakRequest returns the most of a resource a pod needs at one time, in the
