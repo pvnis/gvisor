@@ -1165,22 +1165,69 @@ trusted control plane. No patching of either chart.
   `<ns>-sandbox-ssh` policy, but that rule's `from` selects the OpenShell
   *server* pod — not the platform namespace its own comment names. Both worth
   reporting upstream to midokura.
-- **Open: the agent's own gateway port is not reachable at the pod IP.**
-  `POST /sandboxes/{id}/chat/completions` returns 502 "Could not connect to
-  agent" although `openclaw-gateway` is running inside the sandbox and
-  `/proc/net/tcp` shows `00000000:4965` (0.0.0.0:18789) in state `0A` (LISTEN),
-  and the API dials that pod IP directly. A probe gets `exit=7` (refused) even
-  **from the same namespace**, and NetworkPolicy is ruled out: both the chart's
-  policy and a hand-written copy select `openshell.ai/managed-by=openshell`
-  while the pods carry only `agents.x-k8s.io/sandbox-name-hash`, so *neither
-  selects anything*. Other gVisor pods here (vLLM, the API, the UI) accept
-  inbound traffic normally. Leading hypothesis, **not confirmed**: the OpenShell
-  supervisor runs the agent in a nested network namespace
-  (`OPENSHELL_NETWORK_RUNTIME_CAPABILITIES`; an in-sandbox proxy is also
-  listening on 3128), so 0.0.0.0 there is not the pod's address, and
-  `kubectl exec` sees the listener because it lands in the same nested
-  namespace. `inference.local` not resolving inside a sandbox is likely the same
-  root.
+### Settled: an OpenShell sandbox exposes nothing at its pod IP, and that is not gVisor
+
+`POST /sandboxes/{id}/chat/completions` returns 502 "Could not connect to
+agent". The cause is architectural and had nothing to do with the sandbox
+runtime.
+
+**OpenShell runs the workload in a nested network namespace.** Inside one
+sandbox there are two:
+
+| pid | process | netns |
+| --- | --- | --- |
+| 1 | `openshell-sandbox` (the supervisor) | the **pod** netns, holds the pod IP |
+| 34 | the sandbox's main process | a **nested** netns |
+| 50 | `openclaw-gateway` | the **nested** netns |
+
+The nested side is `10.200.0.2/24`, joined by a veth whose other end
+(`10.200.0.1/24`) is in the pod netns. `openclaw-gateway` binds
+`0.0.0.0:18789` *there*, so it is not on the pod's address. Confirmed by
+connecting from each side: `127.0.0.1:18789` is **refused** in the pod netns and
+**open** in the nested one.
+
+**Nothing binds the pod IP at all.** Under runc, where `/proc` is properly
+scoped, the pod netns has exactly one listener — `0100C80A:0C38`, i.e.
+`10.200.0.1:3128`, the egress proxy, on the *veth* address. Probing the pod IP
+for 2222, 18789, 8080 and 3128 finds all four closed. Sandboxes are reached
+outbound (`OPENSHELL_ENDPOINT`) or over the server's own channel; inbound to a
+workload port is not part of the model. The chart's own
+`<ns>-sandbox-ssh` policy allowing 2222 is vestigial against this topology —
+nothing listens on 2222 either.
+
+**It is not gVisor.** A/B'd directly by setting the release's
+`server.defaultRuntimeClassName` to empty and creating the same sandbox on
+runc: identical two-namespace structure, and `pod_ip:18789` refused exactly the
+same way. Also not policy-induced — a sandbox created without `--policy` has the
+nested namespace too.
+
+So MidoClaw's assumption is the mismatch, on either runtime: its
+`gateway_readiness` dials a **`pod_ip`** and `reconcile.sh` opens 18789 in a
+NetworkPolicy, but OpenShell 0.0.116 in `combined` topology publishes no
+workload port to the pod. `inference.local` not resolving in a sandbox has the
+same root. Worth reporting to midokura as a version/topology mismatch, not a bug
+in either project alone.
+
+**One real gVisor bug came out of this, and it is what made the whole thing look
+like gVisor's fault: `/proc/net/tcp` is not network-namespace scoped.** Read from
+the pod netns, it listed the nested namespace's listener — both namespaces
+returned the identical pair `10.200.0.1:3128` and `0.0.0.0:18789`, same `sl` and
+inode — while a connect to `127.0.0.1:18789` in that namespace was refused. A
+listener the file shows and the stack denies.
+
+Reduced to a minimal reproducer with a runc control, `~/procnet-repro/repro.sh`:
+a listener bound inside a nested namespace appears in the root namespace's
+`/proc/net/tcp` on gVisor and does not under runc, while the connect is refused
+on both. No GPU, no proxy, no device involved. Recorded in
+`UPSTREAM-NOTES.md`.
+
+**Worth remembering as a measurement trap**, because it cost real time here and
+pointed the investigation at the wrong component: on gVisor, `/proc/net/tcp`
+does not tell you which namespace a socket is in — `connect()` to it instead.
+The first version of this write-up asserted the bug from the OpenShell
+observation alone, and the first attempt at a reproducer appeared to *disprove*
+it because the listener it was supposed to create never bound and that went
+unchecked. Verify the fixture before trusting a negative.
 
 ## Two fixes that belong upstream, not here
 
