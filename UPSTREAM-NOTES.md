@@ -271,6 +271,44 @@ stub process, so `mmap` of `/dev/kfd` returns `EINVAL` there.
 
 Only the KFD mapping is process-bound; the render node's is not.
 
+### `/proc/net/tcp` is not network-namespace scoped
+
+Nothing to do with GPUs or with either proxy; it affects any sandbox whose
+workload uses more than one network namespace. Found on 2026-09-28 while
+debugging an OpenShell agent sandbox, which runs its workload in a nested netns.
+
+A task reading `/proc/net/tcp` sees sockets from network namespaces other than
+its own. `~/procnet-repro/repro.sh` is a minimal reproducer — no GPU, no proxy,
+no device — that binds a listener inside a nested namespace and then reads the
+file and attempts a connect from the sandbox's root namespace:
+
+| runtime | root ns `/proc/net/tcp` | `connect(127.0.0.1:12345)` from root ns |
+| --- | --- | --- |
+| **gVisor** | `00000000:3039` — the nested namespace's socket | **REFUSED** |
+| runc | *empty* — correct | REFUSED |
+
+So on gVisor the file reports a listener that the stack in that namespace
+correctly refuses to connect to; the file and the stack disagree. runc scopes
+both reads properly, which is the control that makes this gVisor's `/proc`
+implementation rather than anything about the workload.
+
+It was first seen in the real case at a larger scale: inside an OpenShell agent
+sandbox, *both* namespaces returned the identical pair of listeners
+(`10.200.0.1:3128` and `0.0.0.0:18789`), the second belonging only to the nested
+namespace, with the same `sl` index and inode in each read.
+
+**Why it matters beyond fidelity:** it is an active measurement trap. It cost
+real time here, because a listener visible in `/proc/net/tcp` from the pod's
+namespace is the natural evidence that a port is reachable at the pod IP — and
+it was not. Anything diagnosing connectivity inside a gVisor sandbox should
+`connect()` rather than read `/proc/net/tcp`. It is also a small information
+leak: a process can enumerate sockets belonging to namespaces it is not in,
+which for a sandbox that deliberately isolates its workload's network is more
+than cosmetic.
+
+Not fixed on this branch. `/proc/net/*` should be filtered by the reading
+task's network namespace.
+
 ## Consequence: which platform to use for AMD
 
 The two mapping types a ROCm application needs fail on different platforms for
