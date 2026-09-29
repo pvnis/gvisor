@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -27,3 +27,10 @@ go_library(
     ],
 )
 
+
+go_test(
+    name = "injector_test",
+    size = "small",
+    srcs = ["certs_test.go"],
+    library = ":injector",
+)
