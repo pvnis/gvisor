@@ -86,7 +86,8 @@ fi
 
 echo "=== [4/6] insmod the corrected build ==="
 if [ "$TPC" != "0" ]; then
-    REG="GhostTpcCount=${TPC};GhostDisjoint=${DISJOINT}"
+    # GhostProbe=1: the partition probes are off unless asked for (driver b8550341).
+    REG="GhostProbe=1;GhostTpcCount=${TPC};GhostDisjoint=${DISJOINT}"
     echo "    spatial: NVreg_RegistryDwords=\"$REG\""
     sudo insmod "$SRC"/kernel-open/nvidia.ko NVreg_RegistryDwords="$REG"
 else
