@@ -177,8 +177,7 @@ fork:
 ```sh
 git clone git@github.com:pvnis/open-gpu-kernel-modules.git
 cd open-gpu-kernel-modules && git checkout gpuslicing
-# per-GPU spatial knob (TPCs = SMs / 2): RTX 5070 = 24, A6000 = 42, A100 = 54
-#   src/nvidia/src/kernel/gpu/fifo/kernel_ctxshare.c: #define GHOST_TOTAL_TPC <N>
+# No per-GPU edit is needed: the TPC count is read from the GPU at runtime.
 make modules -j$(nproc)
 sudo bash ../gvisor/ghost-experiment/reload.sh   # unload + insmod, restart k3s + the scheduler
 ```
