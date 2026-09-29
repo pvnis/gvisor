@@ -15,6 +15,7 @@
 package gpushare
 
 import (
+	"strconv"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -476,5 +477,88 @@ func TestStandDownHAMiKeepsExplicit(t *testing.T) {
 	env := pod.Spec.Containers[0].Env
 	if len(env) != 1 || env[0].Value != "false" {
 		t.Errorf("env = %+v, want the container's own value left alone", env)
+	}
+}
+
+// multiGPUContainer returns a container asking for gpus GPUs with mib MiB of
+// memory on each, as HAMi reads such a request.
+func multiGPUContainer(gpus, mib int64) v1.Container {
+	c := gpuContainer(mib)
+	c.Resources.Limits[GPUResourceName] = *resource.NewQuantity(gpus, resource.DecimalSI)
+	return c
+}
+
+// TestInjectGPUMemoryLimitMultiGPU tests that a request for memory on several
+// GPUs becomes a total of the request on each, bounded per device by the
+// request, and that a single-GPU pod gets no per-device limit.
+func TestInjectGPUMemoryLimitMultiGPU(t *testing.T) {
+	const mib = 1 << 20
+	for _, test := range []struct {
+		name          string
+		pod           v1.Pod
+		wantLimit     int64
+		wantPerDevice int64 // 0: absent
+	}{
+		{
+			name:          "two GPUs",
+			pod:           v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(2, 50000)}}},
+			wantLimit:     100000 * mib,
+			wantPerDevice: 50000 * mib,
+		},
+		{
+			name:      "one GPU counted explicitly",
+			pod:       v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(1, 50000)}}},
+			wantLimit: 50000 * mib,
+		},
+		{
+			// Two single-GPU containers may land on the same GPU, so the
+			// per-device figure is their sum, which equals the total.
+			name:      "two single-GPU containers",
+			pod:       v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{gpuContainer(1000), gpuContainer(2000)}}},
+			wantLimit: 3000 * mib,
+		},
+		{
+			name:          "multi-GPU beside single-GPU",
+			pod:           v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(4, 1000), gpuContainer(500)}}},
+			wantLimit:     4500 * mib,
+			wantPerDevice: 1500 * mib,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := test.pod
+			InjectMemoryLimit(&pod)
+			if got, want := pod.Annotations[MemoryLimitAnnotation], strconv.FormatInt(test.wantLimit, 10); got != want {
+				t.Errorf("%s = %q, want %q", MemoryLimitAnnotation, got, want)
+			}
+			got, ok := pod.Annotations[MemoryLimitPerDeviceAnnotation]
+			if test.wantPerDevice == 0 {
+				if ok {
+					t.Errorf("%s = %q, want absent", MemoryLimitPerDeviceAnnotation, got)
+				}
+				return
+			}
+			if want := strconv.FormatInt(test.wantPerDevice, 10); got != want {
+				t.Errorf("%s = %q, want %q", MemoryLimitPerDeviceAnnotation, got, want)
+			}
+		})
+	}
+}
+
+// TestInjectGPUMemoryLimitPerDeviceNarrowOnly tests that a pod may lower its
+// own per-device limit but not raise it.
+func TestInjectGPUMemoryLimitPerDeviceNarrowOnly(t *testing.T) {
+	const mib = 1 << 20
+	for _, test := range []struct {
+		annotated, want int64
+	}{
+		{annotated: 1000 * mib, want: 1000 * mib},
+		{annotated: 90000 * mib, want: 50000 * mib},
+	} {
+		pod := v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{multiGPUContainer(2, 50000)}}}
+		pod.Annotations = map[string]string{MemoryLimitPerDeviceAnnotation: strconv.FormatInt(test.annotated, 10)}
+		InjectMemoryLimit(&pod)
+		if got, want := pod.Annotations[MemoryLimitPerDeviceAnnotation], strconv.FormatInt(test.want, 10); got != want {
+			t.Errorf("annotated %d: got %q, want %q", test.annotated, got, want)
+		}
 	}
 }

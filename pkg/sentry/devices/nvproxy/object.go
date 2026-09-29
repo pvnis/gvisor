@@ -482,3 +482,71 @@ func (o *osDescMem) Release(ctx context.Context) func() {
 		}
 	}
 }
+
+// maxDeviceDepth bounds the walk from an object to its device. The driver's
+// hierarchy is client -> device -> subdevice -> objects, so a longer chain
+// means the handles are not what they appear to be.
+const maxDeviceDepth = 16
+
+// deviceOfLocked returns the GPU that object h of c belongs to, by walking its
+// parents to the NV01_DEVICE_0 it was allocated under and reading the device
+// instance that allocation named. This is the same field the driver places
+// the object by, and the value is the one nvproxy itself forwarded, so the
+// application cannot make the two disagree.
+//
+// It returns devUnattributed if the device cannot be determined, including
+// for a device that aliases another client's (HTargetClient), which the
+// accounting treats as possibly any GPU.
+//
+// Preconditions: c.objsMu must be locked.
+func (c *rootClient) deviceOfLocked(h nvgpu.Handle) devKey {
+	for i := 0; i < maxDeviceDepth && h.Val != nvgpu.NV01_NULL_OBJECT; i++ {
+		o := c.resources[h]
+		if o == nil {
+			return devUnattributed
+		}
+		if o.class != nvgpu.NV01_DEVICE_0 {
+			h = o.parent
+			continue
+		}
+		ra, ok := o.impl.(*rmAllocObject)
+		if !ok {
+			return devUnattributed
+		}
+		var p nvgpu.NV0080_ALLOC_PARAMETERS
+		if len(ra.params.allocParams) < p.SizeBytes() {
+			return devUnattributed
+		}
+		p.UnmarshalBytes(ra.params.allocParams)
+		if p.HTargetClient.Val != nvgpu.NV01_NULL_OBJECT || p.HTargetDevice.Val != nvgpu.NV01_NULL_OBJECT {
+			return devUnattributed
+		}
+		return devKey(p.DeviceID)
+	}
+	return devUnattributed
+}
+
+// vramDeviceLocked returns the device to charge an allocation of class under
+// parent h to. Attribution costs a walk of the object tree, so it is done
+// only for device memory, and only when a per-device limit needs it.
+//
+// Preconditions: c.objsMu must be locked.
+func (nvp *nvproxy) vramDeviceLocked(c *rootClient, class nvgpu.ClassID, h nvgpu.Handle) devKey {
+	if !nvp.memAcct.perDevice() || memKindOfClass(class) != memKindVRAM {
+		return devUnattributed
+	}
+	return c.deviceOfLocked(h)
+}
+
+// vramDevice is vramDeviceLocked for a client that is not locked.
+func (nvp *nvproxy) vramDevice(ctx context.Context, clientH nvgpu.Handle, class nvgpu.ClassID, h nvgpu.Handle) devKey {
+	if !nvp.memAcct.perDevice() || memKindOfClass(class) != memKindVRAM {
+		return devUnattributed
+	}
+	c, unlock := nvp.getClientWithLock(ctx, clientH)
+	if c == nil {
+		return devUnattributed
+	}
+	defer unlock()
+	return c.deviceOfLocked(h)
+}

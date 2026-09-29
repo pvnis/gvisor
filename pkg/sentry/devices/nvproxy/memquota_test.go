@@ -843,3 +843,136 @@ func TestMaxTimesliceUnsetIsUnrestricted(t *testing.T) {
 		t.Errorf("maxTimesliceUs = %d by default, want 0 (unrestricted)", nvp.maxTimesliceUs)
 	}
 }
+
+// addDevice records an NV01_DEVICE_0 for device instance id under handle h,
+// as rmAllocSimple does, so that deviceOfLocked can find it.
+func addDevice(nvp *nvproxy, client *rootClient, h nvgpu.Handle, params nvgpu.NV0080_ALLOC_PARAMETERS) {
+	ioctlParams := nvgpu.NVOS64_PARAMETERS{HRoot: client.handle, HObjectNew: h, HClass: nvgpu.NV01_DEVICE_0}
+	nvp.objAdd(context.Background(), client, h, nvgpu.NV01_DEVICE_0, newRmAllocObject(nil, &ioctlParams, nvgpu.RS_ACCESS_MASK{}, &params), handle(nvgpu.NV01_NULL_OBJECT))
+}
+
+// addMemOn is addMem for device memory attributed to the device of parent, as
+// the allocation paths attribute it.
+func addMemOn(t *testing.T, nvp *nvproxy, client *rootClient, h nvgpu.Handle, size uint64, parent nvgpu.Handle) bool {
+	t.Helper()
+	ctx := context.Background()
+	class := nvgpu.ClassID(nvgpu.NV01_MEMORY_LOCAL_USER)
+	charge, ok := nvp.memAcct.reserveForClassOn(ctx, class, size, nvp.vramDeviceLocked(client, class, parent))
+	if ok {
+		nvp.objAddMem(ctx, client, h, class, &miscObject{}, charge, parent)
+	}
+	return ok
+}
+
+// TestDeviceOfResolvesThroughParents tests that memory is attributed to the
+// device instance its NV01_DEVICE_0 was allocated for, through a subdevice.
+func TestDeviceOfResolvesThroughParents(t *testing.T) {
+	nvp := &nvproxy{}
+	client := newTestClient(nvp, 1)
+	addDevice(nvp, client, handle(0x100), nvgpu.NV0080_ALLOC_PARAMETERS{DeviceID: 3})
+	nvp.objAdd(context.Background(), client, handle(0x101), nvgpu.NV20_SUBDEVICE_0, &miscObject{}, handle(0x100))
+
+	for _, h := range []uint32{0x100, 0x101} {
+		if got := client.deviceOfLocked(handle(h)); got != 3 {
+			t.Errorf("deviceOfLocked(%#x) = %d, want 3", h, got)
+		}
+	}
+	if got := client.deviceOfLocked(handle(0x999)); got != devUnattributed {
+		t.Errorf("deviceOfLocked(unknown) = %d, want unattributed", got)
+	}
+
+	// A device aliasing another client's cannot be trusted to name its GPU.
+	addDevice(nvp, client, handle(0x200), nvgpu.NV0080_ALLOC_PARAMETERS{DeviceID: 1, HTargetClient: handle(7), HTargetDevice: handle(8)})
+	if got := client.deviceOfLocked(handle(0x200)); got != devUnattributed {
+		t.Errorf("deviceOfLocked(aliased device) = %d, want unattributed", got)
+	}
+}
+
+// TestPerDeviceLimit tests that a sandbox given a share of two GPUs can use
+// its whole share of each, but cannot put the total on one of them.
+func TestPerDeviceLimit(t *testing.T) {
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuLimit = 4096
+	nvp.memAcct.gpuDevLimit = 2048
+	client := newTestClient(nvp, 1)
+	addDevice(nvp, client, handle(0x100), nvgpu.NV0080_ALLOC_PARAMETERS{DeviceID: 0})
+	addDevice(nvp, client, handle(0x200), nvgpu.NV0080_ALLOC_PARAMETERS{DeviceID: 1})
+
+	if !addMemOn(t, nvp, client, handle(10), 2048, handle(0x100)) {
+		t.Fatalf("2048 on device 0 denied, want admitted")
+	}
+	if addMemOn(t, nvp, client, handle(11), 1, handle(0x100)) {
+		t.Errorf("1 more byte on device 0 admitted, want denied")
+	}
+	if !addMemOn(t, nvp, client, handle(12), 2048, handle(0x200)) {
+		t.Errorf("2048 on device 1 denied, want admitted")
+	}
+	checkUsage(t, nvp, 4096, 0)
+
+	// Freeing memory on one device restores that device's headroom only.
+	nvp.objFree(context.Background(), client, handle(10))
+	if !addMemOn(t, nvp, client, handle(13), 2048, handle(0x100)) {
+		t.Errorf("2048 on device 0 after free denied, want admitted")
+	}
+	if addMemOn(t, nvp, client, handle(14), 1, handle(0x200)) {
+		t.Errorf("1 more byte on full device 1 admitted, want denied")
+	}
+}
+
+// TestPerDeviceLimitUnattributedCountsEverywhere tests that device memory
+// whose GPU is unknown is counted against every GPU's limit, so that failing
+// to attribute an allocation can only restrict the sandbox.
+func TestPerDeviceLimitUnattributedCountsEverywhere(t *testing.T) {
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuDevLimit = 2048
+	client := newTestClient(nvp, 1)
+	addDevice(nvp, client, handle(0x100), nvgpu.NV0080_ALLOC_PARAMETERS{DeviceID: 0})
+	addDevice(nvp, client, handle(0x200), nvgpu.NV0080_ALLOC_PARAMETERS{DeviceID: 1})
+
+	// No parent: unattributed.
+	if !addMemOn(t, nvp, client, handle(10), 1024, handle(nvgpu.NV01_NULL_OBJECT)) {
+		t.Fatalf("unattributed 1024 denied, want admitted")
+	}
+	for _, dev := range []uint32{0x100, 0x200} {
+		if addMemOn(t, nvp, client, handle(20+dev), 1025, handle(dev)) {
+			t.Errorf("1025 on device %#x beside 1024 unattributed admitted, want denied", dev)
+		}
+	}
+	if !addMemOn(t, nvp, client, handle(11), 1024, handle(0x100)) {
+		t.Errorf("1024 on device 0 beside 1024 unattributed denied, want admitted")
+	}
+	// Another unattributed allocation must fit on the fullest device.
+	if addMemOn(t, nvp, client, handle(12), 1, handle(nvgpu.NV01_NULL_OBJECT)) {
+		t.Errorf("unattributed byte with device 0 full admitted, want denied")
+	}
+}
+
+// TestVirtualFBPerDevice tests that under a per-device limit each GPU reports
+// that limit as its size and its own remaining share as free.
+func TestVirtualFBPerDevice(t *testing.T) {
+	const gib = 1 << 30
+	nvp := &nvproxy{}
+	nvp.memAcct.gpuLimit = 4 * gib
+	nvp.memAcct.gpuDevLimit = 2 * gib
+	client := newTestClient(nvp, 1)
+	addDevice(nvp, client, handle(0x100), nvgpu.NV0080_ALLOC_PARAMETERS{DeviceID: 0})
+	addDevice(nvp, client, handle(0x200), nvgpu.NV0080_ALLOC_PARAMETERS{DeviceID: 1})
+	if !addMemOn(t, nvp, client, handle(10), gib+gib/2, handle(0x100)) {
+		t.Fatalf("allocation on device 0 denied")
+	}
+
+	for _, test := range []struct {
+		dev      devKey
+		wantFree uint64
+	}{
+		{dev: 0, wantFree: gib / 2},
+		{dev: 1, wantFree: 2 * gib},
+	} {
+		p := fbParams(12*gib, 11*gib)
+		fbInfoApplyQuotaOn(&nvp.memAcct, p, test.dev)
+		total, free := fbResult(p)
+		if total != 2*gib || free != test.wantFree {
+			t.Errorf("device %d: total, free = %d, %d; want %d, %d", test.dev, total, free, 2*gib, test.wantFree)
+		}
+	}
+}

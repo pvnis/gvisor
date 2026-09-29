@@ -450,7 +450,7 @@ func rmVidHeapControlAllocSize(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS32
 			classID = nvgpu.NV01_MEMORY_LOCAL_USER
 		}
 	}
-	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClass(fi.ctx, classID, allocSizeParams.Size)
+	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClassOn(fi.ctx, classID, allocSizeParams.Size, fi.fd.dev.nvp.vramDeviceLocked(client, classID, ioctlParams.HObjectParent))
 	if !ok {
 		unlock()
 		allocSizeParams.Address = origAddress

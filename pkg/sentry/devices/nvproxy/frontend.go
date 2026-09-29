@@ -654,7 +654,7 @@ func rmAllocMemorySystem(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 	if client == nil {
 		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_CLIENT)
 	}
-	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClass(fi.ctx, ioctlParams.Params.HClass, nvos02AllocSize(&ioctlParams.Params))
+	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClassOn(fi.ctx, ioctlParams.Params.HClass, nvos02AllocSize(&ioctlParams.Params), fi.fd.dev.nvp.vramDeviceLocked(client, ioctlParams.Params.HClass, ioctlParams.Params.HObjectParent))
 	if !ok {
 		unlock()
 		ioctlParams.FD = origFD
@@ -690,7 +690,7 @@ func rmAllocMemorySimple(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 	if client == nil {
 		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_CLIENT)
 	}
-	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClass(fi.ctx, ioctlParams.Params.HClass, nvos02AllocSize(&ioctlParams.Params))
+	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClassOn(fi.ctx, ioctlParams.Params.HClass, nvos02AllocSize(&ioctlParams.Params), fi.fd.dev.nvp.vramDeviceLocked(client, ioctlParams.Params.HClass, ioctlParams.Params.HObjectParent))
 	if !ok {
 		unlock()
 		ioctlParams.FD = origFD
@@ -1054,7 +1054,7 @@ func ctrlFBGetInfoV2[Params any, PtrParams hasFBInfoListPtr[Params]](fi *fronten
 		return n, err
 	}
 	if ioctlParams.Status == nvgpu.NV_OK {
-		fbInfoApplyQuota(&fi.fd.dev.nvp.memAcct, ctrlParams)
+		fbInfoApplyQuotaOn(&fi.fd.dev.nvp.memAcct, ctrlParams, fbInfoDevice(fi, ioctlParams))
 	}
 	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
 		return n, err
@@ -1062,9 +1062,30 @@ func ctrlFBGetInfoV2[Params any, PtrParams hasFBInfoListPtr[Params]](fi *fronten
 	return n, nil
 }
 
+// fbInfoDevice returns the GPU an NV2080_CTRL_CMD_FB_GET_INFO_V2 is asking
+// about: the one its subdevice was allocated under.
+func fbInfoDevice(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) devKey {
+	nvp := fi.fd.dev.nvp
+	if !nvp.memAcct.perDevice() {
+		return devUnattributed
+	}
+	c, unlock := nvp.getClientWithLock(fi.ctx, ioctlParams.HClient)
+	if c == nil {
+		return devUnattributed
+	}
+	defer unlock()
+	return c.deviceOfLocked(ioctlParams.HObject)
+}
+
 // fbInfoApplyQuota rewrites the framebuffer sizes in ctrlParams to reflect
 // acct's quota. It is a no-op if no quota is configured.
 func fbInfoApplyQuota(acct *memAccount, ctrlParams nvgpu.HasFBInfoList) {
+	fbInfoApplyQuotaOn(acct, ctrlParams, devUnattributed)
+}
+
+// fbInfoApplyQuotaOn is fbInfoApplyQuota for a control addressed to the given
+// device, which applies that device's share under a per-device limit.
+func fbInfoApplyQuotaOn(acct *memAccount, ctrlParams nvgpu.HasFBInfoList, dev devKey) {
 	entries := ctrlParams.FBInfoEntries()
 	size := ctrlParams.FBInfoCount()
 	if size > uint32(len(entries)) {
@@ -1107,7 +1128,7 @@ func fbInfoApplyQuota(acct *memAccount, ctrlParams nvgpu.HasFBInfoList) {
 	if free != nil {
 		realFree = uint64(free.Data) * fbInfoUnitBytes
 	}
-	virtTotal, virtFree := acct.virtualFB(realTotal, realFree)
+	virtTotal, virtFree := acct.virtualFBOn(realTotal, realFree, dev)
 	if total != nil {
 		total.Data = uint32(virtTotal / fbInfoUnitBytes)
 	}
@@ -1587,7 +1608,8 @@ func rmAllocSimpleParams[Params any, PtrParams marshalPtr[Params]](fi *frontendI
 	// Reserve the memory before forwarding the allocation, so that the limit
 	// is applied to the request rather than discovered after the driver has
 	// already satisfied it.
-	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClass(fi.ctx, ioctlParams.HClass, allocParamsSize(allocParams))
+	dev := fi.fd.dev.nvp.vramDevice(fi.ctx, ioctlParams.HRoot, ioctlParams.HClass, ioctlParams.HObjectParent)
+	charge, ok := fi.fd.dev.nvp.memAcct.reserveForClassOn(fi.ctx, ioctlParams.HClass, allocParamsSize(allocParams), dev)
 	if !ok {
 		return rmAllocFailWithStatus(fi, ioctlParams, isNVOS64, nvgpu.NV_ERR_NO_MEMORY)
 	}

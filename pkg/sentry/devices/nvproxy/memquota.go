@@ -229,6 +229,18 @@ func memKindOfClass(class nvgpu.ClassID) memKind {
 	return memClassKinds[class]
 }
 
+// devKey identifies the physical GPU that device memory was allocated on, for
+// the per-device limit. It is the device instance the application named when
+// it allocated its NV01_DEVICE_0 (NV0080_ALLOC_PARAMETERS.DeviceID), which is
+// what the driver itself places the memory by.
+type devKey int64
+
+// devUnattributed is the devKey of device memory whose GPU could not be
+// determined. It is charged against every device's limit at once, so that a
+// failure to attribute an allocation can only ever restrict the sandbox, never
+// let it exceed its share of some GPU.
+const devUnattributed devKey = -1
+
 // memCharge records memory charged to a sandbox's account.
 //
 // A single underlying driver allocation may be referred to by more than one
@@ -241,9 +253,10 @@ func memKindOfClass(class nvgpu.ClassID) memKind {
 //
 // +stateify savable
 type memCharge struct {
-	// kind and size are immutable.
+	// kind, size and dev are immutable.
 	kind memKind
 	size uint64
+	dev  devKey
 
 	// refs is the number of objects aliasing this charge. When refs reaches
 	// zero the charge is released from the account.
@@ -283,6 +296,23 @@ type memAccount struct {
 	// limit. gpuLimit is immutable after Register().
 	gpuLimit uint64
 
+	// gpuDevLimit is the maximum number of bytes of device memory that may be
+	// charged to this sandbox on any one GPU. Zero means no limit. It is
+	// immutable after Register().
+	//
+	// gpuLimit alone cannot express a multi-GPU share: a pod placed with
+	// 50 GB on each of two GPUs needs 100 GB in total but must not put all
+	// 100 GB on one of them, where only 50 GB was set aside for it and the
+	// rest may belong to another tenant. Unified memory is not attributable
+	// to a GPU when reserved, so it counts against gpuLimit only.
+	gpuDevLimit uint64
+
+	// devVRAM is the device memory charged on each GPU, and unattributedVRAM
+	// the device memory whose GPU is unknown. Both are maintained only while
+	// gpuDevLimit is set; without it every charge is unattributed.
+	devVRAM          map[devKey]uint64
+	unattributedVRAM uint64
+
 	// warnedDenied records that reaching the limit has already been reported.
 	warnedDenied bool
 }
@@ -315,8 +345,28 @@ func warnDenied(ctx context.Context, kind memKind, size, used, limit uint64) {
 
 // Preconditions: a.mu must be locked.
 func (a *memAccount) addLocked(kind memKind, delta uint64) uint64 {
+	return a.addOnLocked(kind, delta, devUnattributed)
+}
+
+// addOnLocked is addLocked for memory on the given device. delta may be the
+// two's complement of a size, to release it.
+//
+// Preconditions: a.mu must be locked.
+func (a *memAccount) addOnLocked(kind memKind, delta uint64, dev devKey) uint64 {
 	switch kind {
 	case memKindVRAM:
+		if dev == devUnattributed {
+			a.unattributedVRAM += delta
+		} else {
+			if a.devVRAM == nil {
+				a.devVRAM = make(map[devKey]uint64)
+			}
+			if v := a.devVRAM[dev] + delta; v == 0 {
+				delete(a.devVRAM, dev)
+			} else {
+				a.devVRAM[dev] = v
+			}
+		}
 		a.vram += delta
 		return a.vram
 	case memKindPinnedHost:
@@ -334,13 +384,49 @@ func (a *memAccount) addLocked(kind memKind, delta uint64) uint64 {
 //
 // Preconditions: a.mu must be locked.
 func (a *memAccount) admitLocked(kind memKind, size uint64) bool {
-	if a.gpuLimit == 0 || !kind.countsAgainstGPULimit() {
+	return a.admitOnLocked(kind, size, devUnattributed)
+}
+
+// admitOnLocked is admitLocked for memory on the given device, additionally
+// applying the per-device limit to device memory.
+//
+// Preconditions: a.mu must be locked.
+func (a *memAccount) admitOnLocked(kind memKind, size uint64, dev devKey) bool {
+	if !kind.countsAgainstGPULimit() {
 		return true
 	}
 	// Written so that a size chosen by the application cannot overflow the
 	// comparison and be wrongly admitted.
-	used := a.vram + a.uvmVA
-	return size <= a.gpuLimit && used <= a.gpuLimit-size
+	if a.gpuLimit != 0 {
+		used := a.vram + a.uvmVA
+		if size > a.gpuLimit || used > a.gpuLimit-size {
+			return false
+		}
+	}
+	if a.gpuDevLimit != 0 && kind == memKindVRAM {
+		used := a.devUsedLocked(dev)
+		if size > a.gpuDevLimit || used > a.gpuDevLimit-size {
+			return false
+		}
+	}
+	return true
+}
+
+// devUsedLocked returns the device memory to count against dev's per-device
+// limit: what is charged on dev, plus everything unattributed, which might be
+// on any GPU. For devUnattributed itself that is the worst case over every
+// GPU, since an unattributed allocation must fit on whichever it landed on.
+//
+// Preconditions: a.mu must be locked.
+func (a *memAccount) devUsedLocked(dev devKey) uint64 {
+	if dev != devUnattributed {
+		return a.devVRAM[dev] + a.unattributedVRAM
+	}
+	var most uint64
+	for _, v := range a.devVRAM {
+		most = max(most, v)
+	}
+	return most + a.unattributedVRAM
 }
 
 // reserve charges size bytes of the given kind against a, unless doing so
@@ -354,11 +440,20 @@ func (a *memAccount) admitLocked(kind memKind, size uint64) bool {
 // headroom. If the driver then fails the allocation, the caller must return
 // the charge with release().
 func (a *memAccount) reserve(ctx context.Context, kind memKind, size uint64) (*memCharge, bool) {
+	return a.reserveOn(ctx, kind, size, devUnattributed)
+}
+
+// reserveOn is reserve() for memory allocated on the given device.
+func (a *memAccount) reserveOn(ctx context.Context, kind memKind, size uint64, dev devKey) (*memCharge, bool) {
 	if size == 0 || kind == memKindNone {
 		return nil, true
 	}
+	if kind != memKindVRAM {
+		// Only device memory is placed on a particular GPU.
+		dev = devUnattributed
+	}
 	a.mu.Lock()
-	if !a.admitLocked(kind, size) {
+	if !a.admitOnLocked(kind, size, dev) {
 		used, limit := a.vram+a.uvmVA, a.gpuLimit
 		first := a.noteDenialLocked()
 		a.mu.Unlock()
@@ -369,14 +464,15 @@ func (a *memAccount) reserve(ctx context.Context, kind memKind, size uint64) (*m
 		}
 		return nil, false
 	}
-	total := a.addLocked(kind, size)
+	total := a.addOnLocked(kind, size, dev)
 	a.mu.Unlock()
 	if ctx.IsLogging(log.Debug) {
-		ctx.Debugf("nvproxy: charged %d bytes of %s memory, total %d", size, kind, total)
+		ctx.Debugf("nvproxy: charged %d bytes of %s memory on device %d, total %d", size, kind, dev, total)
 	}
 	return &memCharge{
 		kind: kind,
 		size: size,
+		dev:  dev,
 		refs: atomicbitops.FromInt64(1),
 	}, true
 }
@@ -384,6 +480,17 @@ func (a *memAccount) reserve(ctx context.Context, kind memKind, size uint64) (*m
 // reserveForClass is reserve() for an allocation of the given class.
 func (a *memAccount) reserveForClass(ctx context.Context, class nvgpu.ClassID, size uint64) (*memCharge, bool) {
 	return a.reserve(ctx, memKindOfClass(class), size)
+}
+
+// reserveForClassOn is reserveOn() for an allocation of the given class.
+func (a *memAccount) reserveForClassOn(ctx context.Context, class nvgpu.ClassID, size uint64, dev devKey) (*memCharge, bool) {
+	return a.reserveOn(ctx, memKindOfClass(class), size, dev)
+}
+
+// perDevice returns true if device memory must be attributed to a GPU, which
+// is only the case when a per-device limit is set.
+func (a *memAccount) perDevice() bool {
+	return a.gpuDevLimit != 0
 }
 
 // release drops a reference on c, releasing its charge from a if it was the
@@ -401,7 +508,7 @@ func (a *memAccount) release(ctx context.Context, c *memCharge) {
 		return
 	}
 	a.mu.Lock()
-	total := a.addLocked(c.kind, ^(c.size - 1))
+	total := a.addOnLocked(c.kind, ^(c.size - 1), c.dev)
 	a.mu.Unlock()
 	if ctx.IsLogging(log.Debug) {
 		ctx.Debugf("nvproxy: released %d bytes of %s memory, total %d", c.size, c.kind, total)
@@ -487,26 +594,47 @@ const fbInfoUnitBytes = 1024
 // size, so that every size the sandbox can ask about agrees.
 func (a *memAccount) virtualFBSize(real uint64) uint64 {
 	a.mu.Lock()
-	limit := a.gpuLimit
+	limit, devLimit := a.gpuLimit, a.gpuDevLimit
 	a.mu.Unlock()
-	if limit == 0 {
-		return real
+	if limit != 0 {
+		real = min(real, limit)
 	}
-	return min(real, limit)
+	if devLimit != 0 {
+		real = min(real, devLimit)
+	}
+	return real
 }
 
 func (a *memAccount) virtualFB(realTotal, realFree uint64) (total, free uint64) {
+	return a.virtualFBOn(realTotal, realFree, devUnattributed)
+}
+
+// virtualFBOn is virtualFB for the given device. With a per-device limit, a
+// GPU reports that limit as its size and its own remaining share as free,
+// rather than the whole sandbox's: otherwise each of a pod's GPUs claims the
+// headroom of all of them, and an allocation sized by it fails.
+func (a *memAccount) virtualFBOn(realTotal, realFree uint64, dev devKey) (total, free uint64) {
 	a.mu.Lock()
-	limit := a.gpuLimit
+	limit, devLimit := a.gpuLimit, a.gpuDevLimit
 	used := a.vram + a.uvmVA
+	devUsed := a.devUsedLocked(dev)
 	a.mu.Unlock()
-	if limit == 0 {
-		return realTotal, realFree
+	total, free = realTotal, realFree
+	if limit != 0 {
+		total = min(total, limit)
+		var headroom uint64
+		if used < limit {
+			headroom = limit - used
+		}
+		free = min(free, headroom)
 	}
-	total = min(realTotal, limit)
-	var headroom uint64
-	if used < limit {
-		headroom = limit - used
+	if devLimit != 0 {
+		total = min(total, devLimit)
+		var headroom uint64
+		if devUsed < devLimit {
+			headroom = devLimit - devUsed
+		}
+		free = min(free, headroom)
 	}
-	return total, min(realFree, headroom)
+	return total, free
 }

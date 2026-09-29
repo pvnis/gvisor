@@ -59,6 +59,18 @@ const (
 	// more than the runtime allows will fail to start.
 	MemoryLimitAnnotation = "dev.gvisor.flag.nvproxy-gpu-memory-limit"
 
+	// MemoryLimitPerDeviceAnnotation is the annotation runsc reads to limit the
+	// GPU memory a sandbox may allocate on any one GPU, in bytes. It is
+	// written only for a pod given a share of more than one GPU, where
+	// MemoryLimitAnnotation bounds just the total. It is subject to the same
+	// ceiling.
+	MemoryLimitPerDeviceAnnotation = "dev.gvisor.flag.nvproxy-gpu-memory-limit-per-device"
+
+	// GPUResourceName is the extended resource by which a container requests
+	// a number of GPUs; with MemoryResourceName, HAMi gives it that much
+	// memory on each of them.
+	GPUResourceName = "nvidia.com/gpu"
+
 	// WeightAnnotation is the annotation runsc reads to decide a sandbox's
 	// share of a GPU relative to the others scheduled alongside it. It is
 	// subject to the same ceiling as MemoryLimitAnnotation.
@@ -93,9 +105,18 @@ const (
 // The limit applies to the sandbox rather than to individual containers, so it
 // is the pod's peak demand: containers run together and their requests add up,
 // while init containers run before them and only their largest matters.
+//
+// HAMi's memory request is per GPU: a container asking for two GPUs and
+// 50000 MiB is placed with 50000 MiB on each. The sandbox's total is therefore
+// the request times the number of GPUs, and for such a pod a per-device limit
+// of the request is set as well, without which the sandbox could put the whole
+// total on one GPU -- past what HAMi set aside for it there, and into memory it
+// may have given another tenant.
 func InjectMemoryLimit(pod *v1.Pod) {
-	peak := peakRequest(pod, MemoryResourceName)
-	if peak <= 0 {
+	total := peakRequestFunc(pod, func(c *v1.Container) int64 {
+		return containerRequest(c, MemoryResourceName) * gpuCount(c)
+	})
+	if total <= 0 {
 		// No container asked for GPU memory, so there is nothing to enforce.
 		// Adding a limit here would restrict a pod that never requested one.
 		return
@@ -103,8 +124,27 @@ func InjectMemoryLimit(pod *v1.Pod) {
 
 	// The resource counts mebibytes, and cannot express a total large enough to
 	// overflow this.
-	setAnnotation(pod, MemoryLimitAnnotation, narrow(pod, MemoryLimitAnnotation, peak*bytesPerMiB))
-	log.Debugf("Injected GPU memory limit of %d MiB from %q requests", peak, MemoryResourceName)
+	setAnnotation(pod, MemoryLimitAnnotation, narrow(pod, MemoryLimitAnnotation, total*bytesPerMiB))
+	log.Debugf("Injected GPU memory limit of %d MiB from %q requests", total, MemoryResourceName)
+
+	// Containers of a pod may be placed on the same GPU, so the most one GPU
+	// may need to hold is what they ask for per GPU, added up. That is no more
+	// than the total, and equal to it for a pod whose every container asks for
+	// one GPU, which is why those need no second limit.
+	perDevice := peakRequest(pod, MemoryResourceName)
+	if perDevice < total {
+		setAnnotation(pod, MemoryLimitPerDeviceAnnotation, narrow(pod, MemoryLimitPerDeviceAnnotation, perDevice*bytesPerMiB))
+		log.Debugf("Injected GPU memory limit of %d MiB per device", perDevice)
+	}
+}
+
+// gpuCount returns the number of GPUs a container asks for. HAMi places a
+// container that asks for GPU memory but no count on one GPU.
+func gpuCount(c *v1.Container) int64 {
+	if n := containerRequest(c, GPUResourceName); n > 1 {
+		return n
+	}
+	return 1
 }
 
 // InjectAMDMemoryLimit is InjectMemoryLimit for amdproxy.
@@ -213,13 +253,19 @@ func narrow(pod *v1.Pod, key string, computed int64) string {
 // peakRequest returns the most of a resource a pod needs at one time, in the
 // resource's own units, or 0 if it requests none.
 func peakRequest(pod *v1.Pod, name v1.ResourceName) int64 {
+	return peakRequestFunc(pod, func(c *v1.Container) int64 { return containerRequest(c, name) })
+}
+
+// peakRequestFunc is peakRequest for a demand computed from each container by
+// request.
+func peakRequestFunc(pod *v1.Pod, request func(*v1.Container) int64) int64 {
 	var concurrent int64
 	for i := range pod.Spec.Containers {
-		concurrent += containerRequest(&pod.Spec.Containers[i], name)
+		concurrent += request(&pod.Spec.Containers[i])
 	}
 	peak := concurrent
 	for i := range pod.Spec.InitContainers {
-		if v := containerRequest(&pod.Spec.InitContainers[i], name); v > peak {
+		if v := request(&pod.Spec.InitContainers[i]); v > peak {
 			peak = v
 		}
 	}

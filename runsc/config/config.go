@@ -378,6 +378,11 @@ type Config struct {
 	// the sandbox may allocate. Zero means no limit.
 	NVProxyGPUMemoryLimit uint64 `flag:"nvproxy-gpu-memory-limit"`
 
+	// NVProxyGPUMemoryLimitPerDevice is the maximum number of bytes of device
+	// memory that the sandbox may allocate on any one GPU. Zero means no
+	// limit.
+	NVProxyGPUMemoryLimitPerDevice uint64 `flag:"nvproxy-gpu-memory-limit-per-device"`
+
 	// NVProxyMaxTimesliceUs is the longest GPU scheduler timeslice, in
 	// microseconds, that the sandbox may request for its channel groups. Zero
 	// means no limit.
