@@ -15,8 +15,10 @@
 package gpusched
 
 import (
+	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -117,12 +119,18 @@ func TestEnforceWeightChangeReissued(t *testing.T) {
 // fakeEnforcer records calls, to test runlistEnforcer wiring.
 type fakeEnforcer struct{ calls []string }
 
-func (f *fakeEnforcer) SetTimeslice(pid int, us uint64) error {
+func (f *fakeEnforcer) SetTimeslice(pid int, gpu string, us uint64) error {
 	f.calls = append(f.calls, "ts")
 	return nil
 }
-func (f *fakeEnforcer) Detach(pid int) error { f.calls = append(f.calls, "detach"); return nil }
-func (f *fakeEnforcer) Attach(pid int) error { f.calls = append(f.calls, "attach"); return nil }
+func (f *fakeEnforcer) Detach(pid int, gpu string) error {
+	f.calls = append(f.calls, "detach")
+	return nil
+}
+func (f *fakeEnforcer) Attach(pid int, gpu string) error {
+	f.calls = append(f.calls, "attach")
+	return nil
+}
 
 func TestRunlistEnforcerAppliesAndRemembers(t *testing.T) {
 	f := &fakeEnforcer{}
@@ -191,3 +199,181 @@ func TestPollActiveParsesDriverLines(t *testing.T) {
 
 func osWriteFile(p string, b []byte) error { return os.WriteFile(p, b, 0644) }
 func osReadFile(p string) ([]byte, error)  { return os.ReadFile(p) }
+
+// gpuFakeEnforcer records each command with the GPU it was addressed to.
+type gpuFakeEnforcer struct{ calls []string }
+
+func (f *gpuFakeEnforcer) record(op string, pid int, gpu string) error {
+	f.calls = append(f.calls, fmt.Sprintf("%s %d %s", op, pid, gpu))
+	return nil
+}
+func (f *gpuFakeEnforcer) SetTimeslice(pid int, gpu string, us uint64) error {
+	return f.record("ts", pid, gpu)
+}
+func (f *gpuFakeEnforcer) Detach(pid int, gpu string) error { return f.record("detach", pid, gpu) }
+func (f *gpuFakeEnforcer) Attach(pid int, gpu string) error { return f.record("attach", pid, gpu) }
+
+// detachesOf returns the detach commands f recorded for pid, as "gpu" strings.
+func (f *gpuFakeEnforcer) detachesOf(pid int) []string {
+	var out []string
+	prefix := fmt.Sprintf("detach %d ", pid)
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, prefix) {
+			out = append(out, strings.TrimPrefix(c, prefix))
+		}
+	}
+	return out
+}
+
+func TestPollActiveByGPUParsesDeviceLines(t *testing.T) {
+	p := t.TempDir() + "/gpusched"
+	report := "pid 100 active 1 tsgs 9\n" +
+		"pid 200 active 0 tsgs 2\n" +
+		"dev 0000:05:00.0 pid 100 active 1 tsgs 7\n" +
+		"dev 0000:06:00.0 pid 100 active 0 tsgs 2\n" +
+		"dev 0000:06:00.0 pid 200 active 0 tsgs 2\n" +
+		"dev notabus pid 300 active 1 tsgs 1\n"
+	if err := os.WriteFile(p, []byte(report), 0644); err != nil {
+		t.Fatal(err)
+	}
+	byPID, byGPU, err := (&ProcfsEnforcer{Path: p}).PollActiveByGPU()
+	if err != nil {
+		t.Fatalf("PollActiveByGPU: %v", err)
+	}
+	if got := byPID[100]; !got.Active || got.TSGs != 9 {
+		t.Errorf("pid 100 = %+v, want active with 9 TSGs", got)
+	}
+	if got := byGPU["0000:05:00.0"][100]; !got.Active || got.TSGs != 7 {
+		t.Errorf("pid 100 on 05:00.0 = %+v, want active with 7 TSGs", got)
+	}
+	if got := byGPU["0000:06:00.0"][100]; got.Active || got.TSGs != 2 {
+		t.Errorf("pid 100 on 06:00.0 = %+v, want idle with 2 TSGs", got)
+	}
+	if len(byGPU) != 2 {
+		t.Errorf("GPUs = %v, want the two valid bus IDs only", byGPU)
+	}
+	// A per-GPU line must not be mistaken for a per-pid one.
+	if _, ok := byPID[300]; ok {
+		t.Errorf("per-GPU line leaked into per-pid report: %v", byPID)
+	}
+}
+
+func TestProcfsEnforcerAddressesGPU(t *testing.T) {
+	p := t.TempDir() + "/gpusched"
+	e := &ProcfsEnforcer{Path: p}
+	for _, test := range []struct {
+		do   func() error
+		want string
+	}{
+		{func() error { return e.Detach(42, "0000:05:00.0") }, "detach 42 0000:05:00.0"},
+		{func() error { return e.Attach(42, AllGPUs) }, "attach 42"},
+		{func() error { return e.SetTimeslice(42, "0000:06:00.0", 4000) }, "ts 42 4000 0000:06:00.0"},
+	} {
+		if err := os.WriteFile(p, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := test.do(); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := os.ReadFile(p); string(got) != test.want {
+			t.Errorf("wrote %q, want %q", got, test.want)
+		}
+	}
+}
+
+// crossGPUClients is a weight-25 tenant alone on GPU A beside a 75/25 pair on
+// GPU B, every tenant busy with one channel group.
+func crossGPUClients() (loneA []EnforceClient, pairB []EnforceClient) {
+	return []EnforceClient{{PID: 10, Weight: 25, TSGs: 1}},
+		[]EnforceClient{{PID: 20, Weight: 75, TSGs: 1}, {PID: 30, Weight: 25, TSGs: 1}}
+}
+
+// TestRunlistEnforcerDividesGPUsSeparately tests that a tenant alone on its GPU
+// is never taken off the runlist because of tenants on another GPU, and that
+// the division on the contended GPU is addressed to that GPU.
+func TestRunlistEnforcerDividesGPUsSeparately(t *testing.T) {
+	const gpuA, gpuB = "0000:05:00.0", "0000:06:00.0"
+	f := &gpuFakeEnforcer{}
+	r := newRunlistEnforcer(f)
+	loneA, pairB := crossGPUClients()
+	for i := 0; i < 200; i++ {
+		r.applyByGPU(map[string][]EnforceClient{gpuA: loneA, gpuB: pairB})
+	}
+	if d := f.detachesOf(10); len(d) != 0 {
+		t.Errorf("lone tenant on %s detached %d times (on %v), want never", gpuA, len(d), d)
+	}
+	d := f.detachesOf(30)
+	if len(d) == 0 {
+		t.Fatalf("weight-25 tenant sharing %s never detached; the division is not being enforced", gpuB)
+	}
+	for _, gpu := range d {
+		if gpu != gpuB {
+			t.Errorf("tenant on %s detached on %q", gpuB, gpu)
+		}
+	}
+
+	// The same tenants in one undivided planner -- what the scheduler did
+	// before GPUs were enforced separately -- detach the lone tenant. This is
+	// the defect the per-GPU planners fix.
+	f = &gpuFakeEnforcer{}
+	r = newRunlistEnforcer(f)
+	for i := 0; i < 200; i++ {
+		r.apply(append(append([]EnforceClient(nil), loneA...), pairB...))
+	}
+	if len(f.detachesOf(10)) == 0 {
+		t.Errorf("undivided planner no longer detaches the lone tenant; this test no longer shows the defect")
+	}
+}
+
+// TestRunlistEnforcerMultiGPUSandbox tests that a sandbox holding two GPUs,
+// one of them shared, is detached only on the shared one.
+func TestRunlistEnforcerMultiGPUSandbox(t *testing.T) {
+	const gpuA, gpuB = "0000:05:00.0", "0000:06:00.0"
+	f := &gpuFakeEnforcer{}
+	r := newRunlistEnforcer(f)
+	for i := 0; i < 200; i++ {
+		r.applyByGPU(map[string][]EnforceClient{
+			gpuA: {{PID: 10, Weight: 25, TSGs: 1}},
+			gpuB: {{PID: 10, Weight: 25, TSGs: 1}, {PID: 20, Weight: 75, TSGs: 1}},
+		})
+	}
+	d := f.detachesOf(10)
+	if len(d) == 0 {
+		t.Fatalf("sandbox never detached on shared %s; the division is not being enforced", gpuB)
+	}
+	for _, gpu := range d {
+		if gpu != gpuB {
+			t.Errorf("sandbox detached on %q, want only on shared %s", gpu, gpuB)
+		}
+	}
+}
+
+// TestEnforceClientsPerGPU tests that a sandbox on two GPUs becomes a client
+// of each, idle on the one it has stopped using, and that without per-GPU
+// reports it is enforced across all of them as before.
+func TestEnforceClientsPerGPU(t *testing.T) {
+	s := &Server{table: parseDeviceQuery("0, GPU-a, 00000000:05:00.0\n1, GPU-b, 00000000:06:00.0\n")}
+	sc := &serverConn{weight: 50, devices: []DeviceID{0, 1}}
+	byGPU := map[string]map[int]TenantState{
+		"0000:05:00.0": {7: {Active: true, TSGs: 3}},
+		"0000:06:00.0": {7: {Active: false, TSGs: 1}},
+	}
+	var enforce map[string][]EnforceClient
+	for i := 0; i < idleTicksBeforeYielding; i++ {
+		enforce = make(map[string][]EnforceClient)
+		s.enforceClientsLocked(enforce, sc, 7, false, 4, byGPU)
+	}
+	want := map[string][]EnforceClient{
+		"0000:05:00.0": {{PID: 7, Weight: 50, Idle: false, TSGs: 3}},
+		"0000:06:00.0": {{PID: 7, Weight: 50, Idle: true, TSGs: 1}},
+	}
+	if !reflect.DeepEqual(enforce, want) {
+		t.Errorf("per-GPU clients = %+v, want %+v", enforce, want)
+	}
+
+	enforce = make(map[string][]EnforceClient)
+	s.enforceClientsLocked(enforce, sc, 7, false, 4, nil)
+	if want := map[string][]EnforceClient{AllGPUs: {{PID: 7, Weight: 50, TSGs: 4}}}; !reflect.DeepEqual(enforce, want) {
+		t.Errorf("without per-GPU reports = %+v, want %+v", enforce, want)
+	}
+}

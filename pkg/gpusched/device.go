@@ -63,6 +63,18 @@ type DeviceTable struct {
 	// count is how many devices were found, which is what decides whether
 	// scheduling them apart is worth anything.
 	count int
+	// bus is each device's PCI bus ID, normalized, which is how the driver's
+	// runlist control names a GPU.
+	bus map[DeviceID]string
+}
+
+// BusID returns the normalized PCI bus ID of d, or AllGPUs if it is not known,
+// in which case a runlist command for d can only be addressed to every GPU.
+func (t *DeviceTable) BusID(d DeviceID) string {
+	if t == nil {
+		return AllGPUs
+	}
+	return t.bus[d]
 }
 
 // Devices returns the number of GPUs the table describes.
@@ -162,7 +174,7 @@ func NewDeviceTable() (*DeviceTable, error) {
 //
 //	0, GPU-0b7a7424-d911-bb25-850c-6feddbc332d1, 00000000:55:00.0
 func parseDeviceQuery(out string) *DeviceTable {
-	t := &DeviceTable{byName: make(map[string]DeviceID)}
+	t := &DeviceTable{byName: make(map[string]DeviceID), bus: make(map[DeviceID]string)}
 	sc := bufio.NewScanner(strings.NewReader(out))
 	for sc.Scan() {
 		f := strings.Split(sc.Text(), ",")
@@ -180,6 +192,7 @@ func parseDeviceQuery(out string) *DeviceTable {
 		t.add(strings.TrimSpace(f[1]), d)
 		if bus := normalizeBusID(f[2]); bus != "" {
 			t.add(bus, d)
+			t.bus[d] = bus
 		}
 		if index+1 > t.count {
 			t.count = index + 1

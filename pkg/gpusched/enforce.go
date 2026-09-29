@@ -38,17 +38,27 @@ import (
 // friends at kernel level), so it lives here in the host-side scheduler, never
 // in a sandbox -- the same reason the scheduler itself runs outside every
 // sandbox.
+//
+// Every command names the GPU it applies to by PCI bus ID, as the device table
+// records it, or AllGPUs for every GPU the process holds channel groups on.
+// Each GPU is divided separately, so a sandbox that has overdrawn its share of
+// one GPU is detached there and nowhere else.
 type Enforcer interface {
 	// SetTimeslice sets the runlist timeslice for every channel group owned by
-	// the process, in microseconds. Shares between co-resident sandboxes are
-	// divided in proportion to their timeslices.
-	SetTimeslice(pid int, us uint64) error
-	// Detach removes the process's channel groups from the hardware runlist,
-	// preempting whatever it is running. Its share goes to the others.
-	Detach(pid int) error
+	// the process on gpu, in microseconds. Shares between co-resident
+	// sandboxes are divided in proportion to their timeslices.
+	SetTimeslice(pid int, gpu string, us uint64) error
+	// Detach removes the process's channel groups on gpu from the hardware
+	// runlist, preempting whatever it is running. Its share goes to the others.
+	Detach(pid int, gpu string) error
 	// Attach re-inserts them.
-	Attach(pid int) error
+	Attach(pid int, gpu string) error
 }
+
+// AllGPUs is the gpu argument that applies an Enforcer command to every GPU,
+// which is all a driver without per-GPU control, or a host whose GPUs could
+// not be enumerated, can express.
+const AllGPUs = ""
 
 // ProcfsEnforcer drives the ghost runlist control at /proc/driver/nvidia/gpusched.
 type ProcfsEnforcer struct {
@@ -74,16 +84,29 @@ func (e *ProcfsEnforcer) write(cmd string) error {
 	return err
 }
 
+// withGPU appends the GPU a command is addressed to, if it names one. The
+// driver reads a trailing PCI bus ID as "this GPU only".
+func withGPU(cmd, gpu string) string {
+	if gpu == AllGPUs {
+		return cmd
+	}
+	return cmd + " " + gpu
+}
+
 // SetTimeslice implements Enforcer.
-func (e *ProcfsEnforcer) SetTimeslice(pid int, us uint64) error {
-	return e.write(fmt.Sprintf("ts %d %d", pid, us))
+func (e *ProcfsEnforcer) SetTimeslice(pid int, gpu string, us uint64) error {
+	return e.write(withGPU(fmt.Sprintf("ts %d %d", pid, us), gpu))
 }
 
 // Detach implements Enforcer.
-func (e *ProcfsEnforcer) Detach(pid int) error { return e.write(fmt.Sprintf("detach %d", pid)) }
+func (e *ProcfsEnforcer) Detach(pid int, gpu string) error {
+	return e.write(withGPU(fmt.Sprintf("detach %d", pid), gpu))
+}
 
 // Attach implements Enforcer.
-func (e *ProcfsEnforcer) Attach(pid int) error { return e.write(fmt.Sprintf("attach %d", pid)) }
+func (e *ProcfsEnforcer) Attach(pid int, gpu string) error {
+	return e.write(withGPU(fmt.Sprintf("attach %d", pid), gpu))
+}
 
 // An ActivityPoller reports, per host pid, whether the sandbox is currently
 // submitting work to the GPU. It is the trusted alternative to nvidia-smi: the
@@ -92,6 +115,15 @@ func (e *ProcfsEnforcer) Attach(pid int) error { return e.write(fmt.Sprintf("att
 // by the sandbox (unlike an in-container kernel counter).
 type ActivityPoller interface {
 	PollActive() (map[int]TenantState, error)
+}
+
+// A DeviceActivityPoller also reports each tenant's state on each GPU, keyed
+// by the GPU's PCI bus ID and then by host pid. A sandbox busy on one of its
+// GPUs is not contending for the others, and its group count on a GPU is what
+// it takes of that GPU. byGPU is empty if the driver reports only per pid.
+type DeviceActivityPoller interface {
+	ActivityPoller
+	PollActiveByGPU() (byPID map[int]TenantState, byGPU map[string]map[int]TenantState, err error)
 }
 
 // TenantState is what the driver reports about one tenant.
@@ -108,44 +140,78 @@ type TenantState struct {
 // issued on the *previous* call, since the driver refreshes asynchronously --
 // one tick of lag, which the scheduler's idle hysteresis already tolerates.
 func (e *ProcfsEnforcer) PollActive() (map[int]TenantState, error) {
+	byPID, _, err := e.PollActiveByGPU()
+	return byPID, err
+}
+
+// PollActiveByGPU implements DeviceActivityPoller. It is PollActive, also
+// returning the per-GPU lines a driver with per-GPU control reports.
+func (e *ProcfsEnforcer) PollActiveByGPU() (map[int]TenantState, map[string]map[int]TenantState, error) {
 	p := e.Path
 	if p == "" {
 		p = DefaultRunlistControlPath
 	}
 	// Read the current snapshot first, then ask for a refresh for next time.
-	out := map[int]TenantState{}
+	byPID := map[int]TenantState{}
+	byGPU := map[string]map[int]TenantState{}
 	f, err := os.Open(p)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		// line: "pid <p> active <0|1> [tsgs <n>]". The trailing count is
-		// accepted but not required, so a scheduler built against a driver that
+		fields := strings.Fields(sc.Text())
+		// "dev <DDDD:BB:SS.F> pid <p> active <0|1> tsgs <n>" is the same
+		// report for one GPU. The bus ID is normalized as the device table
+		// normalizes nvidia-smi's, so the two can be compared as strings.
+		gpu := ""
+		if len(fields) >= 2 && fields[0] == "dev" {
+			if gpu = normalizeBusID(fields[1]); gpu == "" {
+				continue
+			}
+			fields = fields[2:]
+		}
+		// "pid <p> active <0|1> [tsgs <n>]". The trailing count is accepted
+		// but not required, so a scheduler built against a driver that
 		// predates it still parses (it then charges every tenant alike, which
 		// is the V4 behaviour -- degraded, not broken).
-		fields := strings.Fields(sc.Text())
-		if len(fields) < 4 || fields[0] != "pid" || fields[2] != "active" {
+		pid, ts, ok := parseTenantLine(fields)
+		if !ok {
 			continue
 		}
-		pid, err1 := strconv.Atoi(fields[1])
-		act, err2 := strconv.Atoi(fields[3])
-		if err1 != nil || err2 != nil {
+		if gpu == "" {
+			byPID[pid] = ts
 			continue
 		}
-		ts := TenantState{Active: act != 0}
-		if len(fields) >= 6 && fields[4] == "tsgs" {
-			if n, err := strconv.Atoi(fields[5]); err == nil {
-				ts.TSGs = n
-			}
+		if byGPU[gpu] == nil {
+			byGPU[gpu] = map[int]TenantState{}
 		}
-		out[pid] = ts
+		byGPU[gpu][pid] = ts
 	}
 	f.Close()
 	if err := e.write("poll"); err != nil {
-		return out, err
+		return byPID, byGPU, err
 	}
-	return out, nil
+	return byPID, byGPU, nil
+}
+
+// parseTenantLine parses "pid <p> active <0|1> [tsgs <n>]".
+func parseTenantLine(fields []string) (int, TenantState, bool) {
+	if len(fields) < 4 || fields[0] != "pid" || fields[2] != "active" {
+		return 0, TenantState{}, false
+	}
+	pid, err1 := strconv.Atoi(fields[1])
+	act, err2 := strconv.Atoi(fields[3])
+	if err1 != nil || err2 != nil {
+		return 0, TenantState{}, false
+	}
+	ts := TenantState{Active: act != 0}
+	if len(fields) >= 6 && fields[4] == "tsgs" {
+		if n, err := strconv.Atoi(fields[5]); err == nil {
+			ts.TSGs = n
+		}
+	}
+	return pid, ts, true
 }
 
 // Timeslice bounds. The ratio between sandboxes is what sets their shares; the
@@ -254,16 +320,28 @@ type pidState struct {
 // runlistEnforcer applies enforcePlan through an Enforcer, remembering what it
 // applied so it only issues commands on change.
 type runlistEnforcer struct {
-	e      Enforcer
-	prev   map[int]pidState
-	ticks  int
-	credit *creditPlanner
+	e     Enforcer
+	prev  map[int]pidState
+	ticks int
+	// credit divides each GPU, keyed by its bus ID (AllGPUs when GPUs cannot
+	// be told apart). A planner is created the first time a GPU has clients,
+	// and dropped when it has none, so a GPU coming back starts afresh.
+	//
+	// One planner per GPU is the point. A single planner across the node made
+	// every sandbox compete with every other for one pool of credit: a tenant
+	// alone on its GPU was charged against tenants on other GPUs, overdrew, and
+	// was detached from a GPU nobody else was using (measured: 894 TFLOPS
+	// instead of ~1340 for a weight-25 pod alone on a B300).
+	credit map[string]*creditPlanner
+	// creditOff disables the credit planner, leaving enforcePlan's
+	// proportional timeslices; tests of that path set it.
+	creditOff bool
 	// periodUs is the tick length the credit accounting advances by.
 	periodUs float64
 }
 
 func newRunlistEnforcer(e Enforcer) *runlistEnforcer {
-	return &runlistEnforcer{e: e, prev: map[int]pidState{}, credit: newCreditPlanner(defaultCreditParams())}
+	return &runlistEnforcer{e: e, prev: map[int]pidState{}, credit: map[string]*creditPlanner{}}
 }
 
 // reassertEveryTicks is how often the enforcer re-issues every timeslice even
@@ -280,8 +358,15 @@ func newRunlistEnforcer(e Enforcer) *runlistEnforcer {
 // period this is roughly every two seconds.
 const reassertEveryTicks = 20
 
-// apply issues the commands for the given clients and records the new state.
+// apply issues the commands for the given clients, all on one undivided set of
+// GPUs, and records the new state.
 func (r *runlistEnforcer) apply(clients []EnforceClient) {
+	r.applyByGPU(map[string][]EnforceClient{AllGPUs: clients})
+}
+
+// applyByGPU is apply for clients grouped by the GPU they are on. A sandbox
+// holding several GPUs appears under each, with its state on that GPU.
+func (r *runlistEnforcer) applyByGPU(byGPU map[string][]EnforceClient) {
 	r.ticks++
 
 	// Credit-based division (SECURITY-FINDINGS.md V4). Weight sets how fast a
@@ -289,34 +374,42 @@ func (r *runlistEnforcer) apply(clients []EnforceClient) {
 	// share actually consumed is charged back. This is what makes packing
 	// pointless -- a tenant's extra channel groups draw on the same account --
 	// and it avoids the 42% aggregate cost of dividing the quantum instead.
-	if r.credit != nil {
+	if !r.creditOff {
 		p := r.periodUs
 		if p <= 0 {
 			p = float64(DefaultPeriod.Microseconds())
 		}
-		if r.ticks%reassertEveryTicks == 0 {
-			r.credit.forgetWritten()
-		}
-		cmds := r.credit.plan(clients, p)
-		if len(cmds) > 0 {
-			log.Infof("gpusched: credit enforce: %d clients %+v -> %d commands %+v", len(clients), clients, len(cmds), cmds)
-		}
-		for _, c := range cmds {
-			var err error
-			switch c.op {
-			case "detach":
-				err = r.e.Detach(c.pid)
-			case "attach":
-				err = r.e.Attach(c.pid)
-			case "ts":
-				err = r.e.SetTimeslice(c.pid, c.us)
+		for gpu := range r.credit {
+			if len(byGPU[gpu]) == 0 {
+				delete(r.credit, gpu)
 			}
-			if err != nil {
-				log.Warningf("gpusched: runlist %s pid=%d: %v", c.op, c.pid, err)
+		}
+		gpus := make([]string, 0, len(byGPU))
+		for gpu, clients := range byGPU {
+			if len(clients) > 0 {
+				gpus = append(gpus, gpu)
 			}
+		}
+		sort.Strings(gpus)
+		for _, gpu := range gpus {
+			clients := byGPU[gpu]
+			planner, ok := r.credit[gpu]
+			if !ok {
+				planner = newCreditPlanner(defaultCreditParams())
+				r.credit[gpu] = planner
+			}
+			if r.ticks%reassertEveryTicks == 0 {
+				planner.forgetWritten()
+			}
+			cmds := planner.plan(clients, p)
+			if len(cmds) > 0 {
+				log.Infof("gpusched: credit enforce on GPU %q: %d clients %+v -> %d commands %+v", gpu, len(clients), clients, len(cmds), cmds)
+			}
+			r.issue(gpu, cmds)
 		}
 		return
 	}
+	clients := byGPU[AllGPUs]
 
 	// Genuine changes since the last tick -- a client joining or leaving, or a
 	// weight change -- are what is logged, so a steady division is quiet.
@@ -334,19 +427,24 @@ func (r *runlistEnforcer) apply(clients []EnforceClient) {
 	if r.ticks%reassertEveryTicks == 0 {
 		toWrite, _ = enforcePlan(clients, nil)
 	}
-	for _, c := range toWrite {
+	r.issue(AllGPUs, toWrite)
+	r.prev = next
+}
+
+// issue writes cmds to the driver, addressed to gpu.
+func (r *runlistEnforcer) issue(gpu string, cmds []enforceCmd) {
+	for _, c := range cmds {
 		var err error
 		switch c.op {
 		case "detach":
-			err = r.e.Detach(c.pid)
+			err = r.e.Detach(c.pid, gpu)
 		case "attach":
-			err = r.e.Attach(c.pid)
+			err = r.e.Attach(c.pid, gpu)
 		case "ts":
-			err = r.e.SetTimeslice(c.pid, c.us)
+			err = r.e.SetTimeslice(c.pid, gpu, c.us)
 		}
 		if err != nil {
-			log.Warningf("gpusched: runlist %s pid=%d: %v", c.op, c.pid, err)
+			log.Warningf("gpusched: runlist %s pid=%d gpu=%q: %v", c.op, c.pid, gpu, err)
 		}
 	}
-	r.prev = next
 }

@@ -157,6 +157,11 @@ type serverConn struct {
 	// what it used.
 	pid int
 
+	// gpuIdleTicks is idleTicks for each GPU the driver reports on
+	// separately, so that a sandbox busy on one of its GPUs does not count as
+	// contending for another it has left idle.
+	gpuIdleTicks map[DeviceID]int
+
 	// idleTicks counts consecutive periods in which the sandbox reported
 	// nothing. It is what keeps a sandbox from being judged idle by a single
 	// period: a sandbox reports once per period on a clock of its own, so
@@ -361,6 +366,54 @@ func (s *Server) tickLoop() {
 	}
 }
 
+// enforceClientsLocked adds sc to the runlist clients of each GPU it is on.
+//
+// Each GPU is divided on its own, as the windows above are: a sandbox is a
+// client of each GPU it holds, with its activity and channel-group count on
+// that GPU. When GPUs cannot be told apart -- the device table is missing, the
+// sandbox's devices are unknown, or the driver reports only per pid -- it is
+// a client of AllGPUs with its whole-sandbox state instead, and the commands
+// then act on all of its GPUs together, as they always did.
+//
+// Preconditions: s.mu must be locked.
+func (s *Server) enforceClientsLocked(enforce map[string][]EnforceClient, sc *serverConn, pid int, idle bool, tsgs int, byGPU map[string]map[int]TenantState) {
+	whole := EnforceClient{PID: pid, Weight: sc.weight, Idle: idle, TSGs: tsgs}
+	if byGPU == nil || s.table == nil {
+		enforce[AllGPUs] = append(enforce[AllGPUs], whole)
+		return
+	}
+	var gpus []string
+	for _, d := range sc.devices {
+		bus := s.table.BusID(d)
+		if bus == AllGPUs {
+			enforce[AllGPUs] = append(enforce[AllGPUs], whole)
+			return
+		}
+		gpus = append(gpus, bus)
+	}
+	if sc.gpuIdleTicks == nil {
+		sc.gpuIdleTicks = make(map[DeviceID]int)
+	}
+	for i, d := range sc.devices {
+		st, reported := byGPU[gpus[i]][pid]
+		// A GPU the sandbox has no channel groups on yet reads as idle there;
+		// it joins that GPU's division once it starts using it. Hysteresis
+		// as for the whole sandbox, so a cuBLAS tenant that drains its GPFIFO
+		// between kernels is not taken for idle on one sample.
+		if reported && st.Active {
+			sc.gpuIdleTicks[d] = 0
+		} else {
+			sc.gpuIdleTicks[d]++
+		}
+		enforce[gpus[i]] = append(enforce[gpus[i]], EnforceClient{
+			PID:    pid,
+			Weight: sc.weight,
+			Idle:   sc.gpuIdleTicks[d] >= idleTicksBeforeYielding,
+			TSGs:   st.TSGs,
+		})
+	}
+}
+
 // Tick computes and distributes the windows for one period.
 //
 // It is exported so that the scheduling can be driven directly in tests rather
@@ -371,14 +424,29 @@ func (s *Server) Tick() {
 	// nvidia-smi below when present.
 	var driverActive map[int]bool
 	var driverTSGs map[int]int
+	// driverByGPU is the same snapshot per GPU, keyed by bus ID, from a driver
+	// that reports it; nil otherwise, and every GPU is then enforced as one.
+	var driverByGPU map[string]map[int]TenantState
 	if s.activity != nil {
-		if a, err := s.activity.PollActive(); err == nil {
+		var a map[int]TenantState
+		var err error
+		if dp, ok := s.activity.(DeviceActivityPoller); ok {
+			a, driverByGPU, err = dp.PollActiveByGPU()
+		} else {
+			a, err = s.activity.PollActive()
+		}
+		if err == nil {
 			driverActive = make(map[int]bool, len(a))
 			driverTSGs = make(map[int]int, len(a))
 			for pid, st := range a {
 				driverActive[pid] = st.Active
 				driverTSGs[pid] = st.TSGs
 			}
+		} else {
+			driverByGPU = nil
+		}
+		if len(driverByGPU) == 0 {
+			driverByGPU = nil
 		}
 	}
 
@@ -517,7 +585,7 @@ func (s *Server) Tick() {
 	// weight, and one idle past the threshold is detached so its time is
 	// reclaimed. A sandbox whose pid is not yet known is skipped -- it will be
 	// picked up once runsc announces it.
-	var enforce []EnforceClient
+	enforce := make(map[string][]EnforceClient)
 	if s.enforcer != nil {
 		for id, sc := range s.conns {
 			pid := sc.pid
@@ -535,14 +603,14 @@ func (s *Server) Tick() {
 				continue
 			}
 			delete(s.warnedNoPID, id)
-			enforce = append(enforce, EnforceClient{PID: pid, Weight: sc.weight, Idle: idle[id], TSGs: driverTSGs[pid]})
+			s.enforceClientsLocked(enforce, sc, pid, idle[id], driverTSGs[pid], driverByGPU)
 		}
 	}
 	enforcer := s.enforcer
 	s.mu.Unlock()
 
 	if enforcer != nil {
-		enforcer.apply(enforce)
+		enforcer.applyByGPU(enforce)
 	}
 
 	// Send outside the lock: a sandbox that has stopped reading must not hold
