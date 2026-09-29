@@ -297,17 +297,53 @@ sandbox, *both* namespaces returned the identical pair of listeners
 (`10.200.0.1:3128` and `0.0.0.0:18789`), the second belonging only to the nested
 namespace, with the same `sl` index and inode in each read.
 
-**Why it matters beyond fidelity:** it is an active measurement trap. It cost
-real time here, because a listener visible in `/proc/net/tcp` from the pod's
-namespace is the natural evidence that a port is reachable at the pod IP — and
-it was not. Anything diagnosing connectivity inside a gVisor sandbox should
-`connect()` rather than read `/proc/net/tcp`. It is also a small information
-leak: a process can enumerate sockets belonging to namespaces it is not in,
-which for a sandbox that deliberately isolates its workload's network is more
-than cosmetic.
+**How far it extends, measured.** `/proc/net/tcp`, `/proc/net/udp`,
+`/proc/net/tcp6` and `/proc/net/unix` all leak across the namespace boundary,
+including **abstract AF_UNIX socket names**, which Linux also scopes per network
+namespace. `/proc/net/dev` does *not* — interface lists are correctly scoped.
 
-Not fixed on this branch. `/proc/net/*` should be filtered by the reading
-task's network namespace.
+**How far it does not extend.** Two bounds that keep this narrow, both measured
+rather than assumed:
+
+- **It does not cross a sandbox.** A second gVisor pod sees nothing of the
+  first's sockets — `grep -c` returns 0 for both a TCP listener and an abstract
+  UNIX name bound in the other pod. Each sandbox has its own Sentry and its own
+  netstack, so the leak is confined to namespaces *within* one sandbox. There is
+  no cross-tenant disclosure.
+- **It does not reach the host.** The host's `:6443`, `:10250` and `:22` do not
+  appear in a sandbox's `/proc/net/tcp`.
+
+**It is disclosure only; the enforcement boundary holds.** From a nested
+namespace, `connect()` to the root namespace's TCP listener *and* to its abstract
+UNIX socket are both `ECONNREFUSED`, while both are visible in the corresponding
+`/proc/net` file. So a process can enumerate sockets it cannot reach.
+
+**Security reading.** A real weakness, and a narrow one: cross-network-namespace
+information disclosure inside a single sandbox. Not an escape, not cross-tenant,
+grants no connectivity. It only bites when one sandbox holds more than one
+network namespace *and* those namespaces are in different trust domains — which
+is unusual, but is exactly the OpenShell / agent-sandbox pattern that put
+untrusted agent code in its own netns to isolate its network. What an attacker
+there gains is reconnaissance: the ports the supervisor listens on, the 4-tuples
+of its live connections (so the address of the control plane it dials and of the
+egress proxy), the uid owning each socket, and abstract UNIX names — which are
+often the whole of the access control for an IPC endpoint, so knowing the name is
+step one even while `connect()` is refused.
+
+The reason to fix it anyway is that the listing and the enforcement *disagree*,
+which says the netns plumbing is not applied uniformly — that is a reason to
+expect the same gap in other `/proc/net` paths, and it quietly gives an
+application less than the boundary it deliberately asked for, which is the one
+thing gVisor exists to provide.
+
+**Its practical cost so far has been to mislead debugging, not to enable an
+attack** — a listener visible in `/proc/net/tcp` from the pod's namespace is the
+natural evidence that a port is reachable there, and it was not. Anything
+diagnosing connectivity inside a gVisor sandbox should `connect()` rather than
+read `/proc/net/*`.
+
+Not fixed on this branch. `/proc/net/*` should be filtered by the reading task's
+network namespace.
 
 ## Consequence: which platform to use for AMD
 
