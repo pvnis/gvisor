@@ -170,15 +170,46 @@ func Collect(sysRoot string, uverbs []UverbsSpec) (*Snapshot, error) {
 		s.Devices = append(s.Devices, d)
 	}
 
+	if _, err := s.collectGPUsAndNUMA(sysRoot, pciPaths); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// CollectGPUs builds a snapshot of the host's GPU PCI topology alone -- the
+// GPU functions, every bridge and root complex above them, and the NUMA node
+// topology -- for a sandbox that has GPUs but no RDMA devices. It returns nil
+// if the host has no GPUs.
+//
+// NVML builds a GPU's PCIe placement (the PIX/PXB/PHB/NODE/SYS entries of
+// `nvidia-smi topo -m`) by walking this tree, and without any of it gives up
+// on the topology matrix entirely. The exposure is the same read-only PCI
+// metadata Collect already includes for GPUs beside RDMA NICs.
+func CollectGPUs(sysRoot string) (*Snapshot, error) {
+	s := &Snapshot{}
+	n, err := s.collectGPUsAndNUMA(sysRoot, make(map[string]bool))
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	return s, nil
+}
+
+// collectGPUsAndNUMA adds the host's GPU leaves and their ancestors to
+// pciPaths, materializes every PCI node in pciPaths into s, and collects the
+// NUMA topology. It returns the number of GPUs found.
+func (s *Snapshot) collectGPUsAndNUMA(sysRoot string, pciPaths map[string]bool) (int, error) {
 	// GPU/accelerator leaves by PCI class scan; fold each into the PCI
 	// closure so its ancestors are materialized alongside the NIC leaves.
 	gpus, err := gpuLeaves(sysRoot)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	for _, g := range gpus {
 		if err := addWithAncestors(pciPaths, g); err != nil {
-			return nil, err
+			return 0, err
 		}
 	}
 
@@ -186,7 +217,7 @@ func Collect(sysRoot string, uverbs []UverbsSpec) (*Snapshot, error) {
 	for p := range pciPaths {
 		attrs, err := readAttrs(path.Join(sysRoot, p), pciAttrNames)
 		if err != nil {
-			return nil, fmt.Errorf("PCI node %q: %w", p, err)
+			return 0, fmt.Errorf("PCI node %q: %w", p, err)
 		}
 		s.PCINodes = append(s.PCINodes, PCINode{Path: p, Attrs: attrs})
 	}
@@ -194,10 +225,10 @@ func Collect(sysRoot string, uverbs []UverbsSpec) (*Snapshot, error) {
 
 	numa, err := collectNUMA(sysRoot)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	s.NUMA = numa
-	return s, nil
+	return len(gpus), nil
 }
 
 // addWithAncestors records leaf and every ancestor directory whose name is

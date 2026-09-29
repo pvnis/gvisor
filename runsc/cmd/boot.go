@@ -594,6 +594,15 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		if rdmaSnap, err = rdma.Load(rdma.Path); err != nil {
 			util.Fatalf("loading RDMA sysfs snapshot: %v", err)
 		}
+	} else if specutils.NVProxyEnabled(spec, conf) {
+		// The GPU-only snapshot (rdma.CollectGPUs) is absent on a host with
+		// no GPU PCI functions to describe, and the sandbox then simply has
+		// no PCI tree, as before.
+		if _, err := os.Stat(rdma.Path); err == nil {
+			if rdmaSnap, err = rdma.Load(rdma.Path); err != nil {
+				util.Fatalf("loading GPU sysfs snapshot: %v", err)
+			}
+		}
 	}
 
 	var amdSnap *amdsysfs.Snapshot

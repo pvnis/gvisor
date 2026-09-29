@@ -276,10 +276,18 @@ func tpuProxyUpdateChroot(hostRoot, chroot string, spec *specs.Spec, conf *confi
 // support here). GID tables and port state therefore stay readable through
 // those mounts.
 func rdmaSysfsUpdateChroot(chroot string, spec *specs.Spec, conf *config.Config) error {
-	if !specutils.RDMAEnabled(spec, conf) {
+	var snap *rdma.Snapshot
+	var err error
+	switch {
+	case specutils.RDMAEnabled(spec, conf):
+		snap, err = rdma.Collect("/sys", specutils.UverbsDevicesInSpec(spec))
+	case specutils.NVProxyEnabled(spec, conf):
+		// No RDMA devices, but the GPUs' PCI placement is still wanted: NVML
+		// cannot report GPU topology without it. See rdma.CollectGPUs.
+		snap, err = rdma.CollectGPUs("/sys")
+	default:
 		return nil
 	}
-	snap, err := rdma.Collect("/sys", specutils.UverbsDevicesInSpec(spec))
 	if err != nil {
 		return fmt.Errorf("collecting RDMA sysfs snapshot: %w", err)
 	}

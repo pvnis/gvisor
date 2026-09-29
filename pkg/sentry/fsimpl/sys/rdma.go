@@ -220,12 +220,17 @@ func (fs *filesystem) newRDMASysfs(ctx context.Context, creds *auth.Credentials,
 		out.devices[name] = fs.buildRDMADir(ctx, creds, sub)
 	}
 
-	out.class["infiniband"] = fs.newDir(ctx, creds, defaultSysDirMode, fs.symlinkFarm(ctx, creds, classIB))
-	uverbsEntries := fs.symlinkFarm(ctx, creds, classUverbs)
-	if snap.VerbsABIVersion != "" {
-		uverbsEntries["abi_version"] = fs.newStaticFile(ctx, creds, defaultSysMode, snap.VerbsABIVersion)
+	// A GPU-only snapshot (rdma.CollectGPUs) has no RDMA devices, and gets no
+	// InfiniBand classes: an empty one would tell libibverbs there is an RDMA
+	// stack to probe.
+	if len(snap.Devices) > 0 {
+		out.class["infiniband"] = fs.newDir(ctx, creds, defaultSysDirMode, fs.symlinkFarm(ctx, creds, classIB))
+		uverbsEntries := fs.symlinkFarm(ctx, creds, classUverbs)
+		if snap.VerbsABIVersion != "" {
+			uverbsEntries["abi_version"] = fs.newStaticFile(ctx, creds, defaultSysMode, snap.VerbsABIVersion)
+		}
+		out.class["infiniband_verbs"] = fs.newDir(ctx, creds, defaultSysDirMode, uverbsEntries)
 	}
-	out.class["infiniband_verbs"] = fs.newDir(ctx, creds, defaultSysDirMode, uverbsEntries)
 	if len(classNet) > 0 {
 		out.class["net"] = fs.newDir(ctx, creds, defaultSysDirMode, fs.symlinkFarm(ctx, creds, classNet))
 	}
