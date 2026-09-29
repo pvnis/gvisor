@@ -985,6 +985,28 @@ A window covering the whole period on a contended GPU means the sandbox is not
 being scheduled; one that changes as other pods come and go means it is. The
 `phase` is what keeps two sandboxes from being given the same 40ms.
 
+> **Unless the scheduler runs with `--runlist-control`, where this check
+> inverts.** When the runlist enforcer is driving the division, the compute gate
+> is deliberately stood down: every sandbox is sent a *full-period* window at
+> phase 0, so that the gate never revokes a submission mapping and the driver
+> never reads the sandbox idle. The window is then constant, the Sentry logs it
+> at most once, and `grep "GPU window is now"` finds **nothing at all** — on a
+> healthy node. Reading that as "not being scheduled" is backwards.
+>
+> Verify the runlist path at the driver instead. It reports one line per
+> registered tenant, naming the Sentry's host pid and how many channel groups
+> it holds:
+>
+> ```
+> sudo sh -c 'echo poll > /proc/driver/nvidia/gpusched; cat /proc/driver/nvidia/gpusched'
+> pid 1805222 active 0 tsgs 3
+> ```
+>
+> Match the pid against the sandbox with `pgrep -f <sandbox-id>`. A sandbox that
+> appears there is registered and is being divided by credit; `active` is the
+> driver's idle signal at that instant and is expected to be 0 for a tenant that
+> is not submitting.
+
 The memory limit shows up in the pod's own view of the device: `nvidia-smi`
 inside the pod reports the figure it asked for rather than the hardware's.
 
