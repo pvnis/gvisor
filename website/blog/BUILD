@@ -182,22 +182,12 @@ doc(
 
 doc(
     name = "gpu_slicing",
-    src = "2026-08-07-gpu-slicing.md",
+    src = "2026-09-22-slicing-a-gpu-between-untrusted-containers.md",
     authors = [
         "dmd",
     ],
     layout = "post",
-    permalink = "/blog/2026/08/07/slicing-a-gpu-between-untrusted-containers/",
-)
-
-doc(
-    name = "gpu_compute_isolation",
-    src = "2026-08-19-gpu-compute-isolation.md",
-    authors = [
-        "dmd",
-    ],
-    layout = "post",
-    permalink = "/blog/2026/08/19/making-the-gpu-enforce-its-own-compute-shares/",
+    permalink = "/blog/2026/09/22/slicing-a-gpu-between-untrusted-containers/",
 )
 
 docs(
