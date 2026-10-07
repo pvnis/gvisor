@@ -1109,7 +1109,9 @@ per-user sandboxes run LLM-authored code), both in the tenant namespace
 `tenant-nv-a`.
 
 Neither repository was modified. Everything below is values files and
-NetworkPolicies, kept in `~/pc-build/`.
+NetworkPolicies, now committed under `third-party-stack/` in this repo (they
+were `~/pc-build/` on vm-nv-dmd1, which has been destroyed). Its README is the
+order to bring the stack up again, including the one step that must come first.
 
 **The model server is a gVisor sandbox holding a Sentry-enforced slice**, set by
 one line in the chart's own hook (`vllm.runtimeClassName: gvisor`) plus
@@ -1215,7 +1217,7 @@ returned the identical pair `10.200.0.1:3128` and `0.0.0.0:18789`, same `sl` and
 inode — while a connect to `127.0.0.1:18789` in that namespace was refused. A
 listener the file shows and the stack denies.
 
-Reduced to a minimal reproducer with a runc control, `~/procnet-repro/repro.sh`:
+Reduced to a minimal reproducer with a runc control, `procnet-repro/repro.sh`:
 a listener bound inside a nested namespace appears in the root namespace's
 `/proc/net/tcp` on gVisor and does not under runc, while the connect is refused
 on both. No GPU, no proxy, no device involved. Recorded in

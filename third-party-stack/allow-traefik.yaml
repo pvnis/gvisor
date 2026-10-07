@@ -1,0 +1,25 @@
+# traefik runs in kube-system and terminates the platform's Ingress, so the
+# tenant's default-deny-ingress blocks every request to the UI and API. Same
+# shape as allow-inference-platform: the tenant must explicitly admit the
+# ingress controller, because the controller is not part of the tenant.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-traefik-ingress
+  namespace: tenant-nv-a
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: agentic-platform
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 8000
+          protocol: TCP
+        - port: 80
+          protocol: TCP
