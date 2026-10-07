@@ -1,0 +1,6 @@
+Listening for events on 16 CPUs with 64x4096 of shared memory
+Press Ctrl-C to quit
+time=2026-09-28T21:59:54.637184677Z level=info msg="Initializing dissection cache..."
+-> endpoint 2322 flow 0x0 , identity 47707->8484 state reply ifindex lxcd1a9c41dcce3 orig-ip 10.0.0.111: 10.0.0.111:53 -> 10.0.0.13:52299 udp
+-> stack flow 0x0 , identity 17218->world state new ifindex 0 orig-ip 0.0.0.0: 10.0.0.205:22741 -> 10.43.0.10:53 udp
+command terminated with exit code 124

@@ -1,0 +1,78 @@
+# MidoClaw (phoenix-claw) in the same tenant that serves its model.
+#
+# Two things are deliberate here: every image is built from the working tree so
+# no ghcr.io/midokura credentials are needed, and OpenShell's per-user agent
+# sandboxes run under gVisor.
+
+# All three platform images were built locally and imported into k3s, so there
+# is nothing to authenticate to. An empty list also stops the lifecycle
+# reconciler from copying a pull secret that does not exist into every tenant
+# namespace.
+imagePullSecrets: []
+
+# The tag scripts/build-images.sh produces. api/ui/lifecycle all fall back to
+# this when they set no tag of their own.
+image:
+  tag: dev
+
+# The agent-sandbox CRDs (kubernetes-sigs/agent-sandbox) are not in this
+# cluster, so the chart installs them.
+agentSandbox:
+  install: true
+
+ingress:
+  enabled: true
+  # k3s ships traefik, which ignores the nginx annotations the chart sets by
+  # default. Host-less rules match any host, so this serves on the node IP.
+  className: traefik
+
+lifecycle:
+  enabled: true
+  imagePullPolicy: Never
+  openshell:
+    values:
+      server:
+        # THE POINT. OpenShell stamps this onto every sandbox pod it creates
+        # that does not name a RuntimeClass of its own, and agentic-api names
+        # none -- so every agent sandbox is a gVisor sandbox. These pods run
+        # LLM-authored code, which is the workload this whole stack exists to
+        # confine: an escape would otherwise be an escape to the host kernel.
+        defaultRuntimeClassName: gvisor
+        workspaceDefaultStorageSize: "4Gi"
+        disableTls: true
+        auth:
+          allowUnauthenticatedUsers: true
+        # Built from docker/Dockerfile (openclaw from public sources) rather
+        # than pulled from the private midokura registry.
+        sandboxImage: ghcr.io/midokura/phoenix-claw:dev
+        sandboxImagePullSecrets: []
+      service:
+        metricsPort: 0
+
+ui:
+  image:
+    pullPolicy: Never
+
+api:
+  # No Google OAuth client is configured here, so the UI would have nothing to
+  # sign in against.
+  authBypass: true
+  image:
+    pullPolicy: Never
+  env:
+    SANDBOX_IMAGE_TYPES:
+      openclaw:
+        label: OpenClaw Agent
+        image: ghcr.io/midokura/phoenix-claw:dev
+        kind: openclaw
+      base:
+        label: Standard OpenShell
+        image: ghcr.io/nvidia/openshell-community/sandboxes/base:fffb6b2
+        kind: plain
+    # authBypass authenticates as the fixed identity e2e@midokura.com (see
+    # agentic-api/src/agentic_api/api/deps.py:_BYPASS_EMAIL), so that address
+    # has to map to a tenant or every bypassed call is 403 rather than 401.
+    TENANT_MAP: |
+      {
+        "tenant1": ["dmd17@cornell.edu", "e2e@midokura.com"]
+      }

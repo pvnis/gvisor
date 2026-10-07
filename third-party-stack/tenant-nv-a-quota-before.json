@@ -1,0 +1,1 @@
+{"limits.cpu":"8","limits.memory":"12Gi","persistentvolumeclaims":"10","pods":"30","requests.cpu":"4","requests.memory":"8Gi","requests.nvidia.com/gpu":"4","requests.nvidia.com/gpumem":"4096"}

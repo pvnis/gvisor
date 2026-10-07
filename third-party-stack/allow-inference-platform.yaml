@@ -1,0 +1,44 @@
+# The tenant's default-deny-ingress is doing its job: the Phoenix Serving
+# control plane (Gateway + AgentGateway + the KServe llmisvc controller) runs in
+# inference-platform, OUTSIDE the tenant, while the model server and its
+# endpoint picker run inside it. Every generation request therefore crosses the
+# tenant boundary, and without this the gateway answers
+# "ext_proc failed: no more response messages" while /v1/models still works --
+# because /v1/models is served by the gateway itself and never enters the
+# tenant, which makes the routing look healthy.
+#
+# Narrow on purpose: only the inference-platform namespace, only the three
+# ports that serving needs, and only pods that are part of an
+# LLMInferenceService. Nothing else in the tenant becomes reachable.
+#
+# The alternative is to run a Gateway inside each tenant namespace, so that no
+# cross-namespace ingress is needed at all. That is the better tenancy shape and
+# is not what the platform chart does today (it installs one Gateway per
+# cluster).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-inference-platform
+  namespace: tenant-nv-a
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: llminferenceservice
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: inference-platform
+      ports:
+        # vLLM's OpenAI-compatible HTTP port.
+        - port: 8000
+          protocol: TCP
+        # The endpoint picker's ext-proc gRPC service, which AgentGateway calls
+        # once per request to choose a backend pod.
+        - port: 9002
+          protocol: TCP
+        # The endpoint picker's metrics, scraped for KV-cache-aware routing.
+        - port: 9090
+          protocol: TCP

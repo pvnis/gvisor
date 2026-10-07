@@ -1,0 +1,31 @@
+# reconcile.sh intends to open the openclaw gateway port to the platform
+# namespace -- its comment says "from the agentic-platform namespace" -- but it
+# appends the port to /spec/ingress/0/ports/- on the openshell chart's
+# <ns>-sandbox-ssh policy, and that rule's `from` selects the OpenShell SERVER
+# pod in the OpenShell namespace. So 18789 ends up open to the server, not to
+# the API.
+#
+# The API dials the sandbox pod IP directly -- its log says
+# "gateway not ready on 10.0.0.237 within 120s" -- so it needs its own rule.
+# Symptom without this: POST /sandboxes/<id>/chat/completions returns
+# 502 "Could not connect to agent" while the openclaw-gateway process is up and
+# listening inside the sandbox.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-platform-to-sandbox-gateway
+  namespace: openshell-45b3e9dd
+spec:
+  podSelector:
+    matchLabels:
+      openshell.ai/managed-by: openshell
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tenant-nv-a
+      ports:
+        - port: 18789
+          protocol: TCP

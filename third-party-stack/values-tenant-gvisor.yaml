@@ -1,0 +1,44 @@
+# Deploy Phoenix Serving's default profile (Qwen3.5-4B, one NVIDIA GPU) into a
+# tenant namespace as a gVisor sandbox holding a Sentry-enforced slice of the
+# card.
+#
+# Only the deltas from the packaged profile are stated: the chart's preset
+# loader takes profiles/qwen35-4b-nvidia-x1.yaml as the base and layers
+# .Values.profiles.<name> over it with mergeOverwrite, so cpu, memory, the
+# engine args and the accelerator request all come from the chart unchanged.
+profiles:
+  qwen35-4b-nvidia-x1:
+    vllm:
+      # gvisor, not the nvidia runtime. nvproxy interprets the driver ioctls in
+      # the Sentry, which is what makes the two limits below enforceable: they
+      # are applied outside the container, where the workload cannot reach
+      # them. The nvidia RuntimeClass would hand the GPU over whole.
+      runtimeClassName: gvisor
+      resources:
+        requests:
+          # GPU memory, in MiB. The admission webhook turns this into
+          # dev.gvisor.flag.nvproxy-gpu-memory-limit, and nvproxy refuses an
+          # allocation past it and rewrites cuMemGetInfo to report it -- so
+          # vLLM's --gpu-memory-utilization=0.9 sizes its KV cache against this
+          # 20 GiB, not against the card's 46 GiB.
+          nvidia.com/gpumem: "20480"
+          # Share of GPU *time*, as a weight. 60 leaves 40 for a neighbour on
+          # the same card; the runsc gpu-scheduler re-divides every period, so
+          # an idle neighbour costs this tenant nothing.
+          nvidia.com/gpucores: "60"
+        limits:
+          nvidia.com/gpumem: "20480"
+          nvidia.com/gpucores: "60"
+    # KServe's base preset gives the endpoint picker limits.memory 16Gi, which
+    # a tenant ResourceQuota sized for one model rejects -- the ReplicaSet then
+    # reports FailedCreate and the LLMInferenceService sits at
+    # RouterReady=False/WaitingForGateway, which reads like a Gateway problem
+    # and is not one. An endpoint picker routes requests; it needs far less.
+    epp:
+      resources:
+        requests:
+          cpu: "500m"
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 4Gi

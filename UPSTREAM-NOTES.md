@@ -278,7 +278,7 @@ workload uses more than one network namespace. Found on 2026-09-28 while
 debugging an OpenShell agent sandbox, which runs its workload in a nested netns.
 
 A task reading `/proc/net/tcp` sees sockets from network namespaces other than
-its own. `~/procnet-repro/repro.sh` is a minimal reproducer — no GPU, no proxy,
+its own. `procnet-repro/repro.sh` in this repo is a minimal reproducer — no GPU, no proxy,
 no device — that binds a listener inside a nested namespace and then reads the
 file and attempts a connect from the sandbox's root namespace:
 

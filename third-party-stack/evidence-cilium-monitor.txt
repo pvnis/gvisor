@@ -1,0 +1,10 @@
+Listening for events on 16 CPUs with 64x4096 of shared memory
+Press Ctrl-C to quit
+CPU 08: [pre-xlate-fwd] cgroup_id: 64686 sock_cookie: 58132865, dst [0.0.0.0]:8080 tcp 
+time=2026-09-28T21:57:30.913235053Z level=info msg="Initializing dissection cache..."
+-> stack flow 0x0 , identity 30243->world state new ifindex 0 orig-ip 0.0.0.0: 10.0.0.82:23349 -> 10.43.0.10:53 udp
+CPU 02: [pre-xlate-fwd] cgroup_id: 64686 sock_cookie: 58140810, dst [0.0.0.0]:8080 tcp 
+-> endpoint 74 flow 0x0 , identity 47707->30243 state reply ifindex lxcdbf5901c8492 orig-ip 10.0.0.111: 10.0.0.111:53 -> 10.0.0.82:60321 udp
+CPU 02: [pre-xlate-fwd] cgroup_id: 64686 sock_cookie: 58140822, dst [0.0.0.0]:8080 tcp 
+CPU 04: [pre-xlate-fwd] cgroup_id: 64686 sock_cookie: 58124953, dst [0.0.0.0]:8080 tcp 
+command terminated with exit code 124
