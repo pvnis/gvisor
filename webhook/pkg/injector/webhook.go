@@ -238,12 +238,18 @@ func admitPod(req *admv1.AdmissionRequest) (*admv1.AdmissionResponse, error) {
 // only right on a cluster whose devices all have this much memory.
 var WholeCardMiB int64
 
+// MemoryTotalResource is a resource each GPU container is made to ask for as
+// much of as its GPU memory on all its GPUs together, in MiB, for a
+// ResourceQuota to bound; empty for none. See gpushare.InjectMemoryTotal.
+var MemoryTotalResource string
+
 func updatePod(pod *v1.Pod) {
 	gvisor := "gvisor"
 	pod.Spec.RuntimeClassName = &gvisor
 
 	// State whole-device memory before it is restated as a runsc limit below.
 	gpushare.DefaultWholeCardMemory(pod, WholeCardMiB)
+	gpushare.InjectMemoryTotal(pod, v1.ResourceName(MemoryTotalResource))
 
 	// Have runsc enforce whatever share of a GPU the pod was scheduled
 	// against, and stand down the limiter that runs inside the container.
