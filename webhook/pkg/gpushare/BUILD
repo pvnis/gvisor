@@ -10,11 +10,13 @@ go_library(
     srcs = [
         "gpushare.go",
         "hami.go",
+        "wholecard.go",
     ],
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/log",
         "@io_k8s_api//core/v1:go_default_library",
+        "@io_k8s_apimachinery//pkg/api/resource:go_default_library",
     ],
 )
 

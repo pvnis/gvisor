@@ -29,8 +29,9 @@
 // annotations has them enforced in the Sentry instead, where the container
 // cannot reach them.
 //
-// Nothing here changes what a pod asks for, so a scheduler reading these
-// resources continues to work unmodified.
+// Apart from DefaultWholeCardMemory, which only makes explicit what a pod was
+// already going to receive, nothing here changes what a pod asks for, so a
+// scheduler reading these resources continues to work unmodified.
 package gpushare
 
 import (
@@ -52,6 +53,11 @@ const (
 	// place more than 100 on one GPU; 0 means the container asks for no
 	// particular share.
 	CoresResourceName = "nvidia.com/gpucores"
+
+	// MemoryPercentageResourceName is HAMi's alternative to MemoryResourceName:
+	// GPU memory as a percentage of whichever device the container is placed
+	// on. HAMi does not accept both on one container.
+	MemoryPercentageResourceName = "nvidia.com/gpumem-percentage"
 
 	// MemoryLimitAnnotation is the annotation runsc reads to limit the GPU
 	// memory a sandbox may allocate, in bytes. The value configured on the
