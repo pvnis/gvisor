@@ -232,9 +232,18 @@ func admitPod(req *admv1.AdmissionRequest) (*admv1.AdmissionResponse, error) {
 	}, nil
 }
 
+// WholeCardMiB is the GPU memory of one NVIDIA device, in MiB. When positive,
+// a container asking for GPUs but no GPU memory is made to ask for this much
+// per GPU, so a GPU memory quota charges it for the devices it holds. It is
+// only right on a cluster whose devices all have this much memory.
+var WholeCardMiB int64
+
 func updatePod(pod *v1.Pod) {
 	gvisor := "gvisor"
 	pod.Spec.RuntimeClassName = &gvisor
+
+	// State whole-device memory before it is restated as a runsc limit below.
+	gpushare.DefaultWholeCardMemory(pod, WholeCardMiB)
 
 	// Have runsc enforce whatever share of a GPU the pod was scheduled
 	// against, and stand down the limiter that runs inside the container.

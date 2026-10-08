@@ -562,3 +562,77 @@ func TestInjectGPUMemoryLimitPerDeviceNarrowOnly(t *testing.T) {
 		}
 	}
 }
+
+// TestDefaultWholeCardMemory tests that a container asking for GPUs without
+// stating their memory is made to ask for a whole card's per GPU, and that
+// every other container is left alone.
+func TestDefaultWholeCardMemory(t *testing.T) {
+	const card = 46068
+	percentage := wholeGPUContainer(1)
+	percentage.Resources.Limits[MemoryPercentageResourceName] = *resource.NewQuantity(50, resource.DecimalSI)
+	requestOnly := v1.Container{Resources: v1.ResourceRequirements{
+		Requests: v1.ResourceList{GPUResourceName: *resource.NewQuantity(1, resource.DecimalSI)},
+	}}
+	for _, test := range []struct {
+		name      string
+		container v1.Container
+		cardMiB   int64
+		want      int64 // 0: no gpumem expected to be set
+	}{
+		{name: "whole GPU", container: wholeGPUContainer(1), cardMiB: card, want: card},
+		{name: "several whole GPUs", container: wholeGPUContainer(2), cardMiB: card, want: card},
+		{name: "GPU as a request only", container: requestOnly, cardMiB: card, want: card},
+		{name: "memory stated", container: multiGPUContainer(1, 8000), cardMiB: card, want: 8000},
+		{name: "percentage stated", container: percentage, cardMiB: card},
+		{name: "no GPU", container: v1.Container{}, cardMiB: card},
+		{name: "disabled", container: wholeGPUContainer(1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := &v1.Pod{Spec: v1.PodSpec{
+				InitContainers: []v1.Container{*test.container.DeepCopy()},
+				Containers:     []v1.Container{*test.container.DeepCopy()},
+			}}
+			DefaultWholeCardMemory(pod, test.cardMiB)
+			for _, c := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
+				limit, limited := c.Resources.Limits[MemoryResourceName]
+				request, requested := c.Resources.Requests[MemoryResourceName]
+				if test.want == 0 {
+					if limited || requested {
+						t.Errorf("gpumem set: limit %v, request %v", limit.String(), request.String())
+					}
+					continue
+				}
+				if got := limit.Value(); got != test.want {
+					t.Errorf("gpumem limit = %d, want %d", got, test.want)
+				}
+				if test.want == card && request.Value() != card {
+					t.Errorf("gpumem request = %v, want %d", request.String(), card)
+				}
+			}
+		})
+	}
+}
+
+// TestDefaultWholeCardMemoryBecomesLimit tests that a defaulted pod gets the
+// runsc limit of a card per GPU.
+func TestDefaultWholeCardMemoryBecomesLimit(t *testing.T) {
+	pod := &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{wholeGPUContainer(2)}}}
+	DefaultWholeCardMemory(pod, 46068)
+	InjectMemoryLimit(pod)
+	if got, want := pod.Annotations[MemoryLimitAnnotation], strconv.FormatInt(2*46068<<20, 10); got != want {
+		t.Errorf("%s = %q, want %q", MemoryLimitAnnotation, got, want)
+	}
+	if got, want := pod.Annotations[MemoryLimitPerDeviceAnnotation], strconv.FormatInt(46068<<20, 10); got != want {
+		t.Errorf("%s = %q, want %q", MemoryLimitPerDeviceAnnotation, got, want)
+	}
+}
+
+// wholeGPUContainer returns a container asking for gpus GPUs and nothing
+// about their memory.
+func wholeGPUContainer(gpus int64) v1.Container {
+	var c v1.Container
+	c.Resources.Limits = v1.ResourceList{
+		GPUResourceName: *resource.NewQuantity(gpus, resource.DecimalSI),
+	}
+	return c
+}

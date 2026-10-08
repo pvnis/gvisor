@@ -36,11 +36,13 @@ var (
 	address   = flag.String("address", "", "The ip address the admission webhook serves on. If unspecified, a public address is selected automatically.")
 	port      = flag.Int("port", 0, "The port the admission webhook serves on.")
 	podLabels = flag.String("pod-namespace-labels", "", "A comma-separated namespace label selector, the admission webhook will only take effect on pods in selected namespaces, e.g. `label1,label2`.")
+	wholeCardMiB = flag.Int64("nvidia-whole-card-mib", 0, "GPU memory of one NVIDIA device, in MiB. If positive, a container that asks for nvidia.com/gpu but neither nvidia.com/gpumem nor nvidia.com/gpumem-percentage is made to ask for this much nvidia.com/gpumem per GPU, so GPU memory quotas charge whole devices. Only correct when every device has this much memory.")
 )
 
 // Main runs the webhook.
 func Main() {
 	flag.Parse()
+	injector.WholeCardMiB = *wholeCardMiB
 
 	if err := run(); err != nil {
 		log.Warningf("%v", err)
