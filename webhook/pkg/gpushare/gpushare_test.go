@@ -570,6 +570,10 @@ func TestDefaultWholeCardMemory(t *testing.T) {
 	const card = 46068
 	percentage := wholeGPUContainer(1)
 	percentage.Resources.Limits[MemoryPercentageResourceName] = *resource.NewQuantity(50, resource.DecimalSI)
+	exclusive := multiGPUContainer(1, 8000)
+	exclusive.Resources.Limits[CoresResourceName] = *resource.NewQuantity(100, resource.DecimalSI)
+	shared := multiGPUContainer(1, 8000)
+	shared.Resources.Limits[CoresResourceName] = *resource.NewQuantity(99, resource.DecimalSI)
 	requestOnly := v1.Container{Resources: v1.ResourceRequirements{
 		Requests: v1.ResourceList{GPUResourceName: *resource.NewQuantity(1, resource.DecimalSI)},
 	}}
@@ -583,7 +587,10 @@ func TestDefaultWholeCardMemory(t *testing.T) {
 		{name: "several whole GPUs", container: wholeGPUContainer(2), cardMiB: card, want: card},
 		{name: "GPU as a request only", container: requestOnly, cardMiB: card, want: card},
 		{name: "memory stated", container: multiGPUContainer(1, 8000), cardMiB: card, want: 8000},
-		{name: "percentage stated", container: percentage, cardMiB: card},
+		{name: "percentage stated", container: percentage, cardMiB: card, want: card / 2},
+		{name: "percentage, disabled", container: percentage},
+		{name: "all of the time", container: exclusive, cardMiB: card, want: card},
+		{name: "part of the time", container: shared, cardMiB: card, want: 8000},
 		{name: "no GPU", container: v1.Container{}, cardMiB: card},
 		{name: "disabled", container: wholeGPUContainer(1)},
 	} {
@@ -605,8 +612,11 @@ func TestDefaultWholeCardMemory(t *testing.T) {
 				if got := limit.Value(); got != test.want {
 					t.Errorf("gpumem limit = %d, want %d", got, test.want)
 				}
-				if test.want == card && request.Value() != card {
-					t.Errorf("gpumem request = %v, want %d", request.String(), card)
+				if test.want != 8000 && request.Value() != test.want {
+					t.Errorf("gpumem request = %v, want %d", request.String(), test.want)
+				}
+				if test.cardMiB > 0 && hasResource(&c, MemoryPercentageResourceName) {
+					t.Errorf("gpumem-percentage kept beside gpumem")
 				}
 			}
 		})
@@ -635,4 +645,65 @@ func wholeGPUContainer(gpus int64) v1.Container {
 		GPUResourceName: *resource.NewQuantity(gpus, resource.DecimalSI),
 	}
 	return c
+}
+
+// TestInjectMemoryTotal tests that the quota-only total is GPU memory times
+// GPUs, replaces whatever the container claimed, and is absent without GPU
+// memory or a resource name.
+func TestInjectMemoryTotal(t *testing.T) {
+	const total = v1.ResourceName("example.com/gpu-memory")
+	claimed := multiGPUContainer(2, 8000)
+	claimed.Resources.Limits[total] = *resource.NewQuantity(1, resource.DecimalSI)
+	for _, test := range []struct {
+		name      string
+		container v1.Container
+		resource  v1.ResourceName
+		want      int64 // 0: none expected
+	}{
+		{name: "one GPU", container: multiGPUContainer(1, 8000), resource: total, want: 8000},
+		{name: "two GPUs", container: multiGPUContainer(2, 46068), resource: total, want: 92136},
+		{name: "memory without a count", container: gpuContainer(8000), resource: total, want: 8000},
+		{name: "claimed total replaced", container: claimed, resource: total, want: 16000},
+		{name: "no GPU memory", container: wholeGPUContainer(1), resource: total},
+		{name: "disabled", container: multiGPUContainer(2, 8000)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pod := &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{*test.container.DeepCopy()}}}
+			InjectMemoryTotal(pod, test.resource)
+			c := pod.Spec.Containers[0]
+			limit, limited := c.Resources.Limits[total]
+			request := c.Resources.Requests[total]
+			if test.want == 0 {
+				if test.resource != "" && limited {
+					t.Errorf("total set: %v", limit.String())
+				}
+				return
+			}
+			if limit.Value() != test.want || request.Value() != test.want {
+				t.Errorf("total limit %v, request %v, want %d", limit.String(), request.String(), test.want)
+			}
+		})
+	}
+}
+
+// TestPercentageBecomesTotal tests the whole chain for a percentage pod on two
+// GPUs: MiB per GPU, the total for the quota, and the runsc limits.
+func TestPercentageBecomesTotal(t *testing.T) {
+	const total = v1.ResourceName("example.com/gpu-memory")
+	c := wholeGPUContainer(2)
+	c.Resources.Limits[MemoryPercentageResourceName] = *resource.NewQuantity(25, resource.DecimalSI)
+	pod := &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{c}}}
+	DefaultWholeCardMemory(pod, 46068)
+	InjectMemoryTotal(pod, total)
+	InjectMemoryLimit(pod)
+	got := pod.Spec.Containers[0].Resources.Limits
+	if v := got[MemoryResourceName]; v.Value() != 11517 {
+		t.Errorf("gpumem = %v, want 11517", v.String())
+	}
+	if v := got[total]; v.Value() != 23034 {
+		t.Errorf("total = %v, want 23034", v.String())
+	}
+	if got, want := pod.Annotations[MemoryLimitPerDeviceAnnotation], strconv.FormatInt(11517<<20, 10); got != want {
+		t.Errorf("%s = %q, want %q", MemoryLimitPerDeviceAnnotation, got, want)
+	}
 }
