@@ -1195,3 +1195,100 @@ immediately after a successful `insmod` of a different build. Compare
 build-specific interface. `a6000-verify-loaded.sh` does both.
 
 The spatial axis on GA102 is still open.
+
+## Potential improvement: doorbell interception as a complement (2026-10-14, not implemented)
+
+New outside work weakens one of our conclusions. The Yan, Karlin & Grant
+paper ([arXiv:2604.26889](https://arxiv.org/pdf/2604.26889), §5.1–5.2)
+captures every NVIDIA doorbell write before the GPU acts on it. Maxime Peim's
+"Rebuilding CUDA From Scratch" series ports the technique to the open driver
+([Part 4](https://medium.com/ai-infrastructure/part-4-catching-the-doorbell-before-the-gpu-sees-it-aaa5060aadc8),
+[Part 5](https://medium.com/ai-infrastructure/part-5-anatomy-of-a-command-9d48ad800db6);
+H100 PCIe; code in `maxime-peim/libcuda-research`,
+`kernel-open/nvidia/nv-doorbell-watch.c`).
+
+**The technique.**
+- The driver redirects the process's doorbell mapping (the USERMODE object,
+  64 KiB, doorbell at +0x90) onto ordinary RAM.
+- It arms an x86 data-write watchpoint (DR0–DR3) on the doorbell word, so every
+  write traps before anything reaches the GPU.
+- The handler decodes the work-submit token (channel in bits 11:0, runlist in
+  bits 22:16), reads GPPut from USERD at +0x8c, and decodes the GPFIFO entry
+  down to the pushbuffer address and length.
+- Then it forwards the write to the real register.
+- Measured: 174 of 174 doorbells decoded, at uninstrumented bandwidth, a few µs
+  per doorbell.
+- Trapping after a write to the real register is always too late: GET == PUT
+  every time inside the handler.
+
+**What that changes here.** SECURITY-FINDINGS.md V1/V2 (Updates 3–4) concluded
+that "the MMIO doorbell write never faults". That was a property of how we
+revoked the mapping: after the first fault the app got the real device page
+back. It is not a property of the hardware. A doorbell redirected to RAM and
+kept trapped is seen on every write.
+
+**What it does not change.** A doorbell admits a batch of work; it does not
+measure GPU time. cuBLAS rings about one doorbell per ~150 matmuls, and once a
+batch or a long kernel is released, only the hardware scheduler (timeslice
+expiry and channel-group preemption) bounds it. That is what the runlist
+control drives. Gating doorbells alone would be admission control with
+unbounded, batch-sized overshoot. **Runlist control stays the enforcement
+mechanism. Interception would only be an addition to it.**
+
+**Ways around a doorbell gate.** None of these affect runlist control, because
+all the work still runs in the tenant's own channel groups.
+- **GPU-initiated submission.** The series' Parts 6–7 have a GPU thread ring its
+  own doorbell. Dynamic parallelism and device graph launch also create work
+  without any doorbell.
+- **Semaphore-gated work** (inference, untested): one admitted stream that waits
+  on semaphore acquires the tenant later releases with plain memory writes.
+- **GPPut without a doorbell** (untested): does a resident channel pick up a new
+  GPPut on its own?
+
+**What it would add.**
+1. *An activity signal the tenant cannot forge.* Today the ghost driver reads
+   `GP_GET`/`GP_PUT` from USERD (`kernel_channel_group_api.c`, offsets 136/140 =
+   0x88/0x8c, matching the paper's layout). The tenant writes USERD itself, and
+   a long kernel with GET == PUT reads idle. An idle tenant is neither credited
+   nor charged (`pkg/gpusched/credit.go`). Doorbell events from a trap we own
+   cannot be faked, though they still do not measure GPU time.
+2. *Event-driven re-attach.* Re-attach a detached tenant on its doorbell
+   instead of at the next 100 ms tick, for latency-sensitive inference on small
+   shares. Runlist-path latency has never been measured.
+3. *Per-tenant accounting and audit.* Submissions per engine (compute vs copy
+   engine), copy sizes, CUDA Graph launch patterns, and detection of streams
+   gated on semaphores.
+4. *Copy-engine admission*, if copy bandwidth contention ever matters.
+
+**Where it would live.**
+- *Sentry (preferred).* nvproxy already handles the USERMODE object's mmap
+  (`frontend_mmap.go`). It would map a write-protected page in its place, take
+  the fault on each doorbell, and forward the write itself. The open problem is
+  completing the faulted store: decode the instruction, or single-step it.
+  Debug registers are realistic only on the KVM platform, since systrap does
+  not ptrace the app. It must keep the write-combining and fence ordering of
+  the submission path.
+- *Ghost driver (the paper's port).* Covers every process, including the
+  Sentry's mappings. Not production-ready as is:
+  - only four debug registers per CPU, shared with everything else, and silent
+    pass-through when another process holds them;
+  - watchpoints bind per thread, so threads created later are missed;
+  - libcuda maps two doorbell windows (BAR0 and BAR1).
+- *Cost.* A few µs per doorbell: fine for bulk work, roughly doubles a small
+  kernel's launch overhead. CUDA Graphs reduce how many doorbells there are.
+
+**Tests to run before investing.** All are cheap and need no change to any
+tenant.
+1. Does a GPPut update alone make a resident channel progress?
+2. Does semaphore-gated work bypass a doorbell gate?
+3. Once the series' Part 6 is out, can a tenant map the USERMODE page into a
+   GPU address space? If so, nvproxy should probably refuse that mapping
+   regardless.
+4. Measure runlist-path wake-up latency, to price item 2 above.
+5. Adversarially test hiding or faking the `GP_PUT` activity signal. This is
+   worth doing whether or not we ever intercept doorbells.
+
+**Related, low severity.** nvproxy passes `NV2080_CTRL_CMD_PERF_BOOST` through
+(`pkg/sentry/devices/nvproxy/version.go`). Any tenant can pin the shared GPU's
+clocks at maximum with no expiry. libcuda issues it on every startup, so it is
+normal behaviour, but on a shared card the clock policy is a platform decision.
