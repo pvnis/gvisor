@@ -377,3 +377,126 @@ func TestEnforceClientsPerGPU(t *testing.T) {
 		t.Errorf("without per-GPU reports = %+v, want %+v", enforce, want)
 	}
 }
+
+// tsFakeEnforcer records each command with its GPU and, for timeslices, value.
+type tsFakeEnforcer struct{ calls []string }
+
+func (f *tsFakeEnforcer) SetTimeslice(pid int, gpu string, us uint64) error {
+	f.calls = append(f.calls, fmt.Sprintf("ts %d %s %d", pid, gpu, us))
+	return nil
+}
+func (f *tsFakeEnforcer) Detach(pid int, gpu string) error {
+	f.calls = append(f.calls, fmt.Sprintf("detach %d %s", pid, gpu))
+	return nil
+}
+func (f *tsFakeEnforcer) Attach(pid int, gpu string) error {
+	f.calls = append(f.calls, fmt.Sprintf("attach %d %s", pid, gpu))
+	return nil
+}
+
+// lastTimeslice returns the last timeslice written to pid on gpu, or 0.
+func (f *tsFakeEnforcer) lastTimeslice(pid int, gpu string) uint64 {
+	var us uint64
+	prefix := fmt.Sprintf("ts %d %s ", pid, gpu)
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, prefix) {
+			fmt.Sscanf(strings.TrimPrefix(c, prefix), "%d", &us)
+		}
+	}
+	return us
+}
+
+func (f *tsFakeEnforcer) has(cmd string) bool {
+	for _, c := range f.calls {
+		if c == cmd {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRealtimeShortensQuantumOnItsGPU tests the lab real-time class: on the
+// GPU a real-time process is on, every sandbox runs at the short quantum and
+// the real-time process at its own timeslice, never detached; another GPU
+// keeps the default quantum; and when the real-time process leaves, its GPU
+// returns to the default.
+func TestRealtimeShortensQuantumOnItsGPU(t *testing.T) {
+	const gpuA, gpuB = "0000:05:00.0", "0000:06:00.0"
+	const rtPID = 99
+	f := &tsFakeEnforcer{}
+	r := newRunlistEnforcer(f)
+	r.rtOthersUs, r.rtOwnUs = 500, 4000
+	byGPU := map[string][]EnforceClient{
+		gpuA: {{PID: 10, Weight: 100, TSGs: 1}, {PID: 20, Weight: 100, TSGs: 2}},
+		gpuB: {{PID: 30, Weight: 100, TSGs: 1}},
+	}
+	r.rt = map[string][]int{gpuA: {rtPID}}
+	for i := 0; i < 50; i++ {
+		r.applyByGPU(byGPU)
+	}
+	for _, pid := range []int{10, 20} {
+		if got := f.lastTimeslice(pid, gpuA); got != 500 {
+			t.Errorf("sandbox %d beside the real-time process: timeslice %d, want 500", pid, got)
+		}
+	}
+	if got := f.lastTimeslice(rtPID, gpuA); got != 4000 {
+		t.Errorf("real-time process timeslice %d, want 4000", got)
+	}
+	if got := f.lastTimeslice(30, gpuB); got != defaultCreditParams().quantumUs {
+		t.Errorf("sandbox on the other GPU: timeslice %d, want the default %d", got, defaultCreditParams().quantumUs)
+	}
+	if f.has(fmt.Sprintf("detach %d %s", rtPID, gpuA)) {
+		t.Errorf("real-time process was detached")
+	}
+	if f.lastTimeslice(rtPID, gpuB) != 0 {
+		t.Errorf("real-time process written on a GPU it is not on")
+	}
+
+	r.rt = nil
+	r.applyByGPU(byGPU)
+	for _, pid := range []int{10, 20} {
+		if got := f.lastTimeslice(pid, gpuA); got != defaultCreditParams().quantumUs {
+			t.Errorf("after the real-time process left, sandbox %d timeslice %d, want %d", pid, got, defaultCreditParams().quantumUs)
+		}
+	}
+}
+
+// TestRealtimeOffByDefault tests that without the real-time settings nothing
+// changes: the default quantum everywhere, and no write to a real-time pid.
+func TestRealtimeOffByDefault(t *testing.T) {
+	const gpuA = "0000:05:00.0"
+	f := &tsFakeEnforcer{}
+	r := newRunlistEnforcer(f)
+	r.rt = map[string][]int{gpuA: {99}}
+	r.applyByGPU(map[string][]EnforceClient{gpuA: {{PID: 10, Weight: 100, TSGs: 1}}})
+	if got := f.lastTimeslice(10, gpuA); got != defaultCreditParams().quantumUs {
+		t.Errorf("timeslice %d with the real-time class unset, want %d", got, defaultCreditParams().quantumUs)
+	}
+	if f.lastTimeslice(99, gpuA) != 0 {
+		t.Errorf("real-time pid written with the real-time class unset")
+	}
+}
+
+// TestRealtimeShortensUnmanagedProcesses tests that a process the scheduler
+// does not manage (a sandbox started before it restarted) is shortened beside
+// a real-time process and given the default quantum back when it leaves.
+func TestRealtimeShortensUnmanagedProcesses(t *testing.T) {
+	const gpuA = "0000:05:00.0"
+	f := &tsFakeEnforcer{}
+	r := newRunlistEnforcer(f)
+	r.rtOthersUs, r.rtOwnUs = 500, 4000
+	r.rt = map[string][]int{gpuA: {99}}
+	r.rtUnmanaged = map[string][]int{gpuA: {77}}
+	r.applyByGPU(map[string][]EnforceClient{})
+	if got := f.lastTimeslice(77, gpuA); got != 500 {
+		t.Errorf("unmanaged process beside the real-time one: %d, want 500", got)
+	}
+	if got := f.lastTimeslice(99, gpuA); got != 4000 {
+		t.Errorf("real-time process on a GPU with no sandboxes: %d, want 4000", got)
+	}
+	r.rt, r.rtUnmanaged = nil, nil
+	r.applyByGPU(map[string][]EnforceClient{})
+	if got := f.lastTimeslice(77, gpuA); got != defaultCreditParams().quantumUs {
+		t.Errorf("after the real-time process left: %d, want %d", got, defaultCreditParams().quantumUs)
+	}
+}

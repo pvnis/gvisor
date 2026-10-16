@@ -17,6 +17,7 @@ package gpusched
 import (
 	"net"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -510,5 +511,35 @@ func TestServerRetainsPIDAcrossReconnect(t *testing.T) {
 	waitForClients(t, s, 1)
 	if got := s.pidFor("sb"); got != 4242 {
 		t.Fatalf("after reconnect pid = %d, want 4242", got)
+	}
+}
+
+// TestRealtimeByGPU tests which processes the lab real-time class picks up:
+// named, holding channel groups on that GPU, and not a sandbox.
+func TestRealtimeByGPU(t *testing.T) {
+	s := NewServer(DefaultPeriod)
+	s.SetRealtime([]string{"pusch_e2e_pipeline_test", " pdsch_gpu_latency_benchmark"}, 500, 4000)
+	comm := map[int]string{
+		1: "pusch_e2e_pipel", // truncated to 15 bytes by the kernel, as the flag value is
+		2: "pdsch_gpu_laten",
+		3: "python3",
+		4: "pusch_e2e_pipel",
+		5: "pusch_e2e_pipel",
+	}
+	s.commOf = func(pid int) string { return comm[pid] }
+	byGPU := map[string]map[int]TenantState{
+		"0000:05:00.0": {1: {TSGs: 3}, 3: {TSGs: 1}, 4: {TSGs: 2}, 5: {TSGs: 0}},
+		"0000:06:00.0": {2: {TSGs: 1}},
+	}
+	got := s.realtimeByGPU(byGPU, map[int]bool{4: true}) // pid 4 is a sandbox
+	if want := []int{1}; !slices.Equal(got["0000:05:00.0"], want) {
+		t.Errorf("GPU 5: %v, want %v (not python3, not the sandbox, not a process with no channel groups)", got["0000:05:00.0"], want)
+	}
+	if want := []int{2}; !slices.Equal(got["0000:06:00.0"], want) {
+		t.Errorf("GPU 6: %v, want %v", got["0000:06:00.0"], want)
+	}
+	s.SetRealtime(nil, 0, 0)
+	if got := s.realtimeByGPU(byGPU, nil); got != nil {
+		t.Errorf("with no real-time class: %v, want nil", got)
 	}
 }

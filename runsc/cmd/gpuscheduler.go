@@ -18,6 +18,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/subcommands"
@@ -35,6 +36,9 @@ type GPUScheduler struct {
 	period         time.Duration
 	measure        bool
 	runlistControl string
+	rtComm         string
+	rtOthersUs     uint64
+	rtOwnUs        uint64
 }
 
 // Name implements subcommands.Command.Name.
@@ -82,6 +86,9 @@ func (g *GPUScheduler) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&g.socket, "socket", "/run/runsc-gpu-scheduler.sock", "path of the socket sandboxes connect to.")
 	f.DurationVar(&g.period, "period", gpusched.DefaultPeriod, "length of the cycle that windows are placed within.")
 	f.BoolVar(&g.measure, "measure-usage", true, "judge sandboxes by what they take from the GPU, as reported by nvidia-smi, rather than by whether they submitted anything. Scheduling continues without it if nvidia-smi cannot be run.")
+	f.StringVar(&g.rtComm, "rt-comm", "", "LAB PROTOTYPE: comma-separated host process names (/proc/<pid>/comm) to treat as a real-time class -- e.g. a RAN DU's GPU PHY, which cannot run under gVisor. Such a process is kept on the GPU at --rt-own-timeslice-us, and every sandbox sharing the GPU with it runs at --rt-others-quantum-us. Requires --runlist-control. Trusts whoever can name a host process; not for production.")
+	f.Uint64Var(&g.rtOthersUs, "rt-others-quantum-us", 500, "timeslice, in microseconds, of every sandbox on a GPU while a --rt-comm process is on it.")
+	f.Uint64Var(&g.rtOwnUs, "rt-own-timeslice-us", 4000, "timeslice, in microseconds, of a --rt-comm process.")
 	f.StringVar(&g.runlistControl, "runlist-control", "", "path of the ghost-instrumented driver's runlist control (e.g. /proc/driver/nvidia/gpusched). When set, the scheduler divides each GPU by driving the hardware runlist -- detach/attach and per-TSG timeslice -- which binds doorbell-submission workloads (cuBLAS) the compute gate cannot. Requires the ghost driver; empty leaves enforcement to the gate.")
 }
 
@@ -142,6 +149,10 @@ func (g *GPUScheduler) Execute(_ context.Context, f *flag.FlagSet, args ...any) 
 		} else {
 			server.SetEnforcer(&gpusched.ProcfsEnforcer{Path: g.runlistControl})
 			log.Infof("Dividing each GPU by its hardware runlist via %q", g.runlistControl)
+			if g.rtComm != "" {
+				server.SetRealtime(strings.Split(g.rtComm, ","), g.rtOthersUs, g.rtOwnUs)
+				log.Infof("Real-time class (lab): %q at %dus; sandboxes beside it at %dus", g.rtComm, g.rtOwnUs, g.rtOthersUs)
+			}
 		}
 	}
 

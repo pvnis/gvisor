@@ -15,8 +15,12 @@
 package gpusched
 
 import (
+	"fmt"
 	"net"
+	"os"
 	"slices"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,6 +85,15 @@ type Server struct {
 	// enforcement to the gate, as before.
 	enforcer *runlistEnforcer
 
+	// Real-time class (lab prototype, see SetRealtime): host processes not
+	// under gVisor, recognized by command name, that the scheduler keeps on
+	// the GPU and protects by shortening every sandbox's quantum there.
+	rtComms    map[string]bool
+	rtOthersUs uint64
+	rtOwnUs    uint64
+	// commOf reads a host process's command name; tests replace it.
+	commOf func(pid int) string
+
 	// activity, when set, reports which sandboxes are submitting work, read
 	// from the driver (GP_PUT) rather than nvidia-smi. It is set together with
 	// the enforcer when the control supports it, and is the trusted, doorbell-
@@ -107,6 +120,90 @@ func (s *Server) SetDeviceTable(table *DeviceTable) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.table = table
+}
+
+// SetRealtime declares a real-time class (lab prototype). A host process that
+// holds channel groups on a GPU, is not a connected sandbox, and whose command
+// name (/proc/<pid>/comm) is one of comms is treated as real-time on that GPU:
+// it is held at ownUs and never detached, and every sandbox on the same GPU
+// runs at othersUs instead of the credit planner's default quantum, so
+// real-time work waits behind at most a short slice of each. The intended
+// user is a RAN DU's GPU PHY, which cannot run under gVisor and so never
+// registers. Identification by command name is for the lab only: it trusts
+// whoever can name a process on the host.
+//
+// Requires an enforcer and a driver that reports channel groups per GPU.
+func (s *Server) SetRealtime(comms []string, othersUs, ownUs uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rtComms = map[string]bool{}
+	for _, c := range comms {
+		if c = strings.TrimSpace(c); c != "" {
+			// The kernel truncates comm to 15 bytes.
+			if len(c) > 15 {
+				c = c[:15]
+			}
+			s.rtComms[c] = true
+		}
+	}
+	s.rtOthersUs, s.rtOwnUs = othersUs, ownUs
+}
+
+// realtimeByGPU returns, per GPU, the real-time processes on it: those the
+// driver reports with channel groups there that are not sandboxes and whose
+// command name is in the real-time class.
+func (s *Server) realtimeByGPU(byGPU map[string]map[int]TenantState, sandboxPIDs map[int]bool) map[string][]int {
+	rt, _ := s.realtimeAndUnmanagedByGPU(byGPU, sandboxPIDs)
+	return rt
+}
+
+// realtimeAndUnmanagedByGPU is realtimeByGPU, also returning, for each GPU
+// with a real-time process, the other processes there that are neither
+// real-time nor connected sandboxes. Those are typically sandboxes started
+// before the scheduler last restarted (a sandbox does not reconnect); they are
+// shortened beside the real-time process like the connected ones.
+func (s *Server) realtimeAndUnmanagedByGPU(byGPU map[string]map[int]TenantState, sandboxPIDs map[int]bool) (map[string][]int, map[string][]int) {
+	if len(s.rtComms) == 0 || byGPU == nil {
+		return nil, nil
+	}
+	commOf := s.commOf
+	if commOf == nil {
+		commOf = procComm
+	}
+	rt := map[string][]int{}
+	unmanaged := map[string][]int{}
+	for gpu, pids := range byGPU {
+		var others []int
+		for pid, st := range pids {
+			if st.TSGs == 0 || sandboxPIDs[pid] {
+				continue
+			}
+			if s.rtComms[commOf(pid)] {
+				rt[gpu] = append(rt[gpu], pid)
+			} else {
+				others = append(others, pid)
+			}
+		}
+		if len(rt[gpu]) == 0 {
+			delete(rt, gpu)
+			continue
+		}
+		sort.Ints(rt[gpu])
+		sort.Ints(others)
+		if len(others) > 0 {
+			unmanaged[gpu] = others
+		}
+	}
+	return rt, unmanaged
+}
+
+// procComm reads a host process's command name, or "" if it is gone.
+func procComm(pid int) string {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // SetEnforcer makes the scheduler divide each GPU by driving its hardware
@@ -586,6 +683,7 @@ func (s *Server) Tick() {
 	// reclaimed. A sandbox whose pid is not yet known is skipped -- it will be
 	// picked up once runsc announces it.
 	enforce := make(map[string][]EnforceClient)
+	sandboxPIDs := map[int]bool{}
 	if s.enforcer != nil {
 		for id, sc := range s.conns {
 			pid := sc.pid
@@ -603,13 +701,20 @@ func (s *Server) Tick() {
 				continue
 			}
 			delete(s.warnedNoPID, id)
+			sandboxPIDs[pid] = true
 			s.enforceClientsLocked(enforce, sc, pid, idle[id], driverTSGs[pid], driverByGPU)
 		}
 	}
 	enforcer := s.enforcer
+	rtOthersUs, rtOwnUs := s.rtOthersUs, s.rtOwnUs
+	var rt, unmanaged map[string][]int
+	if enforcer != nil {
+		rt, unmanaged = s.realtimeAndUnmanagedByGPU(driverByGPU, sandboxPIDs)
+	}
 	s.mu.Unlock()
 
 	if enforcer != nil {
+		enforcer.rt, enforcer.rtUnmanaged, enforcer.rtOthersUs, enforcer.rtOwnUs = rt, unmanaged, rtOthersUs, rtOwnUs
 		enforcer.applyByGPU(enforce)
 	}
 

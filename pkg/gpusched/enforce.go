@@ -338,10 +338,130 @@ type runlistEnforcer struct {
 	creditOff bool
 	// periodUs is the tick length the credit accounting advances by.
 	periodUs float64
+
+	// Real-time class (lab prototype). rt is, per GPU, the host pids of the
+	// real-time processes holding channel groups there this tick; see
+	// Server.SetRealtime. While a GPU has one, every sandbox on it runs at
+	// rtOthersUs instead of the credit planner's default quantum, so a
+	// real-time submission waits behind at most a short slice of each, and
+	// the real-time process itself is held at rtOwnUs and never detached.
+	rt         map[string][]int
+	// rtUnmanaged is, per GPU with a real-time process, the other processes
+	// there the scheduler does not otherwise manage; they get rtOthersUs too.
+	rtUnmanaged map[string][]int
+	rtOthersUs  uint64
+	rtOwnUs    uint64
+	// rtWritten is the timeslice last written to each real-time process, per
+	// GPU, so a steady tick is silent.
+	rtWritten map[string]map[int]uint64
+	// unmanagedWritten is the same for the unmanaged processes shortened
+	// beside a real-time process, so they can be restored when it leaves.
+	unmanagedWritten map[string]map[int]uint64
 }
 
 func newRunlistEnforcer(e Enforcer) *runlistEnforcer {
-	return &runlistEnforcer{e: e, prev: map[int]pidState{}, credit: map[string]*creditPlanner{}}
+	return &runlistEnforcer{e: e, prev: map[int]pidState{}, credit: map[string]*creditPlanner{}, rtWritten: map[string]map[int]uint64{}, unmanagedWritten: map[string]map[int]uint64{}}
+}
+
+// applyUnmanaged shortens the unmanaged processes on each GPU with a
+// real-time process to rtOthersUs, and puts back the default quantum on any
+// it shortened before that is no longer beside one.
+func (r *runlistEnforcer) applyUnmanaged() {
+	def := defaultCreditParams().quantumUs
+	for gpu, w := range r.unmanagedWritten {
+		now := map[int]bool{}
+		for _, pid := range r.rtUnmanaged[gpu] {
+			now[pid] = true
+		}
+		var restore []enforceCmd
+		for pid := range w {
+			if !now[pid] {
+				restore = append(restore, enforceCmd{op: "ts", pid: pid, us: def})
+				delete(w, pid)
+			}
+		}
+		sort.Slice(restore, func(i, j int) bool { return restore[i].pid < restore[j].pid })
+		r.issue(gpu, restore)
+		if len(w) == 0 {
+			delete(r.unmanagedWritten, gpu)
+		}
+	}
+	gpus := make([]string, 0, len(r.rtUnmanaged))
+	for gpu := range r.rtUnmanaged {
+		gpus = append(gpus, gpu)
+	}
+	sort.Strings(gpus)
+	for _, gpu := range gpus {
+		w := r.unmanagedWritten[gpu]
+		if w == nil {
+			w = map[int]uint64{}
+			r.unmanagedWritten[gpu] = w
+		}
+		var cmds []enforceCmd
+		for _, pid := range r.rtUnmanaged[gpu] {
+			if w[pid] != r.rtOthersUs || r.ticks%reassertEveryTicks == 0 {
+				cmds = append(cmds, enforceCmd{op: "ts", pid: pid, us: r.rtOthersUs})
+				w[pid] = r.rtOthersUs
+			}
+		}
+		r.issue(gpu, cmds)
+	}
+}
+
+// creditParamsFor is the credit planner's parameters on gpu this tick: the
+// defaults, with the short quantum while a real-time process is on it.
+func (r *runlistEnforcer) creditParamsFor(gpu string) creditParams {
+	p := defaultCreditParams()
+	if r.rtOthersUs > 0 && len(r.rt[gpu]) > 0 {
+		p.quantumUs = r.rtOthersUs
+	}
+	return p
+}
+
+// applyRealtime holds each real-time process at its own timeslice on the GPUs
+// it is on, re-issued on the re-assert cadence like the sandboxes' plans (a
+// CUDA process creates its compute TSG lazily). It forgets processes that have
+// gone, so one that returns is written again.
+func (r *runlistEnforcer) applyRealtime() {
+	if r.rtOwnUs == 0 {
+		return
+	}
+	r.applyUnmanaged()
+	for gpu := range r.rtWritten {
+		if len(r.rt[gpu]) == 0 {
+			delete(r.rtWritten, gpu)
+		}
+	}
+	gpus := make([]string, 0, len(r.rt))
+	for gpu := range r.rt {
+		gpus = append(gpus, gpu)
+	}
+	sort.Strings(gpus)
+	for _, gpu := range gpus {
+		w := r.rtWritten[gpu]
+		if w == nil {
+			w = map[int]uint64{}
+			r.rtWritten[gpu] = w
+		}
+		live := map[int]bool{}
+		var cmds []enforceCmd
+		for _, pid := range r.rt[gpu] {
+			live[pid] = true
+			if w[pid] != r.rtOwnUs || r.ticks%reassertEveryTicks == 0 {
+				cmds = append(cmds, enforceCmd{op: "ts", pid: pid, us: r.rtOwnUs})
+				w[pid] = r.rtOwnUs
+			}
+		}
+		for pid := range w {
+			if !live[pid] {
+				delete(w, pid)
+			}
+		}
+		if len(cmds) > 0 && r.ticks%reassertEveryTicks != 0 {
+			log.Infof("gpusched: real-time class on GPU %q: pids %v at %dus, sandboxes at %dus", gpu, r.rt[gpu], r.rtOwnUs, r.rtOthersUs)
+		}
+		r.issue(gpu, cmds)
+	}
 }
 
 // reassertEveryTicks is how often the enforcer re-issues every timeslice even
@@ -393,9 +513,18 @@ func (r *runlistEnforcer) applyByGPU(byGPU map[string][]EnforceClient) {
 		sort.Strings(gpus)
 		for _, gpu := range gpus {
 			clients := byGPU[gpu]
+			params := r.creditParamsFor(gpu)
 			planner, ok := r.credit[gpu]
+			if ok && planner.params.quantumUs != params.quantumUs {
+				// A real-time process arrived on this GPU or left it. A fresh
+				// planner re-writes every sandbox's timeslice at the new quantum;
+				// losing the accounts is harmless, they are bounded to two
+				// periods of credit anyway.
+				log.Infof("gpusched: GPU %q quantum %dus -> %dus", gpu, planner.params.quantumUs, params.quantumUs)
+				ok = false
+			}
 			if !ok {
-				planner = newCreditPlanner(defaultCreditParams())
+				planner = newCreditPlanner(params)
 				r.credit[gpu] = planner
 			}
 			if r.ticks%reassertEveryTicks == 0 {
@@ -407,6 +536,7 @@ func (r *runlistEnforcer) applyByGPU(byGPU map[string][]EnforceClient) {
 			}
 			r.issue(gpu, cmds)
 		}
+		r.applyRealtime()
 		return
 	}
 	clients := byGPU[AllGPUs]
