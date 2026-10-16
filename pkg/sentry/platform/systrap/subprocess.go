@@ -1017,15 +1017,32 @@ func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRa
 	if precommit {
 		flags |= unix.MAP_POPULATE
 	}
-	_, err = s.syscall(
-		unix.SYS_MMAP,
-		arch.SyscallArgument{Value: uintptr(addr)},
-		arch.SyscallArgument{Value: uintptr(fr.Length())},
-		arch.SyscallArgument{Value: uintptr(at.Prot())},
-		arch.SyscallArgument{Value: uintptr(flags | unix.MAP_SHARED | unix.MAP_FIXED)},
-		arch.SyscallArgument{Value: uintptr(fd)},
-		arch.SyscallArgument{Value: uintptr(fr.Start)})
-	return err
+	mmap := func() error {
+		_, err := s.syscall(
+			unix.SYS_MMAP,
+			arch.SyscallArgument{Value: uintptr(addr)},
+			arch.SyscallArgument{Value: uintptr(fr.Length())},
+			arch.SyscallArgument{Value: uintptr(at.Prot())},
+			arch.SyscallArgument{Value: uintptr(flags | unix.MAP_SHARED | unix.MAP_FIXED)},
+			arch.SyscallArgument{Value: uintptr(fd)},
+			arch.SyscallArgument{Value: uintptr(fr.Start)})
+		return err
+	}
+	// The mmap runs in the stub, not the Sentry, so a File that only maps
+	// into processes its host driver was told about must be told about the
+	// stub first.
+	if tf, ok := f.(memmap.HostMapTargetFile); ok {
+		return tf.WithHostMapTarget(s.hostTGID(), mmap)
+	}
+	return mmap()
+}
+
+// hostTGID returns the host thread-group ID of the stub thread that performs
+// s's system calls. Every thread of the stub shares its address space.
+func (s *subprocess) hostTGID() int32 {
+	s.syscallThreadMu.Lock()
+	defer s.syscallThreadMu.Unlock()
+	return s.syscallThread.thread.tgid
 }
 
 // Unmap implements platform.AddressSpace.Unmap.

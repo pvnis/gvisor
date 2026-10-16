@@ -530,6 +530,26 @@ type File interface {
 	FD() int
 }
 
+// HostMapTargetFile is an optional interface for a File whose host file
+// descriptor only lets processes the host driver has been told about mmap it.
+// AMD's KFD is one: it refuses mmap from any process other than the owner of
+// the KFD context unless the owner first names that process.
+//
+// Platforms that implement platform.AddressSpace.MapFile by calling mmap from a
+// host process other than the Sentry (such as systrap's stub processes) check
+// for this interface and, when it is present, perform that mmap inside
+// WithHostMapTarget instead of calling it directly. Platforms that map in the
+// Sentry's own address space need not.
+type HostMapTargetFile interface {
+	File
+
+	// WithHostMapTarget arranges for the host process with thread-group ID
+	// tgid to be allowed to mmap the File, then calls mapFn, which performs
+	// that mmap, and returns its error. It must call mapFn at most once, and
+	// keep the host process allowed until mapFn returns.
+	WithHostMapTarget(tgid int32, mapFn func() error) error
+}
+
 // DefaultMemoryType implements File.MemoryType() for implementations of File
 // backed by ordinary system memory.
 type DefaultMemoryType struct{}

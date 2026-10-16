@@ -61,6 +61,9 @@ func Filters() seccomp.SyscallRules {
 		// The sandbox cannot reach either: kfdFD.Ioctl dispatches neither.
 		amdgpu.AMDKFD_IOC_DBG_TRAP,
 		amdgpu.AMDKFD_IOC_GET_QUEUE_WAVE_STATE,
+		// Issued only by kfdMemmapFile.WithHostMapTarget, naming a systrap
+		// stub. kfdFD.Ioctl does not dispatch it.
+		amdgpu.AMDKFD_IOC_SET_MMAP_TARGET,
 	} {
 		ioctlRules = append(ioctlRules, seccomp.PerArg{
 			seccomp.NonNegativeFD{},

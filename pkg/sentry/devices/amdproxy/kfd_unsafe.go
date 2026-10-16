@@ -37,6 +37,18 @@ func kfdIoctlInvoke[Params any](ki *kfdIoctlState, params *Params) (uintptr, err
 	return n, nil
 }
 
+// kfdSetMmapTarget names the host process tgid as the one, other than the
+// Sentry, that may mmap hostFD's KFD context; zero clears it. The sandbox
+// cannot issue this ioctl: kfdFD.Ioctl does not dispatch it.
+func kfdSetMmapTarget(hostFD int32, tgid int32) error {
+	args := amdgpu.KFDIoctlSetMmapTargetArgs{PID: uint32(tgid)}
+	_, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(hostFD), uintptr(amdgpu.AMDKFD_IOC_SET_MMAP_TARGET), uintptr(unsafe.Pointer(&args)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 // kfdGetProcessAperturesNew handles AMDKFD_IOC_GET_PROCESS_APERTURES_NEW. The
 // parameters point at an application array that the driver fills in with one
 // entry per GPU, so the pointer is retargeted at a Sentry buffer for the

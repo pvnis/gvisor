@@ -1509,10 +1509,23 @@ identity, so commits need `-c user.name=dmd -c user.email=dmd17@cornell.edu`.
    above: forwarding it crashes ROCr's initialisation, and denial is what lets
    ROCr fall back. `hipMallocManaged` will not work; hipMalloc workloads
    (vecadd, and vLLM up to graph capture) are unaffected.
-6. **`/dev/kfd` mappings are impossible on systrap** (task #18). Not a bug: KFD
-   binds each mapping to the process holding the KFD context, and systrap maps
-   from a stub process, so `mmap` returns `EINVAL`. Only the KFD mapping is
-   process-bound; the render node's is not. KVM is the platform to use.
+6. **`/dev/kfd` mappings on systrap need a modified amdgpu driver** (task #18).
+   KFD binds each mapping to the process holding the KFD context (the Sentry),
+   and systrap maps from a stub process, so stock KFD fails the stub's `mmap`
+   with `EBADF`. Only the KFD mapping (doorbells, MMIO page) is process-bound;
+   the render node's, which carries all GPU memory, is not. The fork of AMD's
+   DKMS tree on midori-amd-0 (`~/amdgpu`, branch `kfd-mmap`) adds
+   `AMDKFD_IOC_SET_MMAP_TARGET`, through which the owner names one other
+   process that may mmap. `kfdMemmapFile.WithHostMapTarget` names the stub
+   immediately before systrap's `mmap` and clears it after, via the new
+   `memmap.HostMapTargetFile` hook in `subprocess.MapFile`. Verified on
+   midori-amd-0 (R9700, gfx1201): queue + doorbell + ROCr blit kernels pass
+   under systrap, including two processes sequentially and concurrently with
+   `--amdproxy-share-kfd-vm`; the previous runsc still fails with `EBADF`. On a
+   stock driver the ioctl is `EINVAL`, logged once, and behaviour is as before.
+   `HSA_USERPTR_FOR_PAGED_MEM=0` is still needed on every platform: KFD pins
+   userptr pages from the Sentry's mm, where the application's address is not
+   mapped.
 7. **Registration keys off the root container's spec.** `registerFilesystems`
    takes `&l.root`, so under Kubernetes — where the root is the pause container
    and carries no devices — spec-based detection never fires and a pod depends

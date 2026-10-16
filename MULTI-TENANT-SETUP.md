@@ -63,17 +63,19 @@ broker).
 | --- | --- | --- |
 | OS / kernel | Ubuntu 22.04, 6.8.x | Ubuntu 24.04, **7.0.0-28+** (KVM device-memory fix needs ≥ 6.13) |
 | GPU | RTX 5070, driver **610.43.02**, 12 GiB | Navi 32 (gfx1101), 54 CUs, 12 GiB; **ROCm 7.2** |
-| gVisor platform | `systrap` (or `kvm`) | **`kvm`** (required — see note) |
+| gVisor platform | `systrap` (or `kvm`) | **`kvm`**, or `systrap` with the modified amdgpu driver — see note |
 | container runtime | containerd only (no docker) | docker + containerd |
 | GPU scheduler role | `hami-scheduler` | `hami-scheduler` (or `default-scheduler` for bare-annotation spatial) |
 | `runsc gpu-scheduler` | required (runlist enforcement) | required (time-slicing coordination) |
 
-**Why AMD requires `--platform=kvm`.** `/dev/kfd` binds each mapping to the
-process holding the KFD context; systrap maps from a stub process, so the mapping
-`mmap` returns `EINVAL`. Only KVM presents the Sentry as the mapping process. On
+**Why AMD needs `--platform=kvm` on a stock driver.** `/dev/kfd` binds each
+mapping to the process holding the KFD context; systrap maps from a stub process,
+so the mapping `mmap` fails. KVM presents the Sentry as the mapping process. On
 kernels **< 6.13**, KVM also has a device-memory bug (tail pages of a compound
-amdgpu allocation `SIGBUS`); sens1 runs 7.0.0-28 to avoid it. See
-`UPSTREAM-NOTES.md`.
+amdgpu allocation `SIGBUS`); sens1 runs 7.0.0-28 to avoid it. A node running the
+modified amdgpu driver (`AMDKFD_IOC_SET_MMAP_TARGET`, midori-amd-0) can use
+systrap instead, which also suits VMs without `/dev/kvm`. On either platform,
+pods need `HSA_USERPTR_FOR_PAGED_MEM=0`. See `UPSTREAM-NOTES.md`.
 
 ---
 

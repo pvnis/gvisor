@@ -256,20 +256,31 @@ Option 1 is what was done. Note that a kernel upgrade does not help the
 `/dev/kfd` problem below, which is why KVM rather than systrap is the platform
 for AMD.
 
-### KFD mappings are impossible on the systrap platform
+### KFD mappings on the systrap platform need a driver change
 
-Not a bug, but the other half of why nothing runs. KFD binds each mapping to
-the process that owns the KFD context. systrap performs guest mappings from a
-stub process, so `mmap` of `/dev/kfd` returns `EINVAL` there.
-`~/amdtest-mmaptest.c` demonstrates it directly:
+Not a gVisor bug, but the other half of why nothing ran. KFD binds each
+mapping to the process that owns the KFD context. systrap performs guest
+mappings from a stub process, so stock KFD fails the stub's `mmap` of
+`/dev/kfd` with `EBADF` (reported to the application as `EINVAL` before
+`6bfb3c267`). `~/amdtest-mmaptest.c` demonstrates it directly:
 
 | caller | `/dev/kfd` MMIO mmap | render node GEM mmap |
 | --- | --- | --- |
 | parent, which opened the fd | ok | ok |
-| forked child, separate mm | **EINVAL** | ok |
+| forked child, separate mm | **refused** | ok |
 | `CLONE_VM` child, shared mm | ok | ok |
 
 Only the KFD mapping is process-bound; the render node's is not.
+
+**Fixed with a driver change, on midori-amd-0.** A fork of AMD's DKMS tree
+(`~/amdgpu`, branch `kfd-mmap`) adds `AMDKFD_IOC_SET_MMAP_TARGET` (nr `0x86`, in
+AMD's out-of-tree range): the context's owner names one other process whose
+address space may receive the context's doorbell and MMIO mappings. The caller
+must pass a ptrace-style credential check on the target. gVisor names the stub
+immediately before systrap's `mmap` and clears it after (`memmap.HostMapTargetFile`,
+implemented by amdproxy's `kfdMemmapFile`). On a stock driver the ioctl fails
+with `EINVAL`, amdproxy logs it once, and nothing else changes. This would be
+the thing to propose to AMD if systrap support is wanted upstream.
 
 ### `/proc/net/tcp` is not network-namespace scoped
 
@@ -352,15 +363,18 @@ unrelated reasons, and only one combination works:
 
 | | `/dev/kfd` doorbell and MMIO | GPU memory via render node |
 | --- | --- | --- |
-| systrap | impossible, process-bound | works, all pages |
+| systrap, stock amdgpu | impossible, process-bound | works, all pages |
+| **systrap, amdgpu with `SET_MMAP_TARGET`** | **works** | **works** |
 | kvm, host < 6.13 | works | one page per TTM allocation |
 | **kvm, host >= 6.13** | **works** | **works** |
 
-So **KVM on a host kernel >= 6.13 is the only supported configuration for AMD**,
-and it is a real one: HIP kernels run to completion and several sandboxes share
-the GPU at once. The systrap row is not fixable from gVisor — KFD binds the
-mapping to the process holding its context, and systrap maps from a stub
-process.
+So with a stock driver, **KVM on a host kernel >= 6.13 is the only supported
+configuration for AMD**, and it is a real one: HIP kernels run to completion and
+several sandboxes share the GPU at once. The systrap row needs the driver change
+above, and with it systrap works too (verified on midori-amd-0, R9700/gfx1201,
+which has no `/dev/kvm`). Either way, ROCm needs `HSA_USERPTR_FOR_PAGED_MEM=0`
+inside the sandbox: KFD pins userptr pages from the Sentry's mm, where the
+application's addresses are not mapped.
 
 This document originally ended by recording that no ROCm or HIP application ran
 under gVisor at all, on either platform. That is no longer true, and the reason

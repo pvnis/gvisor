@@ -76,6 +76,7 @@ const (
 	SizeofKFDIoctlExportDmabufArgs           = 16
 	SizeofKFDIoctlRuntimeEnableArgs          = 16
 	SizeofKFDIoctlDbgTrapArgs                = 32
+	SizeofKFDIoctlSetMmapTargetArgs          = 8
 
 	SizeofKFDProcessDeviceApertures = 56
 )
@@ -119,6 +120,13 @@ var (
 	AMDKFD_IOC_EXPORT_DMABUF             = KFDIoctl(linux.IOWR(KFD_IOCTL_BASE, 0x24, SizeofKFDIoctlExportDmabufArgs))
 	AMDKFD_IOC_RUNTIME_ENABLE            = KFDIoctl(linux.IOWR(KFD_IOCTL_BASE, 0x25, SizeofKFDIoctlRuntimeEnableArgs))
 	AMDKFD_IOC_DBG_TRAP                  = KFDIoctl(linux.IOWR(KFD_IOCTL_BASE, 0x26, SizeofKFDIoctlDbgTrapArgs))
+
+	// AMDKFD_IOC_SET_MMAP_TARGET is not in upstream Linux. It comes from a
+	// modified amdgpu driver, in AMD's range for out-of-tree KFD ioctls, and
+	// lets the KFD context's owner name another process whose address space
+	// may mmap the context's /dev/kfd pages. A driver without it fails the
+	// ioctl with EINVAL.
+	AMDKFD_IOC_SET_MMAP_TARGET = KFDIoctl(linux.IOW(KFD_IOCTL_BASE, 0x86, SizeofKFDIoctlSetMmapTargetArgs))
 )
 
 // Timeout values for KFDIoctlWaitEventsArgs.Timeout, in milliseconds, from the
@@ -208,6 +216,8 @@ func (i KFDIoctl) String() string {
 		return "AMDKFD_IOC_RUNTIME_ENABLE"
 	case AMDKFD_IOC_DBG_TRAP:
 		return "AMDKFD_IOC_DBG_TRAP"
+	case AMDKFD_IOC_SET_MMAP_TARGET:
+		return "AMDKFD_IOC_SET_MMAP_TARGET"
 	default:
 		return fmt.Sprintf("UNKNOWN KFD COMMAND %#x", uint32(i))
 	}
@@ -787,4 +797,14 @@ type KFDIoctlDbgTrapQueryDebugEventArgs struct {
 	GPUID         uint32
 	QueueID       uint32
 	UnionPad      uint64
+}
+
+// KFDIoctlSetMmapTargetArgs is struct kfd_ioctl_set_mmap_target_args, from the
+// modified driver that defines AMDKFD_IOC_SET_MMAP_TARGET.
+type KFDIoctlSetMmapTargetArgs struct {
+	_ structs.HostLayout
+	// PID is the thread-group ID, in the caller's PID namespace, of the
+	// process whose address space may receive mappings. Zero clears it.
+	PID   uint32
+	Flags uint32
 }
