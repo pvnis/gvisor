@@ -24,7 +24,6 @@ import (
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -86,7 +85,7 @@ type kfdFD struct {
 
 	dev        *kfdDevice
 	queue      waiter.Queue
-	memmapFile fsutil.MmapPreciseFile
+	memmapFile kfdMemmapFile
 }
 
 func (fd *kfdFD) isRestored() bool {
