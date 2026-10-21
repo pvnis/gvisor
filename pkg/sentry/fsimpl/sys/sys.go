@@ -150,6 +150,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	productName := ""
 	busSub := make(map[string]kernfs.Inode)     // /sys/bus
 	pciDevices := make(map[string]kernfs.Inode) // /sys/bus/pci/devices
+	pciDrivers := make(map[string]kernfs.Inode) // /sys/bus/pci/drivers
 	kernelSub := kernelDir(ctx, fs, creds)      // /sys/kernel
 	if opts.InternalData != nil {
 		idata := opts.InternalData.(*InternalData)
@@ -187,6 +188,16 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			}
 			for name, sub := range pciDevicesSub {
 				pciDevices[name] = sub
+			}
+			for name, sub := range fs.newBusPCIDriversDir(ctx, creds, pciInfos) {
+				pciDrivers[name] = sub
+			}
+			// DPDK (rte_eal_check_module) and other VFIO users check that the
+			// VFIO modules are loaded before using /dev/vfio.
+			if hasVFIOPCIDevice(pciInfos) {
+				for _, module := range []string{"vfio", "vfio_pci", "vfio_iommu_type1"} {
+					moduleSub[module] = fs.newDir(ctx, creds, defaultSysDirMode, nil)
+				}
 			}
 
 			iommuGroups, err := fs.mirrorIOMMUGroups(ctx, creds, iommuGroupsPath, pciInfos)
@@ -252,9 +263,13 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		}
 	}
 	if len(pciDevices) > 0 {
-		busSub["pci"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+		pciSub := map[string]kernfs.Inode{
 			"devices": fs.newDir(ctx, creds, defaultSysDirMode, pciDevices),
-		})
+		}
+		if len(pciDrivers) > 0 {
+			pciSub["drivers"] = fs.newDir(ctx, creds, defaultSysDirMode, pciDrivers)
+		}
+		busSub["pci"] = fs.newDir(ctx, creds, defaultSysDirMode, pciSub)
 	}
 	devicesSub["system"] = fs.newDir(ctx, creds, defaultSysDirMode, systemSub)
 
@@ -413,8 +428,10 @@ func (fs *filesystem) mirrorIOMMUGroups(ctx context.Context, creds *auth.Credent
 		case unix.S_IFREG:
 			subs[dent] = fs.newHostFile(ctx, creds, defaultSysMode, absPath)
 		case unix.S_IFLNK:
-			if pciDeviceRegex.MatchString(dent) {
-				subs[dent] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), fmt.Sprintf("../../../../devices/%s", pciInfos[dent].path))
+			// Members of the group that the chroot hides (e.g. a bridge in a
+			// NIC VF's group) are left out.
+			if info, ok := pciInfos[dent]; ok && pciDeviceRegex.MatchString(dent) {
+				subs[dent] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), fmt.Sprintf("../../../../devices/%s", info.path))
 			}
 		}
 	}

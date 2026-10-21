@@ -186,6 +186,7 @@ func tpuProxyUpdateChroot(hostRoot, chroot string, spec *specs.Spec, conf *confi
 		return nil
 	}
 	allowedDeviceIDs := map[uint64]struct{}{}
+	specGroups := specVFIOGroups(spec)
 	paths, err := filepath.Glob(path.Join(hostRoot, "dev/vfio/*"))
 	if err != nil {
 		return fmt.Errorf("enumerating TPU device files: %w", err)
@@ -199,6 +200,11 @@ func tpuProxyUpdateChroot(hostRoot, chroot string, spec *specs.Spec, conf *confi
 		iommuGroupPath := path.Join("/sys/kernel/iommu_groups", devNum)
 		if err := bindMountSysfsInChrootReadonly(chroot, path.Join(hostRoot, iommuGroupPath), iommuGroupPath); err != nil {
 			return fmt.Errorf("error mounting %q in chroot: %v", iommuGroupPath, err)
+		}
+		if _, ok := specGroups[devNum]; ok {
+			if err := vfioPCIGroupUpdateChroot(hostRoot, chroot, iommuGroupPath); err != nil {
+				return err
+			}
 		}
 		allowedDeviceIDs[tpu.TPUV5pDeviceID] = struct{}{}
 		allowedDeviceIDs[tpu.TPUV5eDeviceID] = struct{}{}
@@ -238,6 +244,61 @@ func tpuProxyUpdateChroot(hostRoot, chroot string, spec *specs.Spec, conf *confi
 		}
 	}
 	return err
+}
+
+// specVFIOGroups returns the IOMMU group numbers of the /dev/vfio/$GROUP
+// devices in the spec.
+func specVFIOGroups(spec *specs.Spec) map[string]struct{} {
+	groups := map[string]struct{}{}
+	if spec.Linux == nil {
+		return groups
+	}
+	for _, dev := range spec.Linux.Devices {
+		if specutils.VFIOFunctionalityRequested(&dev) {
+			groups[path.Base(dev.Path)] = struct{}{}
+		}
+	}
+	return groups
+}
+
+// vfioPCIGroupUpdateChroot exposes, read-only, the sysfs directories of the
+// non-TPU PCI devices in an IOMMU group that the spec passes to the container,
+// e.g. a NIC virtual function bound to vfio-pci for DPDK. TPU devices are
+// handled by the vendor allowlist in tpuProxyUpdateChroot.
+//
+// Every non-TPU device in the group must be bound to vfio-pci, or be a bridge
+// that VFIO tolerates in a viable group (pcieport, pci-stub, or no driver),
+// which stays hidden.
+func vfioPCIGroupUpdateChroot(hostRoot, chroot, iommuGroupPath string) error {
+	links, err := filepath.Glob(path.Join(hostRoot, iommuGroupPath, "devices/*"))
+	if err != nil {
+		return fmt.Errorf("enumerating devices in %q: %w", iommuGroupPath, err)
+	}
+	for _, link := range links {
+		devDir, err := filepath.EvalSymlinks(link)
+		if err != nil {
+			return fmt.Errorf("resolving %q: %w", link, err)
+		}
+		if util.IsGooglePCIDevice(devDir) {
+			continue
+		}
+		driver := ""
+		if target, err := os.Readlink(path.Join(devDir, "driver")); err == nil {
+			driver = path.Base(target)
+		}
+		switch driver {
+		case "vfio-pci":
+		case "", "pcieport", "pci-stub":
+			continue
+		default:
+			return fmt.Errorf("PCI device %q in %q is bound to %q, not vfio-pci", path.Base(devDir), iommuGroupPath, driver)
+		}
+		chrootPath := strings.Replace(devDir, hostRoot, "/", 1)
+		if err := bindMountSysfsInChrootReadonly(chroot, devDir, chrootPath); err != nil {
+			return fmt.Errorf("error mounting %q in chroot: %v", devDir, err)
+		}
+	}
+	return nil
 }
 
 // rdmaSysfsUpdateChroot collects the host's RDMA sysfs state into a JSON

@@ -70,6 +70,13 @@ func IsPCIDeviceDirTPU(sysfsPath string, allowedDeviceIDs map[uint64]struct{}) b
 	return true
 }
 
+// IsGooglePCIDevice returns whether the PCI device at the given sysfs path has
+// Google's vendor ID (i.e. is a TPU).
+func IsGooglePCIDevice(sysfsPath string) bool {
+	vendor, err := readHexInt(path.Join(sysfsPath, vendorFile))
+	return err == nil && vendor == googleVendorID
+}
+
 // IsTPUDeviceValid returns if the accelerator device is valid.
 func IsTPUDeviceValid(path string) (bool, error) {
 	valid, err := tpuV4DeviceValid(path)

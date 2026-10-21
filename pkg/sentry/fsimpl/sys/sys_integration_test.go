@@ -496,3 +496,83 @@ func TestRDMASysfs(t *testing.T) {
 		}
 	}
 }
+
+// Check that sysfs exposes a generic vfio-pci device (a NIC virtual function
+// passed through for DPDK) with the entries DPDK's PCI bus scan reads.
+func TestEnableTPUProxyPathsVFIOPCI(t *testing.T) {
+	sysfsTestDir := t.TempDir()
+	const (
+		vf    = "0000:00:05.0"
+		group = "7"
+	)
+	devPath := path.Join(sysfsTestDir, "sys", "devices", "pci0000:00", vf)
+	driverPath := path.Join(sysfsTestDir, "sys", "bus", "pci", "drivers", "vfio-pci")
+	iommuPath := path.Join(sysfsTestDir, "sys", "kernel", "iommu_groups", group, "devices")
+	for _, dir := range []string{devPath, driverPath, iommuPath, path.Join(devPath, "net")} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("Failed to create %q: %v", dir, err)
+		}
+	}
+	files := map[string]string{
+		"vendor": "0x8086\n", "device": "0x1889\n", "class": "0x020000\n",
+		"numa_node": "0\n", "max_vfs": "0\n", "resource": "0x0 0x0 0x0\n",
+		"remove": "", // Writable on the host; not passed through.
+	}
+	for name, content := range files {
+		if err := os.WriteFile(path.Join(devPath, name), []byte(content), 0644); err != nil {
+			t.Fatalf("Failed to write %q: %v", name, err)
+		}
+	}
+	links := map[string]string{
+		path.Join(devPath, "driver"):      "../../../bus/pci/drivers/vfio-pci",
+		path.Join(devPath, "iommu_group"): "../../../kernel/iommu_groups/" + group,
+		path.Join(iommuPath, vf):          "../../../../devices/pci0000:00/" + vf,
+		// A member of the group whose sysfs directory the chroot hides.
+		path.Join(iommuPath, "0000:00:01.0"): "../../../../devices/pci0000:00/0000:00:01.0",
+	}
+	for link, target := range links {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatalf("Failed to symlink %q: %v", link, err)
+		}
+	}
+
+	s := newTestSystem(t, sysfsTestDir)
+	defer s.Destroy()
+
+	s.AssertAllDirentTypes(s.ListDirents(s.PathOpAtRoot("/devices/pci0000:00/"+vf)), map[string]testutil.DirentType{
+		"vendor":      linux.DT_REG,
+		"device":      linux.DT_REG,
+		"class":       linux.DT_REG,
+		"numa_node":   linux.DT_REG,
+		"max_vfs":     linux.DT_REG,
+		"resource":    linux.DT_REG,
+		"driver":      linux.DT_LNK,
+		"iommu_group": linux.DT_LNK,
+	})
+	for p, want := range map[string]string{
+		"/devices/pci0000:00/" + vf + "/driver":            "../../../bus/pci/drivers/vfio-pci",
+		"/devices/pci0000:00/" + vf + "/iommu_group":       "../../../kernel/iommu_groups/" + group,
+		"/bus/pci/drivers/vfio-pci/" + vf:                  "../../../../devices/pci0000:00/" + vf,
+		"/kernel/iommu_groups/" + group + "/devices/" + vf: "../../../../devices/pci0000:00/" + vf,
+	} {
+		got, err := s.VFS.ReadlinkAt(s.Ctx, s.Creds, s.PathOpAtRoot(p))
+		if err != nil {
+			t.Fatalf("ReadlinkAt(%q): %v", p, err)
+		}
+		if got != want {
+			t.Errorf("ReadlinkAt(%q) = %q, want %q", p, got, want)
+		}
+	}
+	s.AssertAllDirentTypes(s.ListDirents(s.PathOpAtRoot("/kernel/iommu_groups/"+group+"/devices")), map[string]testutil.DirentType{
+		vf: linux.DT_LNK,
+	})
+	if got, err := readTestFile(s, "/devices/pci0000:00/"+vf+"/vendor"); err != nil || got != "0x8086\n" {
+		t.Errorf("vendor = %q, %v; want %q", got, err, "0x8086\n")
+	}
+	for _, module := range []string{"vfio", "vfio_pci", "vfio_iommu_type1"} {
+		pop := s.PathOpAtRoot("/module/" + module)
+		if _, err := s.VFS.StatAt(s.Ctx, s.Creds, pop, &vfs.StatOptions{}); err != nil {
+			t.Errorf("Stat(/sys/module/%s): %v", module, err)
+		}
+	}
+}

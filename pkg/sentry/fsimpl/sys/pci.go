@@ -17,6 +17,7 @@ package sys
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	regex "regexp"
 	"sort"
@@ -56,7 +57,15 @@ var (
 		"bar_offsets": nil, "bar_sizes": nil, "resource0": nil, "resource1": nil,
 		"resource2": nil, "resource3": nil, "resource4": nil, "resource5": nil,
 		"enable": nil,
+		// Read by DPDK's PCI bus scan (drivers/bus/pci/linux/pci.c) for
+		// generic VFIO devices such as NIC virtual functions.
+		"max_vfs": nil, "sriov_numvfs": nil, "sriov_totalvfs": nil,
+		"local_cpulist": nil, "local_cpus": nil, "irq": nil, "modalias": nil,
 	}
+
+	// vfioPCIDriver is the host driver that VFIO PCI passthrough devices are
+	// bound to.
+	vfioPCIDriver = "vfio-pci"
 
 	pciAddressLength = 13
 )
@@ -132,6 +141,9 @@ type pciDeviceInfo struct {
 	iommuGroup int
 	physfn     pciAddress
 	virtfn     pciAddressSet
+	// driver is the name of the host driver the device is bound to (e.g.
+	// vfio-pci), or empty if it is unbound or the driver link is hidden.
+	driver string
 }
 
 // pciDeviceInfos returns the information about all PCI devices on the host in a
@@ -219,7 +231,10 @@ func walkPCIDeviceTopology(pciPath, sysDevicesPath string, devices map[string]*p
 				}
 			}
 
-			devices[pciDirChild] = &pciDeviceInfo{path: pciDirChildPath}
+			devices[pciDirChild] = &pciDeviceInfo{
+				path:   pciDirChildPath,
+				driver: hostDriverName(path.Join(sysDevicesPath, pciDirChildPath)),
+			}
 			if err := walkPCIDeviceTopology(pciDirChildPath, sysDevicesPath, devices); err != nil {
 				return err
 			}
@@ -252,7 +267,11 @@ func pciDeviceIOMMUGroups(iommuGroupsPath string, pciInfos map[string]*pciDevice
 			if err != nil {
 				return err
 			}
-			pciInfos[pciDeviceName].iommuGroup = groupNum
+			// Only devices whose sysfs directory is visible are tracked; the
+			// chroot may expose an IOMMU group without all of its members.
+			if info, ok := pciInfos[pciDeviceName]; ok {
+				info.iommuGroup = groupNum
+			}
 		}
 	}
 	return nil
@@ -314,6 +333,46 @@ func (fs *filesystem) newBusPCIDevicesDir(ctx context.Context, creds *auth.Crede
 	return pciDevicesDir, nil
 }
 
+// Create /sys/bus/pci/drivers/$DRIVER/$DEVICE symlinks for the devices whose
+// host driver is known.
+func (fs *filesystem) newBusPCIDriversDir(ctx context.Context, creds *auth.Credentials, pciPaths map[string]*pciDeviceInfo) map[string]kernfs.Inode {
+	drivers := map[string]map[string]kernfs.Inode{}
+	for pciDevice, pciPath := range pciPaths {
+		if pciPath.driver == "" || pciPath.path == "" {
+			continue
+		}
+		if drivers[pciPath.driver] == nil {
+			drivers[pciPath.driver] = map[string]kernfs.Inode{}
+		}
+		drivers[pciPath.driver][pciDevice] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), fmt.Sprintf("../../../../devices/%s", pciPath.path))
+	}
+	driversDir := map[string]kernfs.Inode{}
+	for driver, devices := range drivers {
+		driversDir[driver] = fs.newDir(ctx, creds, defaultSysDirMode, devices)
+	}
+	return driversDir
+}
+
+// hasVFIOPCIDevice returns whether any visible PCI device is bound to vfio-pci.
+func hasVFIOPCIDevice(pciPaths map[string]*pciDeviceInfo) bool {
+	for _, pciPath := range pciPaths {
+		if pciPath.driver == vfioPCIDriver {
+			return true
+		}
+	}
+	return false
+}
+
+// hostDriverName returns the name of the driver that the host PCI device at
+// the given sysfs path is bound to, or "" if none.
+func hostDriverName(pciDevicePath string) string {
+	target, err := os.Readlink(path.Join(pciDevicePath, "driver"))
+	if err != nil {
+		return ""
+	}
+	return path.Base(target)
+}
+
 // Recursively build out sysfs directories according to the allowlisted files,
 // directories, and symlinks defined in this package.
 func (fs *filesystem) mirrorSysDevicesDir(ctx context.Context, creds *auth.Credentials, dir string, pciInfos map[string]*pciDeviceInfo) (map[string]kernfs.Inode, error) {
@@ -366,6 +425,15 @@ func (fs *filesystem) mirrorSysDevicesDir(ctx context.Context, creds *auth.Crede
 					}
 					linkContent = path.Join("../", pciInfos[pciDirName].virtfn[num].String())
 				}
+			case dent == "driver" && pciDeviceRegex.MatchString(path.Base(dir)):
+				pciInfo, ok := pciInfos[path.Base(dir)]
+				if !ok || pciInfo.driver == "" {
+					continue
+				}
+				// See the iommu_group case below for the path arithmetic.
+				pciPathComponents := strings.Split(pciInfo.path, "/")
+				upDirs := strings.Repeat("../", len(pciPathComponents)+1)
+				linkContent = fmt.Sprintf("%sbus/pci/drivers/%s", upDirs, pciInfo.driver)
 			case dent == "iommu_group":
 				pciDeviceName, err := pciDeviceName(dir)
 				if err != nil {
