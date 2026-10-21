@@ -260,6 +260,22 @@ func (fd *pciDeviceFD) vfioSetIrqs(ctx context.Context, t *kernel.Task, arg host
 	if irqSet.Flags&^vfioIrqSetFlags != 0 {
 		return 0, linuxerr.EINVAL
 	}
+	// Bound the data array before allocating it. A PCI function has at most
+	// 2048 MSI-X vectors, and argsz must cover the data, as in
+	// drivers/vfio/vfio_main.c:vfio_set_irqs_validate_and_prepare().
+	if irqSet.Count > maxIrqSetCount {
+		return 0, linuxerr.EINVAL
+	}
+	var elemSize uint32
+	switch irqSet.Flags & linux.VFIO_IRQ_SET_DATA_TYPE_MASK {
+	case linux.VFIO_IRQ_SET_DATA_BOOL:
+		elemSize = 1
+	case linux.VFIO_IRQ_SET_DATA_EVENTFD:
+		elemSize = 4
+	}
+	if irqSet.Argsz < uint32(irqSet.SizeBytes())+irqSet.Count*elemSize {
+		return 0, linuxerr.EINVAL
+	}
 	// See drivers/vfio/vfio_main.c:vfio_set_irqs_validate_and_prepare,
 	// VFIO uses the data type at the request's flags to determine
 	// the memory layout of data field.

@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/devices/tpuproxy/util"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
@@ -128,8 +129,12 @@ func (fd *vfioFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args
 		panic("Ioctl should be called from a task context")
 	}
 	switch cmd {
+	case linux.VFIO_GET_API_VERSION:
+		return util.IOCTLInvoke[uint32, uintptr](fd.hostFD, linux.VFIO_GET_API_VERSION, 0)
 	case linux.VFIO_CHECK_EXTENSION:
 		return fd.checkExtension(extension(args[2].Int()))
+	case linux.VFIO_IOMMU_GET_INFO:
+		return fd.iommuGetInfo(t, args[2].Pointer())
 	case linux.VFIO_SET_IOMMU:
 		return fd.setIOMMU(extension(args[2].Int()))
 	case linux.VFIO_IOMMU_MAP_DMA:
@@ -152,7 +157,52 @@ func (fd *vfioFD) checkExtension(ext extension) (uintptr, error) {
 		}
 		return ret, nil
 	}
-	return 0, linuxerr.EINVAL
+	// Like the host, report other extensions (e.g. VFIO_NOIOMMU_IOMMU, which
+	// DPDK probes) as unsupported rather than failing: callers treat an
+	// error as fatal.
+	return 0, nil
+}
+
+// iommuGetInfo implements VFIO_IOMMU_GET_INFO. The host's capability chain
+// (IOVA ranges, migration, DMA availability) only describes the host
+// container, so it is passed through unchanged.
+func (fd *vfioFD) iommuGetInfo(t *kernel.Task, arg hostarch.Addr) (uintptr, error) {
+	var info linux.VFIOIommuType1Info
+	if _, err := primitive.CopyUint32In(t, arg, &info.Argsz); err != nil {
+		return 0, err
+	}
+	// drivers/vfio/vfio_iommu_type1.c:vfio_iommu_type1_get_info() requires
+	// argsz to cover at least the fields up to iova_pgsizes.
+	const minArgsz = 16
+	appArgsz := int(info.Argsz)
+	if appArgsz < minArgsz {
+		return 0, linuxerr.EINVAL
+	}
+	buf := make([]byte, max(min(appArgsz, 1024), info.SizeBytes()))
+	if _, err := t.CopyInBytes(arg, buf[:min(len(buf), appArgsz)]); err != nil {
+		return 0, err
+	}
+retry:
+	info.UnmarshalUnsafe(buf)
+	info.Argsz = uint32(len(buf))
+	info.MarshalUnsafe(buf)
+	ret, err := util.IOCTLInvokePtrArg[uint32](fd.hostFD, linux.VFIO_IOMMU_GET_INFO, &buf[0])
+	if err != nil {
+		return 0, err
+	}
+	if len(buf) < appArgsz {
+		// The host sets argsz to the size needed for the capability chain
+		// when the buffer is too small for it.
+		info.UnmarshalUnsafe(buf)
+		if info.Flags&linux.VFIO_IOMMU_INFO_CAPS != 0 && info.CapOffset == 0 && int(info.Argsz) > len(buf) && int(info.Argsz) <= appArgsz {
+			buf = make([]byte, info.Argsz)
+			goto retry
+		}
+	}
+	if _, err := t.CopyOutBytes(arg, buf[:min(len(buf), appArgsz)]); err != nil {
+		return 0, err
+	}
+	return ret, nil
 }
 
 // Set the iommu to the given type.  The type must be supported by an iommu
@@ -262,7 +312,7 @@ func (fd *vfioFD) iommuUnmapDma(ctx context.Context, t *kernel.Task, arg hostarc
 	}
 	n, err := util.IOCTLInvokePtrArg[uint32](fd.hostFD, linux.VFIO_IOMMU_UNMAP_DMA, &dmaUnmap)
 	if err != nil {
-		return 0, nil
+		return 0, err
 	}
 	if _, err := dmaUnmap.CopyOut(t, arg); err != nil {
 		return 0, err

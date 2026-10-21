@@ -25,10 +25,26 @@ const (
 	VFIO_TYPE = ';'
 	VFIO_BASE = 100
 
+	// VFIO_API_VERSION is the version returned by VFIO_GET_API_VERSION.
+	VFIO_API_VERSION = 0
+
 	// VFIO extensions.
 	VFIO_TYPE1_IOMMU     = 1
 	VFIO_SPAPR_TCE_IOMMU = 2
 	VFIO_TYPE1v2_IOMMU   = 3
+	VFIO_NOIOMMU_IOMMU   = 8
+)
+
+// VFIOGroupStatus flags.
+const (
+	VFIO_GROUP_FLAGS_VIABLE        = 1 << 0
+	VFIO_GROUP_FLAGS_CONTAINER_SET = 1 << 1
+)
+
+// VFIOIommuType1Info flags.
+const (
+	VFIO_IOMMU_INFO_PGSIZES = 1 << 0
+	VFIO_IOMMU_INFO_CAPS    = 1 << 1
 )
 
 // VFIO device info flags.
@@ -116,8 +132,10 @@ const (
 
 // IOCTLs for VFIO file descriptor from include/uapi/linux/vfio.h.
 var (
+	VFIO_GET_API_VERSION        = IO(VFIO_TYPE, VFIO_BASE+0)
 	VFIO_CHECK_EXTENSION        = IO(VFIO_TYPE, VFIO_BASE+1)
 	VFIO_SET_IOMMU              = IO(VFIO_TYPE, VFIO_BASE+2)
+	VFIO_GROUP_GET_STATUS       = IO(VFIO_TYPE, VFIO_BASE+3)
 	VFIO_GROUP_SET_CONTAINER    = IO(VFIO_TYPE, VFIO_BASE+4)
 	VFIO_GROUP_UNSET_CONTAINER  = IO(VFIO_TYPE, VFIO_BASE+5)
 	VFIO_GROUP_GET_DEVICE_FD    = IO(VFIO_TYPE, VFIO_BASE+6)
@@ -126,9 +144,35 @@ var (
 	VFIO_DEVICE_GET_IRQ_INFO    = IO(VFIO_TYPE, VFIO_BASE+9)
 	VFIO_DEVICE_SET_IRQS        = IO(VFIO_TYPE, VFIO_BASE+10)
 	VFIO_DEVICE_RESET           = IO(VFIO_TYPE, VFIO_BASE+11)
+	VFIO_IOMMU_GET_INFO         = IO(VFIO_TYPE, VFIO_BASE+12)
 	VFIO_IOMMU_MAP_DMA          = IO(VFIO_TYPE, VFIO_BASE+13)
 	VFIO_IOMMU_UNMAP_DMA        = IO(VFIO_TYPE, VFIO_BASE+14)
 )
+
+// VFIOGroupStatus is analogous to vfio_group_status
+// from include/uapi/linux/vfio.h.
+//
+// +marshal
+type VFIOGroupStatus struct {
+	_     structs.HostLayout
+	Argsz uint32
+	Flags uint32
+}
+
+// VFIOIommuType1Info is analogous to vfio_iommu_type1_info
+// from include/uapi/linux/vfio.h.
+//
+// +marshal
+type VFIOIommuType1Info struct {
+	_     structs.HostLayout
+	Argsz uint32
+	Flags uint32
+	// Bitmap of supported page sizes.
+	IOVaPgsizes uint64
+	// Offset within info struct of first cap.
+	CapOffset uint32
+	pad       uint32
+}
 
 // VFIODeviceInfo is analogous to vfio_device_info
 // from include/uapi/linux/vfio.h.

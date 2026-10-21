@@ -39,6 +39,10 @@ const (
 	// A value of -1 can be used to either de-assign interrupts if already
 	// assigned or skip un-assigned interrupts.
 	disableInterrupt = -1
+
+	// maxIrqSetCount bounds VFIO_DEVICE_SET_IRQS: a PCI function has at most
+	// 2048 MSI-X vectors.
+	maxIrqSetCount = 2048
 )
 
 var (
@@ -137,6 +141,8 @@ func (fd *tpuFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 		panic("Ioctl should be called from a task context")
 	}
 	switch cmd {
+	case linux.VFIO_GROUP_GET_STATUS:
+		return fd.getStatus(t, args[2].Pointer())
 	case linux.VFIO_GROUP_SET_CONTAINER:
 		return fd.setContainer(ctx, t, args[2].Pointer())
 	case linux.VFIO_GROUP_UNSET_CONTAINER:
@@ -147,6 +153,28 @@ func (fd *tpuFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 		return ret, err
 	}
 	return 0, linuxerr.ENOSYS
+}
+
+// getStatus implements VFIO_GROUP_GET_STATUS by asking the host, which knows
+// whether every device in the group is bound to a VFIO driver (viable) and
+// whether the group already belongs to a container.
+func (fd *tpuFD) getStatus(t *kernel.Task, arg hostarch.Addr) (uintptr, error) {
+	var status linux.VFIOGroupStatus
+	if _, err := status.CopyIn(t, arg); err != nil {
+		return 0, err
+	}
+	if int(status.Argsz) < status.SizeBytes() {
+		return 0, linuxerr.EINVAL
+	}
+	status.Argsz = uint32(status.SizeBytes())
+	ret, err := util.IOCTLInvokePtrArg[uint32](fd.hostFD, linux.VFIO_GROUP_GET_STATUS, &status)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := status.CopyOut(t, arg); err != nil {
+		return 0, err
+	}
+	return ret, nil
 }
 
 func (fd *tpuFD) setContainer(ctx context.Context, t *kernel.Task, arg hostarch.Addr) (uintptr, error) {

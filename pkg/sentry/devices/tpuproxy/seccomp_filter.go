@@ -66,7 +66,19 @@ func Filters() seccomp.SyscallRules {
 		unix.SYS_IOCTL: seccomp.Or{
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(linux.VFIO_GET_API_VERSION),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
 				seccomp.EqualTo(linux.VFIO_CHECK_EXTENSION),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(linux.VFIO_GROUP_GET_STATUS),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(linux.VFIO_IOMMU_GET_INFO),
 			},
 			seccomp.PerArg{
 				seccomp.NonNegativeFD{},
