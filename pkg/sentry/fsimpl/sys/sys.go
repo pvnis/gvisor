@@ -319,14 +319,25 @@ func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs
 	// For consistency with /proc/cpuinfo, pretend all CPUs are in the same
 	// socket and each CPU is a distinct core.
 	fullMask := fullCPUMask(maxCPUCores) + "\n"
+	fullList := fmt.Sprintf("0-%d\n", maxCPUCores-1)
 	for i := uint(0); i < maxCPUCores; i++ {
 		oneMask := oneCPUMask(i, maxCPUCores) + "\n"
+		oneList := fmt.Sprintf("%d\n", i)
 		children[fmt.Sprintf("cpu%d", i)] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 			"topology": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"core_cpus":       fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
-				"core_siblings":   fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
-				"package_cpus":    fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
-				"thread_siblings": fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
+				"core_cpus":            fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
+				"core_cpus_list":       fs.newStaticFile(ctx, creds, defaultSysMode, oneList),
+				"core_siblings":        fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
+				"core_siblings_list":   fs.newStaticFile(ctx, creds, defaultSysMode, fullList),
+				"package_cpus":         fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
+				"package_cpus_list":    fs.newStaticFile(ctx, creds, defaultSysMode, fullList),
+				"thread_siblings":      fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
+				"thread_siblings_list": fs.newStaticFile(ctx, creds, defaultSysMode, oneList),
+				// DPDK's EAL (eal_cpu_detected(), eal_cpu_core_id()) requires
+				// core_id to consider a CPU present.
+				"core_id":             fs.newStaticFile(ctx, creds, defaultSysMode, oneList),
+				"die_id":              fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
+				"physical_package_id": fs.newStaticFile(ctx, creds, defaultSysMode, "0\n"),
 			}),
 		})
 	}
