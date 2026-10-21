@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -109,6 +110,14 @@ type endpoint struct {
 	packetMMapReserve int
 	// +checklocks:packetMmapMu
 	packetMMapEp stack.PacketMMapEndpoint
+
+	// fanout is the PACKET_FANOUT group the endpoint belongs to, if any, and
+	// fanoutArg the option that joined it. Fanout groups are not saved.
+	fanoutMu sync.Mutex `state:"nosave"`
+	// +checklocks:fanoutMu
+	fanout *fanoutGroup `state:"nosave"`
+	// +checklocks:fanoutMu
+	fanoutArg uint32
 }
 
 // NewEndpoint returns a new packet endpoint.
@@ -151,6 +160,13 @@ func (ep *endpoint) Close() {
 		return
 	}
 	ep.stack.UnregisterPacketEndpoint(ep.boundNIC, ep.boundNetProto, ep)
+
+	ep.fanoutMu.Lock()
+	if ep.fanout != nil {
+		ep.fanout.leave(ep)
+		ep.fanout = nil
+	}
+	ep.fanoutMu.Unlock()
 
 	ep.packetMmapMu.Lock()
 	if ep.packetMMapEp != nil {
@@ -389,7 +405,7 @@ func (ep *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 
 // SetSockOpt implements tcpip.Endpoint.SetSockOpt.
 func (ep *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) tcpip.Error {
-	switch opt.(type) {
+	switch o := opt.(type) {
 	case *tcpip.SocketDetachFilterOption:
 		return nil
 	case *tcpip.TpacketReq:
@@ -398,6 +414,21 @@ func (ep *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) tcpip.Error {
 		if !ep.rcvList.Empty() {
 			return &tcpip.ErrWouldBlock{}
 		}
+		return nil
+	case *tcpip.PacketFanoutOption:
+		ep.fanoutMu.Lock()
+		defer ep.fanoutMu.Unlock()
+		if ep.fanout != nil {
+			// net/packet/af_packet.c:fanout_add() fails with EALREADY, which
+			// is how ErrAlreadyConnecting translates.
+			return &tcpip.ErrAlreadyConnecting{}
+		}
+		g, err := joinFanout(ep, o.Arg)
+		if err != nil {
+			return err
+		}
+		ep.fanout = g
+		ep.fanoutArg = o.Arg
 		return nil
 
 	default:
@@ -466,6 +497,14 @@ func (ep *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) tcpip.Error {
 		}
 		*opt = ep.packetMMapEp.Stats()
 		return nil
+	case *tcpip.PacketFanoutOption:
+		ep.fanoutMu.Lock()
+		defer ep.fanoutMu.Unlock()
+		if ep.fanout == nil {
+			return &tcpip.ErrUnknownProtocolOption{}
+		}
+		opt.Arg = ep.fanoutArg
+		return nil
 	default:
 		return &tcpip.ErrUnknownProtocolOption{}
 	}
@@ -498,6 +537,12 @@ func (ep *endpoint) HasNIC(id int32) bool {
 
 // handlePacket implements stack.PacketEndpoint.HandlePacket
 func (ep *endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	ep.fanoutMu.Lock()
+	g := ep.fanout
+	ep.fanoutMu.Unlock()
+	if g != nil && !g.accepts(ep, pkt) {
+		return
+	}
 	ep.packetMmapMu.RLock()
 	if ep.packetMMapEp != nil {
 		if handled := ep.packetMMapEp.HandlePacket(nicID, netProto, pkt); handled {

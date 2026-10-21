@@ -1225,6 +1225,19 @@ type TpacketStats struct {
 
 func (*TpacketStats) isGettableSocketOption() {}
 
+// PacketFanoutOption is the PACKET_FANOUT option of a packet socket: the
+// fanout group ID in the low 16 bits, and the fanout mode and flags in the
+// high 16 bits, as in <linux/if_packet.h>.
+//
+// +stateify savable
+type PacketFanoutOption struct {
+	Arg uint32
+}
+
+func (*PacketFanoutOption) isGettableSocketOption() {}
+
+func (*PacketFanoutOption) isSettableSocketOption() {}
+
 // EndpointState represents the state of an endpoint.
 type EndpointState uint8
 

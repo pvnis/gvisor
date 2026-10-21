@@ -1759,6 +1759,7 @@ cc_binary(
     malloc = "//test/util:errno_safe_allocator",
     deps = select_gtest() + [
         ":ip_socket_test_util",
+        "@com_google_absl//absl/time",
         "//test/util:capability_util",
         "//test/util:file_descriptor",
         "//test/util:logging",

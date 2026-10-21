@@ -54,6 +54,7 @@ go_library(
         "endpoint_mutex.go",
         "endpoint_rcv_mutex.go",
         "endpoint_state.go",
+        "fanout.go",
         "last_error_mutex.go",
         "packet_list.go",
         "packet_mmap_mutex.go",

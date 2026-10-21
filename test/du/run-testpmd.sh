@@ -9,6 +9,7 @@ MODE=${1:-hugetlbfs}
 FWD=${FWD:-txonly}
 SEND=${SEND:-0}
 NET=${NET:-sandbox}  # sandbox (netstack, --l2-links) or host (hostinet)
+QPAIRS=${QPAIRS:-1}
 BATCH=${BATCH:-0}  # sleep 1 ms after every BATCH injected frames (0: no pacing)
 RUNSC=${RUNSC:-/tmp/runsc-du}
 TESTPMD=${TESTPMD:-$HOME/dpdk-src/dpdk-stable-24.11.3/build/app/dpdk-testpmd}
@@ -17,13 +18,13 @@ ip link add fh0p type veth peer name fh0 netns dutest 2>/dev/null
 ip link set fh0p address 02:00:00:00:00:02 up
 ip -n dutest link set fh0 address 02:00:00:00:00:01 up
 ip -n dutest link set lo up
-EAL="-l 0-1 -m 256 --file-prefix=du --vdev=net_af_packet0,iface=fh0"
+EAL="-l 0-$QPAIRS -m 256 --file-prefix=du --vdev=net_af_packet0,iface=fh0,qpairs=$QPAIRS"
 case $MODE in
   in-memory) EAL="$EAL --in-memory" ;;
   no-huge) EAL="$EAL --no-huge" ;;
 esac
 B=/tmp/du-bundle-pmd; rm -rf $B; mkdir -p $B; cd $B
-$RUNSC spec -- /bin/sh -c "grep -i huge /proc/meminfo; (sleep 4; grep HugePages_Free /proc/meminfo | sed s/^/during-run-/) & timeout -s INT 6 $TESTPMD $EAL -- --forward-mode=$FWD --auto-start --stats-period=2 --total-num-mbufs=4096 </dev/null; echo testpmd-exit=\$?; grep -i hugepages_free /proc/meminfo"
+$RUNSC spec -- /bin/sh -c "grep -i huge /proc/meminfo; (sleep 4; grep HugePages_Free /proc/meminfo | sed s/^/during-run-/) & timeout -s INT 6 $TESTPMD $EAL -- --forward-mode=$FWD --rxq=$QPAIRS --txq=$QPAIRS --nb-cores=$QPAIRS --auto-start --stats-period=2 --total-num-mbufs=4096 </dev/null; echo testpmd-exit=\$?; grep -i hugepages_free /proc/meminfo"
 python3 - "$MODE" <<'PY'
 import json, sys
 c = json.load(open("config.json"))
@@ -50,7 +51,7 @@ s.bind(('fh0p', 0))
 f = bytes.fromhex('020000000001020000000002aefe1000') + bytes(48)
 import time
 for i in range($SEND):
-    s.send(f)
+    s.send(f[:11] + bytes([i % 16]) + f[12:])
     if $BATCH and i % $BATCH == $BATCH - 1: time.sleep(0.001)
 ") &
 fi

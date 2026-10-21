@@ -3059,15 +3059,11 @@ func (s *sock) setSockOptPacket(t *kernel.Task, ep commonEndpoint, name int, opt
 		s.packetLoss.Store(hostarch.ByteOrder.Uint32(optVal) != 0)
 		return nil
 	case linux.PACKET_FANOUT:
-		// Fanout spreads a group's frames over its sockets. With one socket
-		// per group, as DPDK's af_packet PMD creates with one queue pair,
-		// that is the same as no fanout. Larger groups are not supported:
-		// each of their sockets would receive every frame.
 		if len(optVal) < sizeOfInt32 {
 			return syserr.ErrInvalidArgument
 		}
-		log.Infof("PACKET_FANOUT %#x accepted; frames are not spread across sockets", hostarch.ByteOrder.Uint32(optVal))
-		return nil
+		v := tcpip.PacketFanoutOption{Arg: hostarch.ByteOrder.Uint32(optVal)}
+		return syserr.TranslateNetstackError(ep.SetSockOpt(&v))
 	case linux.PACKET_QDISC_BYPASS:
 		// Netstack's packet endpoints write directly to the link endpoint, so
 		// frames already bypass the sandbox's queueing discipline.

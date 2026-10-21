@@ -19,11 +19,15 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <iterator>
 #include <limits>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "test/syscalls/linux/ip_socket_test_util.h"
 #include "test/util/capability_util.h"
 #include "test/util/file_descriptor.h"
@@ -481,6 +485,91 @@ TEST_P(PacketSocketTest, SendWithoutTargetDevice) {
 
 INSTANTIATE_TEST_SUITE_P(AllPacketSocketTests, PacketSocketTest,
                          Values(SOCK_DGRAM, SOCK_RAW));
+
+// Tests that a PACKET_FANOUT_HASH group delivers each frame to exactly one
+// of its sockets, and keeps a flow on one socket.
+TEST(PacketSocketFanoutTest, HashDeliversEachFrameOnce) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HavePacketSocketCapability(SOCK_RAW, 0)));
+  constexpr uint16_t kEtherType = 0x88B5;  // IEEE local experimental.
+  constexpr int kMembers = 2;
+  constexpr int kFlows = 16;
+  constexpr int kFramesPerFlow = 4;
+  const int lo = ASSERT_NO_ERRNO_AND_VALUE(GetLoopbackIndex());
+  sockaddr_ll addr = {
+      .sll_family = AF_PACKET,
+      .sll_protocol = htons(kEtherType),
+      .sll_ifindex = lo,
+      .sll_halen = ETH_ALEN,
+  };
+
+  FileDescriptor members[kMembers];
+  // A group ID unlikely to collide with other users of the network namespace.
+  constexpr int kFanoutHash = 0;  // PACKET_FANOUT_HASH, from <linux/if_packet.h>.
+  const int fanout_arg = (getpid() & 0xffff) | (kFanoutHash << 16);
+  for (auto& member : members) {
+    member = ASSERT_NO_ERRNO_AND_VALUE(
+        Socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(kEtherType)));
+    ASSERT_THAT(
+        bind(member.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+        SyscallSucceeds());
+    ASSERT_THAT(setsockopt(member.get(), SOL_PACKET, PACKET_FANOUT, &fanout_arg,
+                           sizeof(fanout_arg)),
+                SyscallSucceeds());
+  }
+  // Joining twice fails.
+  EXPECT_THAT(setsockopt(members[0].get(), SOL_PACKET, PACKET_FANOUT,
+                         &fanout_arg, sizeof(fanout_arg)),
+              SyscallFailsWithErrno(EALREADY));
+
+  FileDescriptor tx = ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_PACKET, SOCK_RAW, 0));
+  for (int i = 0; i < kFlows * kFramesPerFlow; i++) {
+    char frame[ETH_ZLEN] = {};
+    ethhdr* eth = reinterpret_cast<ethhdr*>(frame);
+    eth->h_source[5] = i % kFlows;  // The flow.
+    eth->h_proto = htons(kEtherType);
+    ASSERT_THAT(sendto(tx.get(), frame, sizeof(frame), 0,
+                       reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+                SyscallSucceedsWithValue(sizeof(frame)));
+  }
+
+  // Collect which member received each flow's frames.
+  int flow_member[kFlows];
+  int flow_frames[kFlows] = {};
+  std::fill(std::begin(flow_member), std::end(flow_member), -1);
+  int total = 0;
+  const absl::Time deadline = absl::Now() + absl::Seconds(5);
+  while (total < kFlows * kFramesPerFlow && absl::Now() < deadline) {
+    for (int m = 0; m < kMembers; m++) {
+      char buf[ETH_FRAME_LEN];
+      int n = recv(members[m].get(), buf, sizeof(buf), 0);
+      if (n < 0) {
+        ASSERT_EQ(errno, EAGAIN);
+        continue;
+      }
+      ASSERT_GE(n, static_cast<int>(sizeof(ethhdr)));
+      int flow = reinterpret_cast<ethhdr*>(buf)->h_source[5];
+      ASSERT_LT(flow, kFlows);
+      if (flow_member[flow] == -1) {
+        flow_member[flow] = m;
+      }
+      EXPECT_EQ(flow_member[flow], m) << "flow " << flow << " split";
+      flow_frames[flow]++;
+      total++;
+    }
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  EXPECT_EQ(total, kFlows * kFramesPerFlow);
+  for (int f = 0; f < kFlows; f++) {
+    EXPECT_EQ(flow_frames[f], kFramesPerFlow) << "flow " << f;
+  }
+  // No frame was delivered to more than one member.
+  absl::SleepFor(absl::Milliseconds(50));
+  for (auto& member : members) {
+    char buf[ETH_FRAME_LEN];
+    EXPECT_THAT(recv(member.get(), buf, sizeof(buf), 0),
+                SyscallFailsWithErrno(EAGAIN));
+  }
+}
 
 }  // namespace
 
