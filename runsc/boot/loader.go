@@ -1153,6 +1153,7 @@ func (l *Loader) run() error {
 		// is configured after the loader is created and before Run() is called.
 		log.Debugf("Configuring host network")
 		s := l.k.RootNetworkNamespace().Stack().(*hostinet.Stack)
+		s.SetAllowPacketEndpointWrite(l.root.conf.AllowPacketEndpointWrite)
 		if err := s.Configure(l.root.conf.EnableRaw); err != nil {
 			return err
 		}

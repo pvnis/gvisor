@@ -766,6 +766,14 @@ func (n *nic) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *Pa
 	n.stats.rx.packets.Increment()
 	n.stats.rx.bytes.IncrementBy(uint64(pkt.Data().Size()))
 
+	// Packet endpoints see every frame, including those of network protocols
+	// the stack does not implement (e.g. eCPRI for O-RAN fronthaul, or
+	// 802.1Q-tagged frames), as Linux's AF_PACKET sockets do. They get their
+	// own copy of the packet, so RXChecksumValidated below does not apply.
+	if n.deliverLinkPackets {
+		n.DeliverLinkPacket(protocol, pkt)
+	}
+
 	networkEndpoint := n.getNetworkEndpoint(protocol)
 	if networkEndpoint == nil {
 		n.stats.unknownL3ProtocolRcvdPacketCounts.Increment(uint64(protocol))
@@ -773,10 +781,6 @@ func (n *nic) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *Pa
 	}
 
 	pkt.RXChecksumValidated = n.NetworkLinkEndpoint.Capabilities()&CapabilityRXChecksumOffload != 0
-
-	if n.deliverLinkPackets {
-		n.DeliverLinkPacket(protocol, pkt)
-	}
 
 	networkEndpoint.HandlePacket(pkt)
 }

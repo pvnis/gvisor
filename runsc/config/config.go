@@ -133,6 +133,12 @@ type Config struct {
 	// AllowPacketEndpointWrite enables write operations on packet endpoints.
 	AllowPacketEndpointWrite bool `flag:"allow-packet-socket-write"`
 
+	// L2Links is a comma-separated list of network interfaces to mirror into
+	// the sandbox even though they have no IP address, for applications that
+	// use them only through AF_PACKET sockets (e.g. an SR-IOV VF for O-RAN
+	// fronthaul).
+	L2Links string `flag:"l2-links"`
+
 	// AllowLiveTCPMigration allows TCP connection state to be migrated.
 	AllowLiveTCPMigration bool `flag:"allow-live-tcp-migration"`
 

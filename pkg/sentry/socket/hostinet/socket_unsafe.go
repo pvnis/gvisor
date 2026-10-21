@@ -86,6 +86,36 @@ func ioctl(ctx context.Context, fd int, io usermem.IO, sysno uintptr, args arch.
 		}
 		_, err := ifr.CopyOut(cc, args[2].Pointer())
 		return 0, err
+	case linux.SIOCSIFMTU, linux.SIOCSIFFLAGS:
+		// The sandbox does not reconfigure host interfaces, but applications
+		// that drive raw Ethernet interfaces (e.g. an O-RAN fronthaul's
+		// AF_PACKET transport) set the MTU or flags they need and fail if
+		// that fails. Succeed if the interface is already configured that
+		// way; the operator configures the host interface.
+		cc := &usermem.IOCopyContext{
+			Ctx: ctx,
+			IO:  io,
+		}
+		var ifr linux.IFReq
+		if _, err := ifr.CopyIn(cc, args[2].Pointer()); err != nil {
+			return 0, err
+		}
+		cur := ifr
+		getCmd := uintptr(linux.SIOCGIFMTU)
+		if cmd == linux.SIOCSIFFLAGS {
+			getCmd = linux.SIOCGIFFLAGS
+		}
+		if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), getCmd, uintptr(unsafe.Pointer(&cur))); errno != 0 {
+			return 0, translateIOSyscallError(errno)
+		}
+		size := 4 // ifr_mtu
+		if cmd == linux.SIOCSIFFLAGS {
+			size = 2 // ifr_flags
+		}
+		if string(cur.Data[:size]) != string(ifr.Data[:size]) {
+			return 0, linuxerr.EPERM
+		}
+		return 0, nil
 	case linux.SIOCGIFCONF:
 		cc := &usermem.IOCopyContext{
 			Ctx: ctx,

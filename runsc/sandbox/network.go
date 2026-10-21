@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/vishvananda/netlink"
@@ -154,6 +155,17 @@ func removeLinkAddresses(linkName string, addresses []boot.IPWithPrefix) error {
 	return nil
 }
 
+// isL2Link returns whether the interface was listed in --l2-links, to be
+// mirrored into the sandbox without IP addresses.
+func isL2Link(conf *config.Config, name string) bool {
+	for _, l := range strings.Split(conf.L2Links, ",") {
+		if strings.TrimSpace(l) == name {
+			return true
+		}
+	}
+	return false
+}
+
 // collectLinksAndRoutes queries the network interfaces in the current network
 // namespace and scrapes their configuration (addresses, routes, neighbors).
 // It returns the args to create them in the sandbox. This function has no
@@ -202,7 +214,7 @@ func collectLinksAndRoutes(conf *config.Config, disableIPv6 bool) (boot.CreateLi
 			}
 			ipAddrs = append(ipAddrs, ipNet)
 		}
-		if len(ipAddrs) == 0 {
+		if len(ipAddrs) == 0 && !isL2Link(conf, iface.Name) {
 			log.Warningf("No usable IP addresses found for interface %q, skipping", iface.Name)
 			continue
 		}

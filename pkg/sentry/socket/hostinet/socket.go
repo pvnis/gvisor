@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
+	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
@@ -92,7 +93,7 @@ var AllowedRawSocketTypes = []AllowedSocketType{
 	{unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_UDP},
 	{unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6},
 
-	// AF_PACKET do not allow Write or SendMsg.
+	// AF_PACKET sockets may only send with --allow-packet-socket-write.
 	{unix.AF_PACKET, unix.SOCK_DGRAM, AllowAllProtocols},
 	{unix.AF_PACKET, unix.SOCK_RAW, AllowAllProtocols},
 }
@@ -231,7 +232,7 @@ func (s *Socket) PWrite(ctx context.Context, dst usermem.IOSequence, offset int6
 
 // Write implements vfs.FileDescriptionImpl.
 func (s *Socket) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
-	if s.family == linux.AF_PACKET {
+	if s.family == linux.AF_PACKET && !packetWriteAllowed(ctx) {
 		// Don't allow Write for AF_PACKET.
 		return 0, linuxerr.EACCES
 	}
@@ -260,6 +261,15 @@ func (s *Socket) Write(ctx context.Context, src usermem.IOSequence, opts vfs.Wri
 
 type socketProvider struct {
 	family int
+}
+
+// packetWriteAllowed returns whether AF_PACKET sockets on ctx's host network
+// stack may send. Sending lets the sandbox inject arbitrary frames (any
+// source MAC, VLAN or ethertype) on the host interfaces of its network
+// namespace, so it requires --allow-packet-socket-write, as for netstack.
+func packetWriteAllowed(ctx context.Context) bool {
+	stack, ok := inet.StackFromContext(ctx).(*Stack)
+	return ok && stack.allowPacketWrite
 }
 
 // Socket implements socket.Provider.Socket.
@@ -789,7 +799,7 @@ const allowedSendMsgFlags = unix.MSG_DONTWAIT |
 
 // SendMsg implements socket.Socket.SendMsg.
 func (s *Socket) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages socket.ControlMessages) (int, *syserr.Error) {
-	if s.family == linux.AF_PACKET {
+	if s.family == linux.AF_PACKET && !packetWriteAllowed(t) {
 		// Don't allow SendMesg for AF_PACKET.
 		return 0, syserr.ErrPermissionDenied
 	}

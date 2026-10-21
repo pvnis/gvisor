@@ -155,6 +155,8 @@ const (
 	PACKET_VERSION        = 10
 	PACKET_HDRLEN         = 11
 	PACKET_RESERVE        = 12
+	PACKET_TX_RING        = 13
+	PACKET_QDISC_BYPASS   = 20
 )
 
 // Statuses for a frame in a packet_mmap ring buffer from <linux/if_packet.h>.

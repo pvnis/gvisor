@@ -489,6 +489,13 @@ func (ep *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, tcpip.Error) {
 	}
 }
 
+// HasNIC implements tcpip.SocketOptionsHandler.HasNIC, so that
+// SO_BINDTODEVICE accepts the stack's interfaces. As on Linux, the binding
+// does not filter which frames a packet socket receives; bind(2) does.
+func (ep *endpoint) HasNIC(id int32) bool {
+	return ep.stack.HasNIC(tcpip.NICID(id))
+}
+
 // handlePacket implements stack.PacketEndpoint.HandlePacket
 func (ep *endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	ep.packetMmapMu.RLock()

@@ -121,6 +121,10 @@ var SockOpts = []SockOpt{
 	{linux.SOL_TCP, linux.TCP_WINDOW_CLAMP, sizeofInt32, true, true, true},
 
 	{linux.SOL_ICMPV6, linux.ICMPV6_FILTER, uint64(linux.ICMP6FilterSize), true, true, true},
+
+	// Sending raw Ethernet frames (e.g. O-RAN fronthaul) without the host's
+	// queueing discipline. Only reachable on AF_PACKET sockets.
+	{linux.SOL_PACKET, linux.PACKET_QDISC_BYPASS, sizeofInt32, true, true, false},
 }
 
 // sockOptMap is a map of {level, name} -> SockOpts. It is an optimization for

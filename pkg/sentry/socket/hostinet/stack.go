@@ -60,9 +60,11 @@ type Stack struct {
 	tcpSendBufSize  inet.TCPBufferSize
 	tcpSACKEnabled  bool
 	allowRawSockets bool
-	configured      bool     `state:"nosave"`
-	netDevFile      *os.File `state:"nosave"`
-	netSNMPFile     *os.File `state:"nosave"`
+	// allowPacketWrite is whether AF_PACKET sockets may send.
+	allowPacketWrite bool
+	configured       bool     `state:"nosave"`
+	netDevFile       *os.File `state:"nosave"`
+	netSNMPFile      *os.File `state:"nosave"`
 	// allowedSocketTypes is the list of allowed socket types
 	allowedSocketTypes []AllowedSocketType `state:"nosave"`
 }
@@ -82,6 +84,13 @@ func (s *Stack) Destroy() {
 // NewStack returns an empty Stack containing no configuration.
 func NewStack() *Stack {
 	return &Stack{}
+}
+
+// SetAllowPacketEndpointWrite sets whether AF_PACKET sockets may send
+// (--allow-packet-socket-write). It must be called before sockets are
+// created.
+func (s *Stack) SetAllowPacketEndpointWrite(allow bool) {
+	s.allowPacketWrite = allow
 }
 
 // Configure sets up the stack using the current state of the host network.

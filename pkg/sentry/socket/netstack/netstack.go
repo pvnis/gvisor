@@ -3044,6 +3044,13 @@ func (s *sock) setSockOptPacket(t *kernel.Task, ep commonEndpoint, name int, opt
 		// Silently ignore these options.
 		incrementBadSetSocketOptionMetric(t, &socketLevelPacketFieldValue, name)
 		return nil
+	case linux.PACKET_QDISC_BYPASS:
+		// Netstack's packet endpoints write directly to the link endpoint, so
+		// frames already bypass the sandbox's queueing discipline.
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+		return nil
 	default:
 		incrementBadSetSocketOptionMetric(t, &socketLevelIPFieldValue, name)
 		return syserr.ErrNotSupported
@@ -3532,6 +3539,19 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr,
 		_, err := ifr.CopyOut(t, args[2].Pointer())
 		return 0, err
 
+	case linux.SIOCSIFFLAGS, linux.SIOCSIFMTU:
+		if !t.HasCapabilityIn(linux.CAP_NET_ADMIN, t.NetworkNamespace().UserNamespace()) {
+			return 0, linuxerr.EPERM
+		}
+		var ifr linux.IFReq
+		if _, err := ifr.CopyIn(t, args[2].Pointer()); err != nil {
+			return 0, err
+		}
+		if err := interfaceSetIoctl(ctx, arg, &ifr); err != nil {
+			return 0, err.ToError()
+		}
+		return 0, nil
+
 	case linux.SIOCGIFCONF:
 		// Return a list of interface addresses or the buffer size
 		// necessary to hold the list.
@@ -3581,6 +3601,60 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr,
 	}
 
 	return 0, linuxerr.ENOTTY
+}
+
+// interfaceSetIoctl implements the interface requests that change an
+// interface, to the extent applications that drive raw Ethernet interfaces
+// (e.g. an O-RAN fronthaul's AF_PACKET transport) need:
+//
+//   - SIOCSIFMTU succeeds if the MTU is the interface's current MTU; netstack
+//     interfaces' MTUs are fixed by the host interface they mirror.
+//   - SIOCSIFFLAGS can toggle IFF_PROMISC. Other flags it does not model are
+//     ignored, but taking the interface down is not supported.
+func interfaceSetIoctl(ctx context.Context, arg int, ifr *linux.IFReq) *syserr.Error {
+	stk := inet.StackFromContext(ctx)
+	if stk == nil {
+		return syserr.ErrNoDevice
+	}
+	epstack, ok := stk.(*Stack)
+	if !ok {
+		return errStackType
+	}
+	var (
+		index int32
+		iface inet.Interface
+		found bool
+	)
+	for index, iface = range stk.Interfaces() {
+		if iface.Name == ifr.Name() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return syserr.ErrNoDevice
+	}
+	switch arg {
+	case linux.SIOCSIFMTU:
+		if mtu := hostarch.ByteOrder.Uint32(ifr.Data[:4]); mtu != iface.MTU {
+			return syserr.ErrInvalidArgument
+		}
+	case linux.SIOCSIFFLAGS:
+		cur, err := interfaceStatusFlags(stk, iface.Name)
+		if err != nil {
+			return err
+		}
+		flags := uint32(hostarch.ByteOrder.Uint16(ifr.Data[:2]))
+		if cur&linux.IFF_UP != 0 && flags&linux.IFF_UP == 0 {
+			return syserr.ErrNotSupported
+		}
+		if (cur^flags)&linux.IFF_PROMISC != 0 {
+			if err := epstack.Stack.SetPromiscuousMode(tcpip.NICID(index), flags&linux.IFF_PROMISC != 0); err != nil {
+				return syserr.TranslateNetstackError(err)
+			}
+		}
+	}
+	return nil
 }
 
 // interfaceIoctl implements interface requests.
