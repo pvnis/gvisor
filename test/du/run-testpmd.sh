@@ -8,6 +8,7 @@ set -u
 MODE=${1:-hugetlbfs}
 FWD=${FWD:-txonly}
 SEND=${SEND:-0}
+NET=${NET:-sandbox}  # sandbox (netstack, --l2-links) or host (hostinet)
 BATCH=${BATCH:-0}  # sleep 1 ms after every BATCH injected frames (0: no pacing)
 RUNSC=${RUNSC:-/tmp/runsc-du}
 TESTPMD=${TESTPMD:-$HOME/dpdk-src/dpdk-stable-24.11.3/build/app/dpdk-testpmd}
@@ -39,6 +40,7 @@ if sys.argv[1] == "hugetlbfs":
     c["mounts"].append({"destination": "/dev/hugepages", "type": "hugetlbfs", "source": "nodev", "options": ["pagesize=2M"]})
 json.dump(c, open("config.json", "w"))
 PY
+NETFLAGS="--l2-links=fh0"; [ "$NET" = host ] && NETFLAGS="--network=host"
 before=$(cat /sys/class/net/fh0p/statistics/rx_packets)
 if [ "$SEND" -gt 0 ]; then
   (sleep 3; python3 -c "
@@ -52,7 +54,7 @@ for i in range($SEND):
     if $BATCH and i % $BATCH == $BATCH - 1: time.sleep(0.001)
 ") &
 fi
-timeout 60 $RUNSC --root=/tmp/runsc-du-root --net-raw --allow-packet-socket-write --l2-links=fh0 --hugetlb-pages=256 run --bundle $B dutest-pmd 2>&1 | grep -vE "^\s*$" > /tmp/testpmd.out 2>&1; tr -d "\033" < /tmp/testpmd.out | grep -aE "EAL: (Selected|Detected CPU)|mbuf pool|[RT]X-packets|testpmd-exit|HugePages_Free|during-run|Error|error|failed" | sort -u
+timeout 60 $RUNSC --root=/tmp/runsc-du-root --net-raw --allow-packet-socket-write $NETFLAGS --hugetlb-pages=256 run --bundle $B dutest-pmd 2>&1 | grep -vE "^\s*$" > /tmp/testpmd.out 2>&1; tr -d "\033" < /tmp/testpmd.out | grep -aE "EAL: (Selected|Detected CPU)|mbuf pool|[RT]X-packets|testpmd-exit|HugePages_Free|during-run|Error|error|failed" | sort -u
 after=$(cat /sys/class/net/fh0p/statistics/rx_packets)
 echo "fh0p received $((after - before)) frames from the sandbox"
 $RUNSC --root=/tmp/runsc-du-root delete -force dutest-pmd 2>/dev/null

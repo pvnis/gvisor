@@ -139,6 +139,9 @@ type Socket struct {
 	// handle blocking behavior independently in the sentry.
 	fd int `state:"nosave"`
 
+	// mmap maps an AF_PACKET socket's rings into the application.
+	mmap packetMMap
+
 	// recvClosed indicates that the socket has been shutdown for reading
 	// (SHUT_RD or SHUT_RDWR).
 	recvClosed atomicbitops.Bool
@@ -186,7 +189,9 @@ func (s *Socket) Release(ctx context.Context) {
 		return
 	}
 	fdnotifier.RemoveFD(int32(s.fd))
-	_ = unix.Close(s.fd)
+	if !s.releaseMMap() {
+		_ = unix.Close(s.fd)
+	}
 }
 
 // Epollable implements FileDescriptionImpl.Epollable.

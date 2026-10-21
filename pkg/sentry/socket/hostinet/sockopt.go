@@ -122,9 +122,20 @@ var SockOpts = []SockOpt{
 
 	{linux.SOL_ICMPV6, linux.ICMPV6_FILTER, uint64(linux.ICMP6FilterSize), true, true, true},
 
-	// Sending raw Ethernet frames (e.g. O-RAN fronthaul) without the host's
-	// queueing discipline. Only reachable on AF_PACKET sockets.
+	// AF_PACKET options for raw Ethernet I/O (e.g. O-RAN fronthaul, DPDK's
+	// af_packet PMD): bypassing the host's queueing discipline, and
+	// PACKET_MMAP rings, which the host kernel fills and drains directly in
+	// memory mapped into the application (see packetMMap). The host rejects
+	// them on other families.
 	{linux.SOL_PACKET, linux.PACKET_QDISC_BYPASS, sizeofInt32, true, true, false},
+	{linux.SOL_PACKET, linux.PACKET_VERSION, sizeofInt32, true, true, false},
+	{linux.SOL_PACKET, linux.PACKET_RESERVE, sizeofInt32, true, true, false},
+	{linux.SOL_PACKET, linux.PACKET_LOSS, sizeofInt32, true, true, false},
+	{linux.SOL_PACKET, linux.PACKET_FANOUT, sizeofInt32, true, true, false},
+	{linux.SOL_PACKET, linux.PACKET_AUXDATA, sizeofInt32, true, true, false},
+	{linux.SOL_PACKET, linux.PACKET_RX_RING, 16 /* sizeof(struct tpacket_req) */, false, true, false},
+	{linux.SOL_PACKET, linux.PACKET_TX_RING, 16 /* sizeof(struct tpacket_req) */, false, true, false},
+	{linux.SOL_PACKET, linux.PACKET_STATISTICS, 8 /* sizeof(struct tpacket_stats) */, true, false, false},
 }
 
 // sockOptMap is a map of {level, name} -> SockOpts. It is an optimization for
