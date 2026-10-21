@@ -390,7 +390,11 @@ func kernelDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) map
 	// Set up /sys/kernel/debug/kcov. Technically, debugfs should be
 	// mounted at debug/, but for our purposes, it is sufficient to keep it
 	// in sys.
-	children := make(map[string]kernfs.Inode)
+	children := map[string]kernfs.Inode{
+		"mm": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"hugepages": fs.newHugepagesDir(ctx, creds),
+		}),
+	}
 	if coverage.KcovSupported() {
 		log.Debugf("Set up /sys/kernel/debug/kcov")
 		children["debug"] = fs.newDir(ctx, creds, linux.FileMode(0700), map[string]kernfs.Inode{

@@ -1684,7 +1684,8 @@ func Flock(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 const (
 	memfdPrefix     = "memfd:"
 	memfdMaxNameLen = linux.NAME_MAX - len(memfdPrefix)
-	memfdAllFlags   = uint32(linux.MFD_CLOEXEC | linux.MFD_ALLOW_SEALING)
+	memfdAllFlags   = uint32(linux.MFD_CLOEXEC | linux.MFD_ALLOW_SEALING | linux.MFD_HUGETLB)
+	memfdHugeFlags  = uint32(linux.MFD_HUGE_MASK << linux.MFD_HUGE_SHIFT)
 )
 
 // MemfdCreate implements the linux syscall memfd_create(2).
@@ -1692,6 +1693,15 @@ func MemfdCreate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uin
 	addr := args[0].Pointer()
 	flags := args[1].Uint()
 
+	hugetlb := flags&linux.MFD_HUGETLB != 0
+	// See mm/memfd.c:memfd_create(): the huge page size bits are only valid
+	// with MFD_HUGETLB, and only the default (2 MiB) size is supported.
+	if hugetlb {
+		if sizeLog := (flags & memfdHugeFlags) >> linux.MFD_HUGE_SHIFT; sizeLog != 0 && sizeLog != hostarch.HugePageShift {
+			return 0, nil, linuxerr.EINVAL
+		}
+		flags &^= memfdHugeFlags
+	}
 	if flags&^memfdAllFlags != 0 {
 		// Unknown bits in flags.
 		return 0, nil, linuxerr.EINVAL
@@ -1706,6 +1716,9 @@ func MemfdCreate(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uin
 	}
 
 	shmMount := t.Kernel().ShmMount()
+	if hugetlb {
+		shmMount = t.Kernel().HugetlbMount()
+	}
 	file, err := tmpfs.NewMemfd(t, t.Credentials(), shmMount, allowSeals, memfdPrefix+name)
 	if err != nil {
 		return 0, nil, err

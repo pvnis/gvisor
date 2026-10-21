@@ -51,6 +51,7 @@ func (mm *MemoryManager) createVMALocked(ctx context.Context, opts memmap.MMapOp
 		Private:   opts.Private,
 		Unmap:     opts.Unmap,
 		Map32Bit:  opts.Map32Bit,
+		Huge:      opts.HugeAligned,
 	})
 	if err != nil {
 		// Can't force without opts.Unmap and opts.Fixed.
@@ -156,6 +157,9 @@ type findAvailableOpts struct {
 	Private   bool
 	Unmap     bool
 	Map32Bit  bool
+
+	// Huge requires the range to be huge page-aligned.
+	Huge bool
 }
 
 // map32Start/End are the bounds to which MAP_32BIT mappings are constrained,
@@ -178,7 +182,7 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 	}
 
 	// Does the provided suggestion work?
-	if ar, ok := opts.Addr.ToRange(length); ok {
+	if ar, ok := opts.Addr.ToRange(length); ok && (!opts.Huge || opts.Addr.IsHugePageAligned()) {
 		if allowedAR.IsSupersetOf(ar) {
 			if opts.Unmap {
 				return ar.Start, nil
@@ -198,7 +202,7 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 	// Prefer hugepage alignment if length is hugepage-aligned and the vma will
 	// actually be eligible for hugepages.
 	alignment := uint64(hostarch.PageSize)
-	if hostarch.IsHugePageAligned(length) && opts.Private && !opts.GrowsDown && !opts.Stack {
+	if opts.Huge || (hostarch.IsHugePageAligned(length) && opts.Private && !opts.GrowsDown && !opts.Stack) {
 		alignment = hostarch.HugePageSize
 	}
 

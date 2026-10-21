@@ -217,6 +217,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	if err := modifySpecForDirectfs(conf, args.Spec); err != nil {
 		return nil, fmt.Errorf("failed to modify spec for directfs: %v", err)
 	}
+	modifySpecForHugetlbfs(args.Spec)
 
 	sandboxID := args.ID
 	if !specutils.IsRootContainer(args.Spec) {
@@ -2067,6 +2068,28 @@ func cgroupInstall(conf *config.Config, cg cgroup.Cgroup, res *specs.LinuxResour
 		}
 	}
 	return cg, nil
+}
+
+// modifySpecForHugetlbfs turns bind mounts of host hugetlbfs directories,
+// such as Kubernetes "medium: HugePages" emptyDir volumes, into
+// sandbox-internal hugetlbfs mounts, so that applications like DPDK see a
+// hugetlbfs mount (in /proc/mounts and statfs(2)) and allocate from the
+// sandbox's hugetlb pool. Like tmpfs-medium emptyDirs, the contents are not
+// shared with the host or other sandboxes.
+func modifySpecForHugetlbfs(spec *specs.Spec) {
+	for i := range spec.Mounts {
+		m := &spec.Mounts[i]
+		if !specutils.IsGoferMount(*m) {
+			continue
+		}
+		var st unix.Statfs_t
+		if err := unix.Statfs(m.Source, &st); err != nil || uint64(st.Type) != linux.HUGETLBFS_MAGIC {
+			continue
+		}
+		log.Infof("Mounting host hugetlbfs %q at %q as sandbox hugetlbfs", m.Source, m.Destination)
+		specutils.ChangeMountType(m, tmpfs.HugetlbfsName)
+		m.Source = ""
+	}
 }
 
 func modifySpecForDirectfs(conf *config.Config, spec *specs.Spec) error {

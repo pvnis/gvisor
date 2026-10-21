@@ -494,6 +494,11 @@ var fileType = abi.ValueSet{
 const (
 	MFD_CLOEXEC       = 0x0001
 	MFD_ALLOW_SEALING = 0x0002
+	MFD_HUGETLB       = 0x0004
+
+	MFD_HUGE_SHIFT = HUGETLB_FLAG_ENCODE_SHIFT
+	MFD_HUGE_MASK  = HUGETLB_FLAG_ENCODE_MASK
+	MFD_HUGE_2MB   = HUGETLB_FLAG_ENCODE_2MB
 )
 
 // Constants related to file seals. Source: include/uapi/{asm-generic,linux}/fcntl.h

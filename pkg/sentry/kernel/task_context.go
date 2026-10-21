@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/devutil"
+	"gvisor.dev/gvisor/pkg/sentry/hugetlb"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
@@ -122,6 +123,8 @@ func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
 		return t.memCgID.Load()
 	case pgalloc.CtxMemoryFile:
 		return t.k.mf
+	case hugetlb.CtxPool:
+		return t.k.hugetlbPool
 	case platform.CtxPlatform:
 		return t.k
 	case shm.CtxDeviceID:

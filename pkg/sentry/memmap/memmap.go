@@ -397,6 +397,11 @@ type MMapOpts struct {
 	// underlying memory backing the mapping thus the memory content is
 	// guaranteed not to be modified outside the sentry's purview.
 	SentryOwnedContent bool
+
+	// HugeAligned is true if the mapping must be aligned to, and sized in,
+	// huge pages, as for hugetlbfs files and MAP_HUGETLB. Length is rounded up
+	// to a huge page; a fixed Addr and Offset must be huge page-aligned.
+	HugeAligned bool
 }
 
 // NameMut is the type of MMapOpts.NameMut.

@@ -352,6 +352,12 @@ type Config struct {
 	// AppHugePages enables support for application huge pages.
 	AppHugePages bool `flag:"app-huge-pages"`
 
+	// HugetlbPages is the number of 2 MiB pages in the sandbox's hugetlb pool,
+	// used by hugetlbfs, MAP_HUGETLB, MFD_HUGETLB and SHM_HUGETLB. If
+	// negative, the pool is sized from the root container's 2MB hugepage
+	// limit (linux.resources.hugepageLimits).
+	HugetlbPages int `flag:"hugetlb-pages"`
+
 	// NVProxy enables support for Nvidia GPUs.
 	NVProxy bool `flag:"nvproxy"`
 

@@ -395,6 +395,7 @@ go_library(
         "//pkg/sentry/fsimpl/timerfd",
         "//pkg/sentry/fsimpl/tmpfs",
         "//pkg/sentry/hostcpu",
+        "//pkg/sentry/hugetlb",
         "//pkg/sentry/inet",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/futex",

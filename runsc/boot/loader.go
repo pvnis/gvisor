@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/gomaxprocs"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/metric"
@@ -769,6 +770,7 @@ func New(args Args) (*Loader, error) {
 		RootUserNamespace:    creds.UserNamespace,
 		RootNetworkNamespace: netns,
 		ApplicationCores:     uint(args.NumCPU),
+		HugetlbPages:         hugetlbPages(args.Spec, args.Conf),
 		Vdso:                 vdso,
 		VdsoParams:           params,
 		RootUTSNamespace:     kernel.NewUTSNamespace(args.Spec.Hostname, args.Spec.Domainname, creds.UserNamespace),
@@ -2355,4 +2357,22 @@ func (l *Loader) GetContainerSpecs() map[string]*specs.Spec {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.containerSpecs
+}
+
+// hugetlbPages returns the size of the sandbox's hugetlb pool in 2 MiB pages:
+// --hugetlb-pages if set, otherwise the root container's 2MB hugepage limit,
+// which Kubernetes sets from the hugepages-2Mi resource.
+func hugetlbPages(spec *specs.Spec, conf *config.Config) uint64 {
+	if conf.HugetlbPages >= 0 {
+		return uint64(conf.HugetlbPages)
+	}
+	if spec.Linux == nil || spec.Linux.Resources == nil {
+		return 0
+	}
+	for _, limit := range spec.Linux.Resources.HugepageLimits {
+		if limit.Pagesize == "2MB" {
+			return limit.Limit / hostarch.HugePageSize
+		}
+	}
+	return 0
 }

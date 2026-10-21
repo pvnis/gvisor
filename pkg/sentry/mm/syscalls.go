@@ -77,6 +77,12 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 		return 0, linuxerr.EINVAL
 	}
 	length, ok := hostarch.Addr(opts.Length).RoundUp()
+	if opts.HugeAligned {
+		length, ok = hostarch.Addr(opts.Length).HugeRoundUp()
+		if !hostarch.IsHugePageAligned(opts.Offset) || (opts.Fixed && !opts.Addr.IsHugePageAligned()) {
+			return 0, linuxerr.EINVAL
+		}
+	}
 	if !ok {
 		return 0, linuxerr.ENOMEM
 	}

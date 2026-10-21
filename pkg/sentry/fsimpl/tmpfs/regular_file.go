@@ -121,6 +121,8 @@ func (fs *filesystem) newRegularFile(kuid auth.KUID, kgid auth.KGID, mode linux.
 		memoryUsageKind: fs.usage,
 		seals:           linux.F_SEAL_SEAL,
 	}
+	// hugetlbfs files are always eligible for huge pages.
+	file.huge = fs.isHugetlb()
 	err := file.inode.init(file, fs, kuid, kgid, linux.S_IFREG|mode, parentDir)
 	if err != nil {
 		return nil, err
@@ -226,6 +228,10 @@ func (rf *regularFile) growLocked(newSize uint64) error {
 //
 // Preconditions: rf.inode.mu must be held.
 func (rf *regularFile) truncateNoTimeUpdateLocked(newSize uint64) error {
+	// See fs/hugetlbfs/inode.c:hugetlbfs_setattr().
+	if rf.inode.fs.isHugetlb() && !hostarch.IsHugePageAligned(newSize) {
+		return linuxerr.EINVAL
+	}
 	oldSize := rf.size.RacyLoad()
 	if newSize == oldSize {
 		// Nothing to do.
@@ -458,6 +464,15 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 	f.inode.mu.Lock()
 	defer f.inode.mu.Unlock()
 	end := offset + length
+	if f.inode.fs.isHugetlb() {
+		// See fs/hugetlbfs/inode.c:hugetlbfs_fallocate(), which allocates
+		// whole huge pages.
+		offset = hostarch.HugePageRoundDown(offset)
+		var ok bool
+		if end, ok = hostarch.HugePageRoundUp(end); !ok {
+			return linuxerr.EFBIG
+		}
+	}
 	pgEnd, ok := hostarch.PageRoundUp(end)
 	if !ok {
 		return linuxerr.EFBIG
@@ -676,6 +691,19 @@ func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
 func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
 	file := fd.inode().impl.(*regularFile)
+	if file.inode.fs.isHugetlb() {
+		// See fs/hugetlbfs/inode.c:hugetlbfs_file_mmap() and
+		// mm/mmap.c:ksys_mmap_pgoff().
+		if !hostarch.IsHugePageAligned(opts.Offset) {
+			return linuxerr.EINVAL
+		}
+		length, ok := hostarch.HugePageRoundUp(opts.Length)
+		if !ok {
+			return linuxerr.ENOMEM
+		}
+		opts.Length = length
+		opts.HugeAligned = true
+	}
 	opts.SentryOwnedContent = true
 	if file.initiallyUnlinked {
 		opts.NameMut = memmap.NameMutAnonShmem

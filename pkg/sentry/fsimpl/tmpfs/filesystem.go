@@ -1058,6 +1058,17 @@ func (fs *filesystem) adjustPageAcct(reserved, alloced uint64) {
 // The returned value is guaranteed to be <= pagesInc. If the size mount option is
 // not set, then pagesInc will be returned.
 func (fs *filesystem) accountPagesPartial(pagesInc uint64) uint64 {
+	if !fs.isHugetlb() {
+		return fs.accountFSPagesPartial(pagesInc)
+	}
+	reserved := fs.accountFSPagesPartial(pagesInc)
+	got := fs.hugetlbPool.AccountPartial(reserved)
+	// Return to the filesystem what the pool could not provide.
+	fs.unaccountFSPages(reserved - got)
+	return got
+}
+
+func (fs *filesystem) accountFSPagesPartial(pagesInc uint64) uint64 {
 	if pagesInc == 0 {
 		return pagesInc
 	}
@@ -1084,6 +1095,17 @@ func (fs *filesystem) accountPagesPartial(pagesInc uint64) uint64 {
 // is mounted with size option. We return a false when the maxSizeInPages
 // has been exhausted and no more allocation can be done.
 func (fs *filesystem) accountPages(pagesInc uint64) bool {
+	if !fs.accountFSPages(pagesInc) {
+		return false
+	}
+	if fs.isHugetlb() && pagesInc != 0 && !fs.hugetlbPool.Account(pagesInc) {
+		fs.unaccountFSPages(pagesInc)
+		return false
+	}
+	return true
+}
+
+func (fs *filesystem) accountFSPages(pagesInc uint64) bool {
 	if pagesInc == 0 {
 		return true // No accounting needed.
 	}
@@ -1108,6 +1130,13 @@ func (fs *filesystem) accountPages(pagesInc uint64) bool {
 // unaccountPages decreases the pagesUsed in filesystem struct if tmpfs
 // is mounted with size option.
 func (fs *filesystem) unaccountPages(pagesDec uint64) {
+	fs.unaccountFSPages(pagesDec)
+	if fs.isHugetlb() && pagesDec != 0 {
+		fs.hugetlbPool.Unaccount(pagesDec)
+	}
+}
+
+func (fs *filesystem) unaccountFSPages(pagesDec uint64) {
 	if pagesDec == 0 {
 		return
 	}

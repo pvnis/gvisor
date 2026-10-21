@@ -19,9 +19,9 @@
 //   - SHM_LOCK/SHM_UNLOCK are no-ops. The sentry currently doesn't implement
 //     memory locking in general.
 //
-//   - SHM_HUGETLB and related flags for shmget(2) are ignored. There's no easy
-//     way to implement hugetlb support on a per-map basis, and it has no impact
-//     on correctness.
+//   - SHM_HUGETLB segments are sized in and aligned to huge pages and charged
+//     to the sandbox's hugetlb pool (see hugetlb.Pool), but, like the
+//     pool, are backed by ordinary memory file pages.
 //
 //   - SHM_NORESERVE for shmget(2) is ignored, the sentry doesn't implement swap
 //     so it's meaningless to reserve space for swap.
@@ -42,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/hugetlb"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
@@ -135,7 +136,7 @@ func (r *Registry) dissociateKey(s *Shm) {
 // analogous to open(2).
 //
 // FindOrCreate returns a reference on Shm.
-func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key ipc.Key, size uint64, mode linux.FileMode, private, create, exclusive bool) (*Shm, error) {
+func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key ipc.Key, size uint64, mode linux.FileMode, private, create, exclusive, huge bool) (*Shm, error) {
 	if (create || private) && (size < linux.SHMMIN || size > linux.SHMMAX) {
 		// "A new segment was to be created and size is less than SHMMIN or
 		// greater than SHMMAX." - man shmget(2)
@@ -174,7 +175,11 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key ipc.Key, siz
 	}
 
 	var sizeAligned uint64
-	if val, ok := hostarch.Addr(size).RoundUp(); ok {
+	roundUp := hostarch.Addr.RoundUp
+	if huge {
+		roundUp = hostarch.Addr.HugeRoundUp
+	}
+	if val, ok := roundUp(hostarch.Addr(size)); ok {
 		sizeAligned = uint64(val)
 	} else {
 		return nil, linuxerr.EINVAL
@@ -188,7 +193,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key ipc.Key, siz
 	}
 
 	// Need to create a new segment.
-	s, err := r.newShmLocked(ctx, pid, key, auth.CredentialsFromContext(ctx), mode, size)
+	s, err := r.newShmLocked(ctx, pid, key, auth.CredentialsFromContext(ctx), mode, size, huge)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +206,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key ipc.Key, siz
 // newShmLocked creates a new segment in the registry.
 //
 // Precondition: Caller must hold r.mu.
-func (r *Registry) newShmLocked(ctx context.Context, pid int32, key ipc.Key, creator *auth.Credentials, mode linux.FileMode, size uint64) (*Shm, error) {
+func (r *Registry) newShmLocked(ctx context.Context, pid int32, key ipc.Key, creator *auth.Credentials, mode linux.FileMode, size uint64, huge bool) (*Shm, error) {
 	mf := pgalloc.MemoryFileFromContext(ctx)
 	if mf == nil {
 		panic(fmt.Sprintf("context.Context %T lacks non-nil value for key %T", ctx, pgalloc.CtxMemoryFile))
@@ -212,8 +217,21 @@ func (r *Registry) newShmLocked(ctx context.Context, pid int32, key ipc.Key, cre
 	}
 
 	effectiveSize := uint64(hostarch.Addr(size).MustRoundUp())
-	fr, err := mf.Allocate(effectiveSize, pgalloc.AllocOpts{Kind: usage.Anonymous, MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx)})
+	var hugetlbPool *hugetlb.Pool
+	if huge {
+		// See ipc/shm.c:newseg() => hugetlb_file_setup(), which fails with
+		// ENOMEM if the pool cannot back the segment.
+		effectiveSize = uint64(hostarch.Addr(size).MustHugeRoundUp())
+		hugetlbPool = hugetlb.PoolFromContext(ctx)
+		if !hugetlbPool.Account(effectiveSize / hostarch.PageSize) {
+			return nil, linuxerr.ENOMEM
+		}
+	}
+	fr, err := mf.Allocate(effectiveSize, pgalloc.AllocOpts{Kind: usage.Anonymous, MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx), Huge: huge && mf.HugepagesEnabled()})
 	if err != nil {
+		if hugetlbPool != nil {
+			hugetlbPool.Unaccount(effectiveSize / hostarch.PageSize)
+		}
 		return nil, err
 	}
 
@@ -225,6 +243,7 @@ func (r *Registry) newShmLocked(ctx context.Context, pid int32, key ipc.Key, cre
 		effectiveSize: effectiveSize,
 		obj:           ipc.NewObject(r.reg.UserNS, ipc.Key(key), creator, creator, mode),
 		fr:            fr,
+		hugetlbPool:   hugetlbPool,
 		creatorPID:    pid,
 		changeTime:    ktime.NowFromContext(ctx),
 	}
@@ -354,6 +373,10 @@ type Shm struct {
 	// segment. Immutable.
 	fr memmap.FileRange
 
+	// hugetlbPool is the pool that an SHM_HUGETLB segment is charged to, or
+	// nil. Immutable.
+	hugetlbPool *hugetlb.Pool
+
 	// mu protects all fields below.
 	mu sync.Mutex `state:"nosave"`
 
@@ -443,6 +466,9 @@ func (s *Shm) InodeID() uint64 {
 func (s *Shm) DecRef(ctx context.Context) {
 	s.ShmRefs.DecRef(func() {
 		s.mf.DecRef(s.fr)
+		if s.hugetlbPool != nil {
+			s.hugetlbPool.Unaccount(s.effectiveSize / hostarch.PageSize)
+		}
 		s.registry.remove(s)
 	})
 }
@@ -568,6 +594,7 @@ func (s *Shm) ConfigureAttach(ctx context.Context, addr hostarch.Addr, opts Atta
 		MaxPerms:        maxPerms,
 		Mappable:        s,
 		MappingIdentity: s,
+		HugeAligned:     s.hugetlbPool != nil,
 	}, nil
 }
 

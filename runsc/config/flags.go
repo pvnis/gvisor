@@ -142,6 +142,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 
 	// Flags that control sandbox runtime behavior: MM related.
 	flagSet.Bool("app-huge-pages", true, "enable use of huge pages for application memory; requires /sys/kernel/mm/transparent_hugepage/shmem_enabled = advise")
+	flagSet.Int("hugetlb-pages", -1, "number of 2 MiB pages in the sandbox's hugetlb pool (hugetlbfs, MAP_HUGETLB, MFD_HUGETLB, SHM_HUGETLB); -1 sizes it from the root container's 2MB hugepage limit. The pool is an accounting limit backed by ordinary sandbox memory.")
 
 	// Flags that control sandbox runtime behavior: FS related.
 	flagSet.Var(fileAccessTypePtr(FileAccessExclusive), "file-access", "specifies which filesystem validation to use for the root mount: exclusive (default), shared.")

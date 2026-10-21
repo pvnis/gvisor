@@ -20,6 +20,7 @@ go_library(
     name = "sys",
     srcs = [
         "amdgpu.go",
+        "hugepages.go",
         "dir_refs.go",
         "kcov.go",
         "pci.go",
@@ -43,6 +44,7 @@ go_library(
         "//pkg/sentry/arch",
         "//pkg/sentry/fsimpl/host",
         "//pkg/sentry/fsimpl/kernfs",
+        "//pkg/sentry/hugetlb",
         "//pkg/sentry/inet",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",

@@ -51,10 +51,18 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 	shared := flags&linux.MAP_SHARED != 0
 	anon := flags&linux.MAP_ANONYMOUS != 0
 	map32bit := flags&linux.MAP_32BIT != 0
+	hugetlb := flags&linux.MAP_HUGETLB != 0
 
 	// Require exactly one of MAP_PRIVATE and MAP_SHARED.
 	if private == shared {
 		return 0, nil, linuxerr.EINVAL
+	}
+	// Only the default (2 MiB) huge page size is supported. See
+	// mm/mmap.c:ksys_mmap_pgoff() => mm/hugetlb.c:hstate_sizelog().
+	if hugetlb && anon {
+		if sizeLog := (flags >> linux.MAP_HUGE_SHIFT) & linux.MAP_HUGE_MASK; sizeLog != 0 && sizeLog != hostarch.HugePageShift {
+			return 0, nil, linuxerr.EINVAL
+		}
 	}
 
 	opts := memmap.MMapOpts{
@@ -116,6 +124,12 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 			}
 		}
 
+		// MAP_HUGETLB is only meaningful (and allowed) for hugetlbfs files,
+		// which are always mapped with huge pages.
+		if hugetlb && !tmpfs.IsHugetlbFile(file) {
+			return 0, nil, linuxerr.EINVAL
+		}
+
 		// mmap requires volume NO_EXEC be false if request has PROT_EXEC flag.
 		if file.Mount().MountFlags()&linux.ST_NOEXEC != 0 {
 			if opts.Perms.Execute {
@@ -130,9 +144,19 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 		}
 		mappedFile = file
 	} else if shared {
-		// Back shared anonymous mappings with an anonymous tmpfs file.
+		// Back shared anonymous mappings with an anonymous tmpfs file, or a
+		// hugetlbfs file (allocating from the hugetlb pool) for MAP_HUGETLB.
 		opts.Offset = 0
-		file, err := tmpfs.NewZeroFile(t, t.Credentials(), t.Kernel().ShmMount(), opts.Length)
+		mount := t.Kernel().ShmMount()
+		if hugetlb {
+			mount = t.Kernel().HugetlbMount()
+			length, ok := hostarch.HugePageRoundUp(opts.Length)
+			if !ok || length == 0 {
+				return 0, nil, linuxerr.ENOMEM
+			}
+			opts.Length = length
+		}
+		file, err := tmpfs.NewZeroFile(t, t.Credentials(), mount, opts.Length)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -143,6 +167,10 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 		mappedFile = file
 	} else {
 		opts.NameMut = memmap.NameMutAnon
+		// Private anonymous MAP_HUGETLB mappings are aligned to huge pages,
+		// which makes them eligible for host transparent huge pages, but are
+		// not charged to the hugetlb pool.
+		opts.HugeAligned = hugetlb
 	}
 
 	if opts.Perms.Execute && seccheck.Global.Enabled(seccheck.PointMmap) {

@@ -342,6 +342,15 @@ func (*meminfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "AnonPages:      %8d kB\n", anon/1024)
 	fmt.Fprintf(buf, "Mapped:         %8d kB\n", file/1024) // doesn't count mapped tmpfs, which we don't know
 	fmt.Fprintf(buf, "Shmem:          %8d kB\n", snapshot.Tmpfs/1024)
+	// See mm/hugetlb.c:hugetlb_report_meminfo(). DPDK reads Hugepagesize to
+	// find the default huge page size.
+	pool := kernel.KernelFromContext(ctx).HugetlbPool()
+	fmt.Fprintf(buf, "HugePages_Total: %8d\n", pool.TotalPages())
+	fmt.Fprintf(buf, "HugePages_Free:  %8d\n", pool.FreePages())
+	fmt.Fprintf(buf, "HugePages_Rsvd:  %8d\n", 0)
+	fmt.Fprintf(buf, "HugePages_Surp:  %8d\n", 0)
+	fmt.Fprintf(buf, "Hugepagesize:   %8d kB\n", pool.HugePageSize()/1024)
+	fmt.Fprintf(buf, "Hugetlb:        %8d kB\n", pool.TotalPages()*pool.HugePageSize()/1024)
 	return nil
 }
 

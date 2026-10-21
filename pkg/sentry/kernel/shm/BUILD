@@ -36,6 +36,7 @@ go_library(
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/refs",
+        "//pkg/sentry/hugetlb",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/ipc",
         "//pkg/sentry/ktime",

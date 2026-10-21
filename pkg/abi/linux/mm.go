@@ -50,6 +50,22 @@ const (
 	MAP_HUGETLB    = 1 << 18
 )
 
+// Huge page size encoding for mmap(2), shmget(2) and memfd_create(2): log2
+// of the page size, shifted by HUGETLB_FLAG_ENCODE_SHIFT. Source:
+// include/uapi/asm-generic/hugetlb_encode.h.
+const (
+	HUGETLB_FLAG_ENCODE_SHIFT = 26
+	HUGETLB_FLAG_ENCODE_MASK  = 0x3f
+
+	HUGETLB_FLAG_ENCODE_2MB = 21 << HUGETLB_FLAG_ENCODE_SHIFT
+	HUGETLB_FLAG_ENCODE_1GB = 30 << HUGETLB_FLAG_ENCODE_SHIFT
+
+	MAP_HUGE_SHIFT = HUGETLB_FLAG_ENCODE_SHIFT
+	MAP_HUGE_MASK  = HUGETLB_FLAG_ENCODE_MASK
+	MAP_HUGE_2MB   = HUGETLB_FLAG_ENCODE_2MB
+	MAP_HUGE_1GB   = HUGETLB_FLAG_ENCODE_1GB
+)
+
 // Flags for mremap(2).
 const (
 	MREMAP_MAYMOVE = 1 << 0

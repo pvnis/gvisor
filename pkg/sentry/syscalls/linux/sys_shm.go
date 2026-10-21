@@ -17,6 +17,7 @@ package linux
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
@@ -36,7 +37,12 @@ func Shmget(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr,
 
 	pid := int32(t.ThreadGroup().ID())
 	r := t.IPCNamespace().ShmRegistry()
-	segment, err := r.FindOrCreate(t, pid, key, size, mode, private, create, exclusive)
+	hugetlb := flag&linux.SHM_HUGETLB != 0
+	// Only the default (2 MiB) huge page size is supported.
+	if sizeLog := (flag >> linux.HUGETLB_FLAG_ENCODE_SHIFT) & linux.HUGETLB_FLAG_ENCODE_MASK; hugetlb && sizeLog != 0 && sizeLog != hostarch.HugePageShift {
+		return 0, nil, linuxerr.EINVAL
+	}
+	segment, err := r.FindOrCreate(t, pid, key, size, mode, private, create, exclusive, hugetlb)
 	if err != nil {
 		return 0, nil, err
 	}

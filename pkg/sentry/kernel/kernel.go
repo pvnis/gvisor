@@ -65,6 +65,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/timerfd"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostcpu"
+	"gvisor.dev/gvisor/pkg/sentry/hugetlb"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
@@ -338,6 +339,15 @@ type Kernel struct {
 	// memfd_create() syscalls. It is analogous to Linux's shm_mnt.
 	shmMount *vfs.Mount
 
+	// hugetlbPool is the pool of huge pages for hugetlbfs, MFD_HUGETLB,
+	// MAP_HUGETLB and SHM_HUGETLB. It is immutable after Init.
+	hugetlbPool *hugetlb.Pool
+
+	// hugetlbMount is the hugetlbfs Mount used for anonymous huge page files
+	// (memfd_create(MFD_HUGETLB), mmap(MAP_SHARED|MAP_ANONYMOUS|MAP_HUGETLB)).
+	// It is analogous to Linux's hugetlbfs_vfsmount.
+	hugetlbMount *vfs.Mount
+
 	// socketMount is the Mount used for sockets created by the socket() and
 	// socketpair() syscalls. There are several cases where a socket dentry will
 	// not be contained in socketMount:
@@ -456,6 +466,10 @@ type Kernel struct {
 type InitKernelArgs struct {
 	// FeatureSet is the emulated CPU feature set.
 	FeatureSet cpuid.FeatureSet
+
+	// HugetlbPages is the number of huge pages in the sandbox's hugetlb pool
+	// (/proc/sys/vm/nr_hugepages).
+	HugetlbPages uint64
 
 	// Timekeeper manages time for all tasks in the system.
 	Timekeeper *Timekeeper
@@ -629,6 +643,15 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	defer tmpfsFilesystem.DecRef(ctx)
 	defer tmpfsRoot.DecRef(ctx)
 	k.shmMount = k.vfs.NewDisconnectedMount(tmpfsFilesystem, tmpfsRoot, &vfs.MountOptions{})
+
+	k.hugetlbPool = hugetlb.NewPool(args.HugetlbPages)
+	hugetlbFilesystem, hugetlbRoot, err := tmpfs.HugetlbfsFilesystemType{}.GetFilesystem(ctx, &k.vfs, auth.NewRootCredentials(k.rootUserNamespace), "", vfs.GetFilesystemOptions{InternalMount: true})
+	if err != nil {
+		return fmt.Errorf("failed to create hugetlbfs filesystem: %v", err)
+	}
+	defer hugetlbFilesystem.DecRef(ctx)
+	defer hugetlbRoot.DecRef(ctx)
+	k.hugetlbMount = k.vfs.NewDisconnectedMount(hugetlbFilesystem, hugetlbRoot, &vfs.MountOptions{})
 
 	socketFilesystem, err := sockfs.NewFilesystem(&k.vfs)
 	if err != nil {
@@ -1247,6 +1270,8 @@ func (ctx *createProcessContext) Value(key any) any {
 		return ctx.getMemoryCgroupID()
 	case pgalloc.CtxMemoryFile:
 		return ctx.kernel.mf
+	case hugetlb.CtxPool:
+		return ctx.kernel.hugetlbPool
 	case platform.CtxPlatform:
 		return ctx.kernel
 	case uniqueid.CtxGlobalUniqueID:
@@ -2122,6 +2147,8 @@ func (ctx *supervisorContext) Value(key any) any {
 		return limits.NewLimitSet()
 	case pgalloc.CtxMemoryFile:
 		return ctx.Kernel.mf
+	case hugetlb.CtxPool:
+		return ctx.Kernel.hugetlbPool
 	case platform.CtxPlatform:
 		return ctx.Kernel
 	case uniqueid.CtxGlobalUniqueID:
@@ -2193,6 +2220,16 @@ func (k *Kernel) ShmMount() *vfs.Mount {
 	return k.shmMount
 }
 
+// HugetlbMount returns the internal hugetlbfs mount.
+func (k *Kernel) HugetlbMount() *vfs.Mount {
+	return k.hugetlbMount
+}
+
+// HugetlbPool returns the sandbox's pool of huge pages.
+func (k *Kernel) HugetlbPool() *hugetlb.Pool {
+	return k.hugetlbPool
+}
+
 // SocketMount returns the sockfs mount.
 func (k *Kernel) SocketMount() *vfs.Mount {
 	return k.socketMount
@@ -2247,6 +2284,7 @@ func (k *Kernel) Release() {
 	k.pipeMount.DecRef(ctx)
 	k.nsfsMount.DecRef(ctx)
 	k.shmMount.DecRef(ctx)
+	k.hugetlbMount.DecRef(ctx)
 	k.socketMount.DecRef(ctx)
 	k.vfs.Release(ctx)
 	if k.cgroupRegistry != nil {

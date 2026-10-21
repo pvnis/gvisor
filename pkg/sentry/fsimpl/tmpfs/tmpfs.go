@@ -45,6 +45,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/hugetlb"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -131,6 +132,11 @@ type filesystem struct {
 
 	// ovlWhiteout is the shared overlay whiteout device. It is protected by mu.
 	ovlWhiteout *deviceFile
+
+	// hugetlbPool is the pool that a hugetlbfs filesystem's files allocate
+	// from, in addition to the filesystem's own size limit. It is nil for
+	// tmpfs. Immutable.
+	hugetlbPool *hugetlb.Pool
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -502,6 +508,9 @@ func (d *dentry) releaseChildrenLocked(ctx context.Context) {
 }
 
 func (fs *filesystem) statFS() linux.Statfs {
+	if fs.isHugetlb() {
+		return fs.hugetlbStatFS()
+	}
 	st := linux.Statfs{
 		Type:         linux.TMPFS_MAGIC,
 		BlockSize:    hostarch.PageSize,

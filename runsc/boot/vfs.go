@@ -95,6 +95,10 @@ func selfFilestoreName(sandboxID string) string {
 // tmpfs has some extra supported options that we must pass through.
 var tmpfsAllowedData = []string{"mode", "size", "uid", "gid"}
 
+// hugetlbfsAllowedData is the set of hugetlbfs mount options that are
+// passed to the filesystem as data.
+var hugetlbfsAllowedData = []string{"pagesize", "size", "min_size", "nr_inodes", "mode", "uid", "gid"}
+
 func cgroupfsCPUDefaults(rawQuota, rawPeriod int64) map[string]int64 {
 	const defaultPeriod int64 = 100000
 	const defaultQuota int64 = -1
@@ -167,6 +171,10 @@ func registerFilesystems(k *kernel.Kernel, info *containerInfo, amdGPUSysfs *amd
 		AllowUserList:  true,
 	})
 	vfsObj.MustRegisterFilesystemType(tmpfs.Name, &tmpfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
+	})
+	vfsObj.MustRegisterFilesystemType(tmpfs.HugetlbfsName, &tmpfs.HugetlbfsFilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
@@ -1051,6 +1059,13 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 				tmpfsOpts.SourceTarFSCheckpoint = true
 			}
 			internalData = tmpfsOpts
+		}
+
+	case tmpfs.HugetlbfsName:
+		var err error
+		mopts, data, err = consumeMountOptions(mopts, hugetlbfsAllowedData...)
+		if err != nil {
+			return "", nil, err
 		}
 
 	case Bind:
