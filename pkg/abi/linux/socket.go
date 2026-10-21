@@ -156,7 +156,17 @@ const (
 	PACKET_HDRLEN         = 11
 	PACKET_RESERVE        = 12
 	PACKET_TX_RING        = 13
+	PACKET_LOSS           = 14
+	PACKET_FANOUT         = 18
 	PACKET_QDISC_BYPASS   = 20
+)
+
+// Statuses for a frame in a packet_mmap TX ring from <linux/if_packet.h>.
+const (
+	TP_STATUS_AVAILABLE    = 0
+	TP_STATUS_SEND_REQUEST = 0x1
+	TP_STATUS_SENDING      = 0x2
+	TP_STATUS_WRONG_FORMAT = 0x4
 )
 
 // Statuses for a frame in a packet_mmap ring buffer from <linux/if_packet.h>.

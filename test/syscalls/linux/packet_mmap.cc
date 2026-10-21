@@ -687,6 +687,107 @@ TEST(PacketMmapTest, PacketStatistics) {
   EXPECT_EQ(stats.tp_packets, tp_frame_nr + expected_dropped);
 }
 
+// Tests that frames queued in a TX ring (PACKET_TX_RING) are sent by
+// send(2) and handed back to the application, with the TX ring mapped after
+// the RX ring as DPDK's af_packet PMD does.
+TEST(PacketMmapTest, TxRingSendsQueuedFrames) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HavePacketSocketCapability(SOCK_RAW, 0)));
+  constexpr uint16_t kEtherType = 0x88B5;  // IEEE local experimental.
+  const int lo = ASSERT_NO_ERRNO_AND_VALUE(GetLoopbackIndex());
+
+  FileDescriptor rx_sock = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(AF_PACKET, SOCK_RAW, htons(kEtherType)));
+  sockaddr_ll rx_addr = {
+      .sll_family = AF_PACKET,
+      .sll_protocol = htons(kEtherType),
+      .sll_ifindex = lo,
+  };
+  ASSERT_THAT(bind(rx_sock.get(), reinterpret_cast<sockaddr*>(&rx_addr),
+                   sizeof(rx_addr)),
+              SyscallSucceeds());
+
+  FileDescriptor tx_sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_PACKET, SOCK_RAW, 0));
+  int version = TPACKET_V2;
+  ASSERT_THAT(setsockopt(tx_sock.get(), SOL_PACKET, PACKET_VERSION, &version,
+                         sizeof(version)),
+              SyscallSucceeds());
+  int loss = 1;
+  ASSERT_THAT(setsockopt(tx_sock.get(), SOL_PACKET, PACKET_LOSS, &loss,
+                         sizeof(loss)),
+              SyscallSucceeds());
+  constexpr uint32_t kFrameSize = 2048;
+  constexpr uint32_t kBlockSize = 4096;
+  tpacket_req req = {
+      .tp_block_size = kBlockSize,
+      .tp_block_nr = 2,
+      .tp_frame_size = kFrameSize,
+      .tp_frame_nr = 4,
+  };
+  ASSERT_THAT(
+      setsockopt(tx_sock.get(), SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)),
+      SyscallSucceeds());
+  ASSERT_THAT(
+      setsockopt(tx_sock.get(), SOL_PACKET, PACKET_TX_RING, &req, sizeof(req)),
+      SyscallSucceeds());
+  const size_t ring_size = req.tp_block_size * req.tp_block_nr;
+  char* map = static_cast<char*>(mmap(nullptr, 2 * ring_size,
+                                      PROT_READ | PROT_WRITE, MAP_SHARED,
+                                      tx_sock.get(), 0));
+  ASSERT_NE(map, MAP_FAILED);
+  auto unmap = Cleanup([&] { munmap(map, 2 * ring_size); });
+  sockaddr_ll tx_addr = {
+      .sll_family = AF_PACKET,
+      .sll_protocol = 0,
+      .sll_ifindex = lo,
+  };
+  ASSERT_THAT(bind(tx_sock.get(), reinterpret_cast<sockaddr*>(&tx_addr),
+                   sizeof(tx_addr)),
+              SyscallSucceeds());
+
+  // Queue two frames, and leave a malformed (zero-length) one after them,
+  // which PACKET_LOSS skips.
+  char* tx_ring = map + ring_size;
+  constexpr char kPayload[] = "tx ring frame";
+  constexpr size_t kDataOffset = TPACKET_ALIGN(sizeof(tpacket2_hdr));
+  size_t frame_len = 0;
+  for (int i = 0; i < 3; i++) {
+    tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(tx_ring + i * kFrameSize);
+    ASSERT_EQ(hdr->tp_status, TP_STATUS_AVAILABLE);
+    char* data = reinterpret_cast<char*>(hdr) + kDataOffset;
+    ethhdr* eth = reinterpret_cast<ethhdr*>(data);
+    memset(eth, 0, sizeof(*eth));
+    eth->h_proto = htons(kEtherType);
+    memcpy(data + sizeof(*eth), kPayload, sizeof(kPayload));
+    data[sizeof(*eth)] = '0' + i;
+    frame_len = sizeof(*eth) + sizeof(kPayload);
+    hdr->tp_len = i < 2 ? frame_len : 0;
+    __atomic_store_n(&hdr->tp_status, TP_STATUS_SEND_REQUEST, __ATOMIC_RELEASE);
+  }
+  EXPECT_THAT(send(tx_sock.get(), nullptr, 0, 0),
+              SyscallSucceedsWithValue(2 * frame_len));
+  for (int i = 0; i < 3; i++) {
+    tpacket2_hdr* hdr = reinterpret_cast<tpacket2_hdr*>(tx_ring + i * kFrameSize);
+    EXPECT_EQ(__atomic_load_n(&hdr->tp_status, __ATOMIC_ACQUIRE),
+              TP_STATUS_AVAILABLE)
+        << "frame " << i;
+  }
+
+  // The RX ring is unaffected.
+  EXPECT_EQ(reinterpret_cast<tpacket2_hdr*>(map)->tp_status,
+            TP_STATUS_KERNEL);
+
+  for (int i = 0; i < 2; i++) {
+    char buf[kFrameSize];
+    ASSERT_THAT(RetryEINTR(recv)(rx_sock.get(), buf, sizeof(buf), 0),
+                SyscallSucceedsWithValue(frame_len));
+    EXPECT_EQ(buf[sizeof(ethhdr)], '0' + i);
+    EXPECT_EQ(memcmp(buf + sizeof(ethhdr) + 1, kPayload + 1,
+                     sizeof(kPayload) - 1),
+              0);
+  }
+}
+
 }  // namespace
 }  // namespace testing
 }  // namespace gvisor

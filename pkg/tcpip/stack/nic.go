@@ -794,6 +794,11 @@ func (n *nic) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt *Packe
 		}
 	}()
 	deliverPacketEPs := func(ep PacketEndpoint) {
+		// Like Linux (net/core/dev.c:skb_loop_sk()), don't loop a packet
+		// back to the packet socket that sent it.
+		if pkt.PktType == tcpip.PacketOutgoing && pkt.senderPacketEP == ep {
+			return
+		}
 		if packetEPPkt == nil {
 			// Packet endpoints hold the full packet.
 			//

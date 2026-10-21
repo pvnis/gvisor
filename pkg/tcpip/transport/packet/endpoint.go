@@ -270,9 +270,9 @@ func (ep *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tc
 	mark := ep.ops.GetMark()
 	if err := func() tcpip.Error {
 		if ep.cooked {
-			return ep.stack.WritePacketToRemoteWithMark(nicID, remote, proto, payload, mark)
+			return ep.stack.WritePacketToRemoteWithMark(nicID, remote, proto, payload, mark, ep)
 		}
-		return ep.stack.WriteRawPacketWithMark(nicID, proto, payload, mark)
+		return ep.stack.WriteRawPacketWithMark(nicID, proto, payload, mark, ep)
 	}(); err != nil {
 		return 0, err
 	}

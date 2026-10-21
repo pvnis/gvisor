@@ -2226,12 +2226,15 @@ func (s *Stack) unregisterPacketEndpointLocked(nicID tcpip.NICID, netProto tcpip
 // WritePacketToRemote writes a payload on the specified NIC using the provided
 // network protocol and remote link address.
 func (s *Stack) WritePacketToRemote(nicID tcpip.NICID, remote tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, payload buffer.Buffer) tcpip.Error {
-	return s.WritePacketToRemoteWithMark(nicID, remote, netProto, payload, 0)
+	return s.WritePacketToRemoteWithMark(nicID, remote, netProto, payload, 0, nil)
 }
 
 // WritePacketToRemoteWithMark writes a payload on the specified NIC using the
 // provided network protocol, remote link address, and packet mark.
-func (s *Stack) WritePacketToRemoteWithMark(nicID tcpip.NICID, remote tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, payload buffer.Buffer, mark uint32) tcpip.Error {
+//
+// If sender is not nil, it is the packet endpoint sending the packet, which
+// does not receive it as an outgoing packet.
+func (s *Stack) WritePacketToRemoteWithMark(nicID tcpip.NICID, remote tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, payload buffer.Buffer, mark uint32, sender PacketEndpoint) tcpip.Error {
 	s.mu.Lock()
 	nic, ok := s.nics[nicID]
 	s.mu.Unlock()
@@ -2245,18 +2248,21 @@ func (s *Stack) WritePacketToRemoteWithMark(nicID tcpip.NICID, remote tcpip.Link
 	})
 	defer pkt.DecRef()
 	pkt.NetworkProtocolNumber = netProto
+	pkt.senderPacketEP = sender
 	return nic.WritePacketToRemote(remote, pkt)
 }
 
 // WriteRawPacket writes data directly to the specified NIC without adding any
 // headers.
 func (s *Stack) WriteRawPacket(nicID tcpip.NICID, proto tcpip.NetworkProtocolNumber, payload buffer.Buffer) tcpip.Error {
-	return s.WriteRawPacketWithMark(nicID, proto, payload, 0)
+	return s.WriteRawPacketWithMark(nicID, proto, payload, 0, nil)
 }
 
 // WriteRawPacketWithMark writes data directly to the specified NIC without adding any
-// headers, setting the specified packet mark.
-func (s *Stack) WriteRawPacketWithMark(nicID tcpip.NICID, proto tcpip.NetworkProtocolNumber, payload buffer.Buffer, mark uint32) tcpip.Error {
+// headers, setting the specified packet mark. If sender is not nil, it is the
+// packet endpoint sending the packet, which does not receive it as an outgoing
+// packet.
+func (s *Stack) WriteRawPacketWithMark(nicID tcpip.NICID, proto tcpip.NetworkProtocolNumber, payload buffer.Buffer, mark uint32, sender PacketEndpoint) tcpip.Error {
 	s.mu.RLock()
 	nic, ok := s.nics[nicID]
 	s.mu.RUnlock()
@@ -2270,6 +2276,7 @@ func (s *Stack) WriteRawPacketWithMark(nicID tcpip.NICID, proto tcpip.NetworkPro
 	})
 	defer pkt.DecRef()
 	pkt.NetworkProtocolNumber = proto
+	pkt.senderPacketEP = sender
 	return nic.writeRawPacketWithLinkHeaderInPayload(pkt)
 }
 

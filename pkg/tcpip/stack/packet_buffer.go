@@ -138,6 +138,10 @@ type PacketBuffer struct {
 	// Only set for locally generated packets.
 	Owner tcpip.PacketOwner
 
+	// senderPacketEP is the packet endpoint that sent this packet, if any.
+	// Outgoing packets are not looped back to it.
+	senderPacketEP PacketEndpoint `state:"nosave"`
+
 	// The following fields are only set by the qdisc layer when the packet
 	// is added to a queue.
 	EgressRoute RouteInfo

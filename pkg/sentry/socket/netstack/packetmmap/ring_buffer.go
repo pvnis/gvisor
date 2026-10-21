@@ -16,7 +16,6 @@ package packetmmap
 
 import (
 	"fmt"
-	"io"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bitmap"
@@ -103,34 +102,52 @@ func (rb *ringBuffer) destroy() {
 	rb.dataMu.Unlock()
 }
 
-// AppendTranslation essentially implements memmap.Mappable.Translate, with the
-// only difference being that it takes in a slice of translations and appends
-// this ring buffer's translation.
-func (rb *ringBuffer) AppendTranslation(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType, ts []memmap.Translation) ([]memmap.Translation, error) {
+// appendTranslation appends the translation of optional, a range of the
+// endpoint's mapping in which this ring buffer starts at base, to ts.
+//
+// Precondition: optional is within [base, base+rb.bufferSize()).
+func (rb *ringBuffer) appendTranslation(optional memmap.MappableRange, base uint64, ts []memmap.Translation) []memmap.Translation {
 	rb.dataMu.Lock()
 	defer rb.dataMu.Unlock()
-	var beyondEOF bool
-	if required.End > rb.size {
-		if required.Start >= rb.size {
-			return ts, &memmap.BusError{Err: io.EOF}
-		}
-		beyondEOF = true
-		required.End = rb.size
-	}
-	if optional.End > rb.size {
-		optional.End = rb.size
-	}
-	mappableRange := rb.mapping.Intersect(optional)
-	ts = append(ts, memmap.Translation{
-		Source: mappableRange,
+	return append(ts, memmap.Translation{
+		Source: optional,
 		File:   rb.mf,
-		Offset: rb.data.Start + (mappableRange.Start - rb.mapping.Start),
+		Offset: rb.data.Start + (optional.Start - base),
 		Perms:  hostarch.AnyAccess,
 	})
-	if beyondEOF {
-		return ts, &memmap.BusError{Err: io.EOF}
+}
+
+// frameCount returns the number of frames in the ring buffer.
+func (rb *ringBuffer) frameCount() uint32 {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	return rb.frameMax + 1
+}
+
+// readUint32 reads the uint32 at offset off in the given frame.
+func (rb *ringBuffer) readUint32(frameNum, off uint32) (uint32, error) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	ims, err := rb.internalMappingsForFrame(frameNum, hostarch.Read)
+	if err != nil {
+		return 0, err
 	}
-	return ts, nil
+	return safemem.LoadUint32(ims.DropFirst64(uint64(off)).Head())
+}
+
+// readFrame copies length bytes at offset off in the given frame.
+func (rb *ringBuffer) readFrame(frameNum, off, length uint32) ([]byte, error) {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	ims, err := rb.internalMappingsForFrame(frameNum, hostarch.Read)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, length)
+	if _, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf)), ims.DropFirst64(uint64(off))); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 func (rb *ringBuffer) FrameSize() uint32 {

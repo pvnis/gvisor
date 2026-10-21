@@ -38,6 +38,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/abi/linux/errno"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/eventchannel"
@@ -429,6 +430,10 @@ type sock struct {
 	Endpoint tcpip.Endpoint
 	skType   linux.SockType
 	protocol int
+
+	// packetLoss is PACKET_LOSS: whether a packet socket's TX ring skips
+	// malformed frames instead of stopping at them.
+	packetLoss atomicbitops.Bool
 
 	namespace *inet.Namespace
 
@@ -2992,7 +2997,8 @@ func (s *sock) setSockOptIP(t *kernel.Task, ep commonEndpoint, name int, optVal 
 // setSockOptPacket implements the linux setsockopt(2) when the level is SOL_PACKET.
 func (s *sock) setSockOptPacket(t *kernel.Task, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
 	switch name {
-	case linux.PACKET_RX_RING:
+	case linux.PACKET_RX_RING, linux.PACKET_TX_RING:
+		isRx := name == linux.PACKET_RX_RING
 		var tpacketReq linux.TpacketReq
 		if len(optVal) < tpacketReq.SizeBytes() {
 			return syserr.ErrInvalidArgument
@@ -3004,8 +3010,10 @@ func (s *sock) setSockOptPacket(t *kernel.Task, ep commonEndpoint, name int, opt
 			TpFrameSize: tpacketReq.TpFrameSize,
 			TpFrameNr:   tpacketReq.TpFrameNr,
 		}
-		if err := ep.SetSockOpt(&req); err != nil {
-			return syserr.TranslateNetstackError(err)
+		if isRx {
+			if err := ep.SetSockOpt(&req); err != nil {
+				return syserr.TranslateNetstackError(err)
+			}
 		}
 		if ep, ok := ep.(stack.MappablePacketEndpoint); ok {
 			var pme *packetmmap.Endpoint
@@ -3017,7 +3025,7 @@ func (s *sock) setSockOptPacket(t *kernel.Task, ep commonEndpoint, name int, opt
 			} else {
 				pme = &packetmmap.Endpoint{}
 			}
-			opts := ep.GetPacketMMapOpts(&req, true /* isRx */)
+			opts := ep.GetPacketMMapOpts(&req, isRx)
 			if opts.Req.TpFrameNr != 0 || opts.Req.TpBlockNr != 0 {
 				if err := pme.Init(t, opts); err != nil {
 					return syserr.FromError(err)
@@ -3043,6 +3051,22 @@ func (s *sock) setSockOptPacket(t *kernel.Task, ep commonEndpoint, name int, opt
 	case linux.PACKET_ADD_MEMBERSHIP, linux.PACKET_AUXDATA:
 		// Silently ignore these options.
 		incrementBadSetSocketOptionMetric(t, &socketLevelPacketFieldValue, name)
+		return nil
+	case linux.PACKET_LOSS:
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+		s.packetLoss.Store(hostarch.ByteOrder.Uint32(optVal) != 0)
+		return nil
+	case linux.PACKET_FANOUT:
+		// Fanout spreads a group's frames over its sockets. With one socket
+		// per group, as DPDK's af_packet PMD creates with one queue pair,
+		// that is the same as no fanout. Larger groups are not supported:
+		// each of their sockets would receive every frame.
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+		log.Infof("PACKET_FANOUT %#x accepted; frames are not spread across sockets", hostarch.ByteOrder.Uint32(optVal))
 		return nil
 	case linux.PACKET_QDISC_BYPASS:
 		// Netstack's packet endpoints write directly to the link endpoint, so
@@ -3392,6 +3416,31 @@ func (s *sock) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, haveDe
 	}
 }
 
+// sendPacketTxRing transmits the frames queued in a packet socket's TX ring
+// (PACKET_TX_RING) and returns true if the socket has one. With a TX ring,
+// send(2) ignores its buffer and sends the ring instead, as in
+// net/packet/af_packet.c:packet_sendmsg().
+func (s *sock) sendPacketTxRing(opts tcpip.WriteOptions) (int, bool, *syserr.Error) {
+	mep, ok := s.Endpoint.(stack.MappablePacketEndpoint)
+	if !ok {
+		return 0, false, nil
+	}
+	pme, ok := mep.GetPacketMMapEndpoint().(*packetmmap.Endpoint)
+	if !ok || pme == nil || !pme.HasTxRing() {
+		return 0, false, nil
+	}
+	n, err := pme.SendTxRing(s.packetLoss.Load(), func(frame []byte) error {
+		if _, err := s.Endpoint.Write(bytes.NewReader(frame), opts); err != nil {
+			return syserr.TranslateNetstackError(err).ToError()
+		}
+		return nil
+	})
+	if err != nil {
+		return int(n), true, syserr.FromError(err)
+	}
+	return int(n), true, nil
+}
+
 // SendMsg implements the linux syscall sendmsg(2) for sockets backed by
 // tcpip.Endpoint.
 func (s *sock) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages socket.ControlMessages) (int, *syserr.Error) {
@@ -3419,6 +3468,12 @@ func (s *sock) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags 
 		More:            flags&linux.MSG_MORE != 0,
 		EndOfRecord:     flags&linux.MSG_EOR != 0,
 		ControlMessages: s.linuxToNetstackControlMessages(controlMessages),
+	}
+
+	if s.family == linux.AF_PACKET {
+		if n, ok, err := s.sendPacketTxRing(opts); ok {
+			return n, err
+		}
 	}
 
 	r := src.Reader(t)
@@ -3539,7 +3594,7 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr,
 		_, err := ifr.CopyOut(t, args[2].Pointer())
 		return 0, err
 
-	case linux.SIOCSIFFLAGS, linux.SIOCSIFMTU:
+	case linux.SIOCSIFFLAGS, linux.SIOCSIFMTU, linux.SIOCSIFHWADDR:
 		if !t.HasCapabilityIn(linux.CAP_NET_ADMIN, t.NetworkNamespace().UserNamespace()) {
 			return 0, linuxerr.EPERM
 		}
@@ -3607,8 +3662,9 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr,
 // interface, to the extent applications that drive raw Ethernet interfaces
 // (e.g. an O-RAN fronthaul's AF_PACKET transport) need:
 //
-//   - SIOCSIFMTU succeeds if the MTU is the interface's current MTU; netstack
-//     interfaces' MTUs are fixed by the host interface they mirror.
+//   - SIOCSIFMTU and SIOCSIFHWADDR succeed if they set the interface's current
+//     MTU or address; netstack interfaces mirror host interfaces whose MTU
+//     and address are fixed.
 //   - SIOCSIFFLAGS can toggle IFF_PROMISC. Other flags it does not model are
 //     ignored, but taking the interface down is not supported.
 func interfaceSetIoctl(ctx context.Context, arg int, ifr *linux.IFReq) *syserr.Error {
@@ -3638,6 +3694,11 @@ func interfaceSetIoctl(ctx context.Context, arg int, ifr *linux.IFReq) *syserr.E
 	case linux.SIOCSIFMTU:
 		if mtu := hostarch.ByteOrder.Uint32(ifr.Data[:4]); mtu != iface.MTU {
 			return syserr.ErrInvalidArgument
+		}
+	case linux.SIOCSIFHWADDR:
+		// ifr_hwaddr is a struct sockaddr: sa_family, then the address.
+		if len(iface.Addr) > len(ifr.Data)-2 || string(ifr.Data[2:2+len(iface.Addr)]) != string(iface.Addr) {
+			return syserr.ErrNotSupported
 		}
 	case linux.SIOCSIFFLAGS:
 		cur, err := interfaceStatusFlags(stk, iface.Name)

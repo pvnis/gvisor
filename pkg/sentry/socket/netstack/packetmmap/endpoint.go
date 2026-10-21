@@ -20,6 +20,7 @@ package packetmmap
 
 import (
 	"fmt"
+	"io"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -65,6 +66,10 @@ type Endpoint struct {
 	//	  txRingBuffer.dataMu
 	mu           sync.Mutex `state:"nosave"`
 	rxRingBuffer ringBuffer
+	// txMu serializes SendTxRing, which must not hold mu while it sends:
+	// netstack loops outgoing frames back to packet endpoints, including
+	// this one (HandlePacket).
+	txMu         sync.Mutex `state:"nosave"`
 	txRingBuffer ringBuffer
 
 	mapped atomicbitops.Uint32
@@ -190,6 +195,13 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 	if !m.Mapped() {
 		return false
 	}
+	m.mu.Lock()
+	hasRx := m.mode&rxRingBuffer != 0
+	m.mu.Unlock()
+	if !hasRx {
+		// A TX ring alone does not change how packets are received.
+		return false
+	}
 
 	const minMacLen = 16
 	var (
@@ -307,35 +319,149 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 }
 
 // Translate implements memmap.Mappable.Translate.
+//
+// As in Linux (net/packet/af_packet.c:packet_mmap()), the mapping holds the
+// RX ring, if any, followed by the TX ring, if any.
 func (m *Endpoint) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	translationSize := 0
+	var rings []*ringBuffer
 	if m.mode&rxRingBuffer != 0 {
-		translationSize++
+		rings = append(rings, &m.rxRingBuffer)
 	}
 	if m.mode&txRingBuffer != 0 {
-		translationSize++
+		rings = append(rings, &m.txRingBuffer)
 	}
-
-	ts := make([]memmap.Translation, 0, translationSize)
-	var err error
-
-	if m.mode&rxRingBuffer != 0 {
-		ts, err = m.rxRingBuffer.AppendTranslation(ctx, required, optional, at, ts)
-	}
-	if m.mode&txRingBuffer != 0 {
-		// Translate went outside the bounds of the RX ring buffer, which is valid
-		// if there is also a TX ring buffer.
-		if err != nil {
-			if len(ts) > 0 {
-				required.Start = ts[len(ts)-1].Source.End
-				optional.Start = ts[len(ts)-1].Source.End
-			}
+	ts := make([]memmap.Translation, 0, len(rings))
+	var base uint64
+	for _, rb := range rings {
+		ringRange := memmap.MappableRange{Start: base, End: base + rb.bufferSize()}
+		if opt := optional.Intersect(ringRange); opt.Length() != 0 {
+			ts = rb.appendTranslation(opt, base, ts)
 		}
-		ts, err = m.txRingBuffer.AppendTranslation(ctx, required, optional, at, ts)
+		base = ringRange.End
 	}
-	return ts, err
+	if required.End > base {
+		return ts, &memmap.BusError{Err: io.EOF}
+	}
+	return ts, nil
+}
+
+// SendTxRing transmits the frames that the application has queued in the TX
+// ring, as net/packet/af_packet.c:tpacket_snd() does: starting at the ring's
+// head, each frame with status TP_STATUS_SEND_REQUEST is passed to write and
+// handed back to the application (TP_STATUS_AVAILABLE). It stops at the first
+// frame that is not queued, and returns the number of bytes sent.
+//
+// A frame whose length does not fit in its slot is skipped if discardBad
+// (PACKET_LOSS) is set; otherwise it is marked TP_STATUS_WRONG_FORMAT and
+// transmission stops with EINVAL.
+func (m *Endpoint) SendTxRing(discardBad bool, write func([]byte) error) (int64, error) {
+	m.txMu.Lock()
+	defer m.txMu.Unlock()
+	var sent int64
+	for {
+		frame, more, err := m.nextTxFrame(discardBad)
+		if err != nil || !more {
+			return sent, err
+		}
+		werr := write(frame.data)
+		if err := m.finishTxFrame(frame.slot); err != nil {
+			return sent, err
+		}
+		if werr != nil {
+			return sent, werr
+		}
+		sent += int64(len(frame.data))
+	}
+}
+
+// txFrame is a frame taken from the TX ring for sending.
+type txFrame struct {
+	slot uint32
+	data []byte
+}
+
+// nextTxFrame returns the frame at the head of the TX ring if the application
+// queued it (TP_STATUS_SEND_REQUEST), marking it TP_STATUS_SENDING. It skips
+// malformed frames if discardBad.
+//
+// Precondition: m.txMu is locked.
+func (m *Endpoint) nextTxFrame(discardBad bool) (txFrame, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mode&txRingBuffer == 0 {
+		return txFrame{}, false, nil
+	}
+	rb := &m.txRingBuffer
+	// The frame data follows the aligned header; see
+	// net/packet/af_packet.c:tpacket_fill_skb() without PACKET_TX_HAS_OFF.
+	var dataOff, lenOff uint32
+	switch m.version {
+	case linux.TPACKET_V1:
+		dataOff = linux.TPacketAlign(uint32((*linux.TpacketHdr)(nil).SizeBytes()))
+		lenOff = 8 // tp_len follows the 64-bit tp_status.
+	default:
+		dataOff = linux.TPacketAlign(uint32((*linux.Tpacket2Hdr)(nil).SizeBytes()))
+		lenOff = 4
+	}
+	frameSize := rb.FrameSize()
+	for n := rb.frameCount(); n > 0; n-- {
+		slot := rb.head
+		status, err := rb.currFrameStatus()
+		if err != nil {
+			return txFrame{}, false, err
+		}
+		if status != linux.TP_STATUS_SEND_REQUEST {
+			return txFrame{}, false, nil
+		}
+		length, err := rb.readUint32(slot, lenOff)
+		if err != nil {
+			return txFrame{}, false, err
+		}
+		if length == 0 || length > frameSize-dataOff {
+			if !discardBad {
+				if err := rb.writeStatus(slot, linux.TP_STATUS_WRONG_FORMAT); err != nil {
+					return txFrame{}, false, err
+				}
+				return txFrame{}, false, linuxerr.EINVAL
+			}
+			if err := rb.writeStatus(slot, linux.TP_STATUS_AVAILABLE); err != nil {
+				return txFrame{}, false, err
+			}
+			rb.incHead()
+			continue
+		}
+		data, err := rb.readFrame(slot, dataOff, length)
+		if err != nil {
+			return txFrame{}, false, err
+		}
+		if err := rb.writeStatus(slot, linux.TP_STATUS_SENDING); err != nil {
+			return txFrame{}, false, err
+		}
+		rb.incHead()
+		return txFrame{slot: slot, data: data}, true, nil
+	}
+	return txFrame{}, false, nil
+}
+
+// finishTxFrame hands a sent frame back to the application.
+//
+// Precondition: m.txMu is locked.
+func (m *Endpoint) finishTxFrame(slot uint32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mode&txRingBuffer == 0 {
+		return nil
+	}
+	return m.txRingBuffer.writeStatus(slot, linux.TP_STATUS_AVAILABLE)
+}
+
+// HasTxRing returns whether the endpoint has a TX ring.
+func (m *Endpoint) HasTxRing() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mode&txRingBuffer != 0
 }
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.

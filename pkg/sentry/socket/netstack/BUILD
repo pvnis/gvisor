@@ -34,6 +34,7 @@ go_library(
     deps = [
         ":events_go_proto",
         "//pkg/abi/linux",
+        "//pkg/atomicbitops",
         "//pkg/abi/linux/errno",
         "//pkg/context",
         "//pkg/errors/linuxerr",

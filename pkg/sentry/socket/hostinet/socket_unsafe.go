@@ -86,7 +86,7 @@ func ioctl(ctx context.Context, fd int, io usermem.IO, sysno uintptr, args arch.
 		}
 		_, err := ifr.CopyOut(cc, args[2].Pointer())
 		return 0, err
-	case linux.SIOCSIFMTU, linux.SIOCSIFFLAGS:
+	case linux.SIOCSIFMTU, linux.SIOCSIFFLAGS, linux.SIOCSIFHWADDR:
 		// The sandbox does not reconfigure host interfaces, but applications
 		// that drive raw Ethernet interfaces (e.g. an O-RAN fronthaul's
 		// AF_PACKET transport) set the MTU or flags they need and fail if
@@ -101,18 +101,18 @@ func ioctl(ctx context.Context, fd int, io usermem.IO, sysno uintptr, args arch.
 			return 0, err
 		}
 		cur := ifr
-		getCmd := uintptr(linux.SIOCGIFMTU)
-		if cmd == linux.SIOCSIFFLAGS {
-			getCmd = linux.SIOCGIFFLAGS
+		getCmd, start, size := uintptr(linux.SIOCGIFMTU), 0, 4 // ifr_mtu
+		switch cmd {
+		case linux.SIOCSIFFLAGS:
+			getCmd, size = linux.SIOCGIFFLAGS, 2 // ifr_flags
+		case linux.SIOCSIFHWADDR:
+			// ifr_hwaddr: sa_family, then the Ethernet address.
+			getCmd, start, size = linux.SIOCGIFHWADDR, 2, 6
 		}
 		if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), getCmd, uintptr(unsafe.Pointer(&cur))); errno != 0 {
 			return 0, translateIOSyscallError(errno)
 		}
-		size := 4 // ifr_mtu
-		if cmd == linux.SIOCSIFFLAGS {
-			size = 2 // ifr_flags
-		}
-		if string(cur.Data[:size]) != string(ifr.Data[:size]) {
+		if string(cur.Data[start:start+size]) != string(ifr.Data[start:start+size]) {
 			return 0, linuxerr.EPERM
 		}
 		return 0, nil
