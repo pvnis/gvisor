@@ -491,10 +491,21 @@ func (fd *kfdFD) destroyQueue(queueID uint32) error {
 // would be exceeded the driver is never called: the request is refused with
 // the error it would itself have returned, which the ROCm runtime reports as
 // an out-of-memory condition.
+//
+// Userptr allocations are refused outright. For those the driver treats
+// MmapOffset as a CPU virtual address in the address space of the process
+// that opened /dev/kfd, and pins the pages it finds there for the GPU to
+// access. That process is the Sentry, whose address space is not the
+// application's, so forwarding the request would let the application choose
+// which of the Sentry's pages the GPU may read and write.
 func kfdAllocMemoryOfGPU(ki *kfdIoctlState) (uintptr, error) {
 	var params amdgpu.KFDIoctlAllocMemoryOfGPUArgs
 	if _, err := params.CopyIn(ki.t, ki.argAddr); err != nil {
 		return 0, err
+	}
+	if params.Flags&amdgpu.KFD_IOC_ALLOC_MEM_FLAGS_USERPTR != 0 {
+		ki.ctx.Debugf("amdproxy: refusing userptr ALLOC_MEMORY_OF_GPU")
+		return 0, linuxerr.EINVAL
 	}
 	acct := &ki.fd.dev.amdp.memAcct
 	kind := memKindOfFlags(params.Flags)

@@ -381,6 +381,28 @@ external one. Left open rather than bypassed; needs `cilium policy trace` or
 direct map inspection, not more guessing. Worked around for this test with
 two fresh tenants matching the AMD side's simpler `tenant-amd-a/b/c` recipe.
 
+### Userptr allocations were a sandbox escape, and are now refused (2026-11-16)
+
+Found while porting amdproxy for upstream, by reading the driver path, not
+by reproducing it. `ALLOC_MEMORY_OF_GPU` with `KFD_IOC_ALLOC_MEM_FLAGS_USERPTR`
+was forwarded unchanged. For a userptr allocation KFD treats `mmap_offset` as
+a CPU address in `current->mm` and pins those pages for the GPU
+(`init_user_pages` -> `amdgpu_ttm_tt_set_userptr`, then `hmm_range_fault`).
+`current->mm` is the **Sentry's**, on systrap and KVM alike, so a sandboxed
+program could pick which Sentry pages (heap, stacks) the GPU reads and
+writes. It is now refused with `EINVAL` before the quota is even consulted.
+nvproxy solved the same shape for OS-descriptor memory by mirroring
+application pages into the Sentry first (`osDescMem`); that is the fix if a
+workload turns out to need userptr.
+
+**Not yet re-verified on sens1.** ROCr uses userptr for `hipHostRegister` and
+`hsa_amd_memory_lock`; whether anything vecadd, gpuburn or vLLM do at init
+depends on it is the open question. The same class of bug — a driver
+dereferencing a CPU address carried *inside* an ioctl struct — needs an audit
+across every forwarded ioctl, starting with `GET_QUEUE_WAVE_STATE`, which
+`timeslice.go` issues from the Sentry and which `copy_to_user`s the control
+stack to the queue's `ctx_save_restore_address`.
+
 ### SVM: denying it is better than forwarding it
 
 Do not "fix" SVM by making it reach the driver. That was tried (`95a5fa7e1`)

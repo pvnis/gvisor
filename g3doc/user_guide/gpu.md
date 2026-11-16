@@ -1227,6 +1227,12 @@ they complement each other.**
     initialisation under KVM, where the driver would act on a guest address;
     denied, ROCr falls back cleanly. `hipMallocManaged` does not work;
     `hipMalloc` workloads are unaffected.
+*   Userptr allocations (`AMDKFD_IOC_ALLOC_MEMORY_OF_GPU` with
+    `KFD_IOC_ALLOC_MEM_FLAGS_USERPTR`) are refused with `EINVAL`. The driver
+    pins the pages at that address in the Sentry's address space, not the
+    application's, so forwarding it would hand the GPU Sentry memory of the
+    application's choosing. `hipHostRegister` and `hsa_amd_memory_lock` do
+    not work; `hipHostMalloc` is unaffected.
 *   Checkpoint and restore of a sandbox that has used the GPU is not supported.
 *   A CU mask must select whole workgroup processors on RDNA, which pairs them.
     runsc refuses a mask that splits a pair at startup, naming the offending
