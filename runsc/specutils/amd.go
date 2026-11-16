@@ -56,3 +56,27 @@ func AMDGPUFunctionalityRequested(spec *specs.Spec) bool {
 	}
 	return false
 }
+
+// AMDRenderMinorsInSpec returns the minor numbers of the DRM render nodes the
+// spec gives the container. These are host device numbers, which is what the
+// KFD topology's drm_render_minor holds, and unlike the path they do not
+// change if a device plugin exposes a node under a different name.
+func AMDRenderMinorsInSpec(spec *specs.Spec) map[uint32]bool {
+	minors := make(map[uint32]bool)
+	if spec.Linux == nil {
+		return minors
+	}
+	for _, dev := range spec.Linux.Devices {
+		if dev.Type == "c" && dev.Major == drmMajor && dev.Minor >= renderMinorBase {
+			minors[uint32(dev.Minor)] = true
+		}
+	}
+	return minors
+}
+
+// drmMajor is the DRM subsystem's character device major, and
+// renderMinorBase the first minor of a render node; card nodes are below it.
+const (
+	drmMajor        = 226
+	renderMinorBase = 128
+)

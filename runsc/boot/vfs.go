@@ -1012,6 +1012,17 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 		internalData = newProcInternalData(conf, spec)
 
 	case sys.Name:
+		// The snapshot was taken when the sandbox was created, from the first
+		// container's spec; under Kubernetes that is the pause container,
+		// which has no devices. Which GPUs a container may use is only known
+		// from its own spec, here. ROCm binds to every GPU the topology
+		// lists and KFD refuses those outside the container's device cgroup,
+		// after which the runtime reports no GPU at all, so this is needed
+		// for a multi-GPU host to work, not only to hide the others.
+		amdGPUSysfs, err := amdGPUSysfs.ForRenderNodes(specutils.AMDRenderMinorsInSpec(spec))
+		if err != nil {
+			return "", nil, fmt.Errorf("restricting AMD GPU sysfs to the container's GPUs: %w", err)
+		}
 		sysData := &sys.InternalData{
 			EnableTPUProxyPaths: specutils.TPUProxyEnabled(spec, conf),
 			RDMASysfs:           rdmaSysfs,
@@ -1703,9 +1714,16 @@ func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *contai
 			// container and carries no devices, so a pod only gets here
 			// when --amdproxy was not passed to the sandbox.
 			log.Warningf("amdproxy: creating /dev/kfd with host major %d but amdproxy is not registered; opening it will fail with ENXIO. Is --amdproxy set for this sandbox?", major)
-		} else if major != info.amdproxyDevInfo.KFDDevMajor {
-			major = info.amdproxyDevInfo.KFDDevMajor
-			log.Infof("Switching /dev/kfd device major number from %d to %d", devSpec.Major, major)
+		} else {
+			if major != info.amdproxyDevInfo.KFDDevMajor {
+				major = info.amdproxyDevInfo.KFDDevMajor
+				log.Infof("Switching /dev/kfd device major number from %d to %d", devSpec.Major, major)
+			}
+			// The GPUs this container was given are the render nodes in its
+			// spec. The driver reports every GPU in the host to the sandbox's
+			// KFD context, and amdproxy hides the ones not given to any of
+			// its containers.
+			info.amdproxyDevInfo.AllowRenderNodes(specutils.AMDRenderMinorsInSpec(info.spec))
 		}
 	} else if strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps-imex-channels/") {
 		if info.nvproxyDevInfo.CapsIMEXChannelsDevMajor != 0 && major != info.nvproxyDevInfo.CapsIMEXChannelsDevMajor {
@@ -1769,6 +1787,7 @@ func amdproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem,
 		CUMask:             cuMask,
 		GPUMemoryLimit:     info.conf.AMDProxyGPUMemoryLimit,
 		CUsPerComputeGroup: amdGPUSysfs.CUsPerComputeGroup(),
+		RenderMinorGPUIDs:  amdGPUSysfs.RenderMinorGPUIDs(),
 		ShareKFDVM:         info.conf.AMDProxyShareKFDVM,
 		SchedulerFD:        info.gpuSchedulerFD,
 		SchedulerWeight:    info.conf.AMDProxyGPUWeight,

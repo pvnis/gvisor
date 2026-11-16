@@ -71,6 +71,11 @@ type Options struct {
 	// disables the check that CUMask selects only whole groups.
 	CUsPerComputeGroup int
 
+	// RenderMinorGPUIDs maps each host GPU's render node minor to its
+	// gpu_id, from the KFD topology. It is how the GPUs a container's spec
+	// names are recognised in the driver's replies.
+	RenderMinorGPUIDs map[uint32]uint32
+
 	// ShareKFDVM allows the processes of this sandbox to share one GPU address
 	// space, so that more than one of them can use the GPU. The driver binds a
 	// single address space per process and the Sentry is one process, so
@@ -105,6 +110,9 @@ type Options struct {
 type DeviceInfo struct {
 	// KFDDevMajor is /dev/kfd's device major number.
 	KFDDevMajor uint32
+
+	// gpus is the sandbox's GPU allowlist; see AllowRenderNodes.
+	gpus *gpuAllowlist
 }
 
 // Register registers all devices implemented by this package, and specified
@@ -116,7 +124,9 @@ func Register(vfsObj *vfs.VirtualFilesystem, opts *Options) (*DeviceInfo, error)
 		cuMask:      opts.CUMask,
 		kfdFDs:      make(map[*kfdFD]struct{}),
 		renderFDs:   make(map[*renderFD]struct{}),
+		gpus:        &gpuAllowlist{byMinor: opts.RenderMinorGPUIDs},
 	}
+	amdp.devInfo.gpus = amdp.gpus
 	amdp.memAcct.init(opts.GPUMemoryLimit)
 	amdp.vmShare.init(opts.ShareKFDVM)
 	amdp.vaGuard.init(opts.ShareKFDVM)
@@ -286,6 +296,9 @@ type amdproxy struct {
 	// queues it submits through. It is inert unless a scheduler connection was
 	// donated.
 	timeSlicer timeSlicer
+
+	// gpus is the set of GPUs the sandbox was given.
+	gpus *gpuAllowlist
 
 	fdsMu     sync.Mutex `state:"nosave"`
 	kfdFDs    map[*kfdFD]struct{}

@@ -11,6 +11,7 @@ go_library(
         "drm.go",
         "drm_mmap.go",
         "drm_unsafe.go",
+        "gpus.go",
         "kfd.go",
         "kfd_handlers.go",
         "kfd_mmap.go",
@@ -54,7 +55,10 @@ go_library(
 go_test(
     name = "amdproxy_test",
     size = "small",
-    srcs = ["timeslice_test.go"],
+    srcs = [
+        "gpus_test.go",
+        "timeslice_test.go",
+    ],
     library = ":amdproxy",
     deps = [
         "//pkg/abi/amdgpu",

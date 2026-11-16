@@ -51,8 +51,13 @@ func kfdSetMmapTarget(hostFD int32, tgid int32) error {
 
 // kfdGetProcessAperturesNew handles AMDKFD_IOC_GET_PROCESS_APERTURES_NEW. The
 // parameters point at an application array that the driver fills in with one
-// entry per GPU, so the pointer is retargeted at a Sentry buffer for the
-// duration of the call and the result copied back out.
+// entry per GPU.
+//
+// The driver reports every GPU in the host, not only the sandbox's, so the
+// host is always asked for its full list, into a Sentry buffer, and the
+// application is answered from that list restricted to the sandbox's GPUs
+// (see gpuAllowlist): both the count, when that is all it asked for, and the
+// entries. The application's pointer is never handed to the host kernel.
 func kfdGetProcessAperturesNew(ki *kfdIoctlState) (uintptr, error) {
 	var params amdgpu.KFDIoctlGetProcessAperturesNewArgs
 	if _, err := params.CopyIn(ki.t, ki.argAddr); err != nil {
@@ -63,40 +68,52 @@ func kfdGetProcessAperturesNew(ki *kfdIoctlState) (uintptr, error) {
 	}
 	// A null pointer, or a zero node count, asks for the number of nodes
 	// alone and leaves the array untouched; see
-	// kfd_ioctl_get_process_apertures_new(). Null the pointer so that no
-	// application address is handed to the host kernel even though the driver
-	// will not dereference it, and restore it afterwards so that the
-	// application's own copy is unchanged.
-	if params.KFDProcessDeviceAperturesPtr == 0 || params.NumOfNodes == 0 {
-		origPtr := params.KFDProcessDeviceAperturesPtr
-		params.KFDProcessDeviceAperturesPtr = 0
-		n, err := kfdIoctlInvoke(ki, &params)
-		params.KFDProcessDeviceAperturesPtr = origPtr
-		if err != nil {
-			return n, err
-		}
-		if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
-			return n, err
-		}
-		return n, nil
-	}
-
-	apertures := make([]amdgpu.KFDProcessDeviceApertures, params.NumOfNodes)
-	defer runtime.KeepAlive(apertures)
+	// kfd_ioctl_get_process_apertures_new().
+	countOnly := params.KFDProcessDeviceAperturesPtr == 0 || params.NumOfNodes == 0
+	want := params.NumOfNodes
 	origPtr := params.KFDProcessDeviceAperturesPtr
-	params.KFDProcessDeviceAperturesPtr = uint64(uintptr(unsafe.Pointer(&apertures[0])))
+
+	// The host refuses a count above its number of GPUs (EINVAL), so ask it
+	// for the count first, then for exactly that many entries.
+	params.NumOfNodes = 0
+	params.KFDProcessDeviceAperturesPtr = 0
 	n, err := kfdIoctlInvoke(ki, &params)
-	params.KFDProcessDeviceAperturesPtr = origPtr
 	if err != nil {
+		params.KFDProcessDeviceAperturesPtr = origPtr
 		return n, err
 	}
+	if params.NumOfNodes > maxKFDDevices {
+		params.KFDProcessDeviceAperturesPtr = origPtr
+		return n, linuxerr.EINVAL
+	}
+	var apertures []amdgpu.KFDProcessDeviceApertures
+	if params.NumOfNodes > 0 {
+		apertures = make([]amdgpu.KFDProcessDeviceApertures, params.NumOfNodes)
+		defer runtime.KeepAlive(apertures)
+		params.KFDProcessDeviceAperturesPtr = uint64(uintptr(unsafe.Pointer(&apertures[0])))
+		n, err = kfdIoctlInvoke(ki, &params)
+		if err != nil {
+			params.KFDProcessDeviceAperturesPtr = origPtr
+			return n, err
+		}
+	}
+	params.KFDProcessDeviceAperturesPtr = origPtr
 	// The driver reports how many entries it filled, which cannot exceed the
 	// number requested.
 	if params.NumOfNodes > uint32(len(apertures)) {
 		return n, linuxerr.EINVAL
 	}
-	if _, err := amdgpu.CopyKFDProcessDeviceAperturesSliceOut(ki.t, hostarch.Addr(origPtr), apertures[:params.NumOfNodes]); err != nil {
-		return n, err
+	visible := ki.fd.dev.amdp.gpus.filterApertures(apertures[:params.NumOfNodes])
+	if countOnly {
+		params.NumOfNodes = uint32(len(visible))
+	} else {
+		if uint32(len(visible)) > want {
+			visible = visible[:want]
+		}
+		if _, err := amdgpu.CopyKFDProcessDeviceAperturesSliceOut(ki.t, hostarch.Addr(origPtr), visible); err != nil {
+			return n, err
+		}
+		params.NumOfNodes = uint32(len(visible))
 	}
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err

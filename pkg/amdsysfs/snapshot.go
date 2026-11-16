@@ -170,13 +170,13 @@ type Snapshot struct {
 // host has no KFD topology, which is the ordinary case on a machine with no
 // AMD GPU.
 //
-// TODO: The topology is currently reproduced whole, so a sandbox sees every
-// GPU the host has rather than the ones assigned to it. Once a sandbox's
-// GPUs are known here, the nodes should be filtered to those, and the
-// per-node memory sizes reported against the sandbox's quota rather than the
-// device's, for the same reason nvproxy rewrites its framebuffer-size query:
-// otherwise the topology is an oracle for what the rest of the machine has
-// and is doing.
+// The snapshot is of every GPU the host has, and is shared by the sandbox's
+// containers; ForRenderNodes derives each container's view from it.
+//
+// TODO: Report the per-node memory sizes against the sandbox's quota rather
+// than the device's, for the same reason nvproxy rewrites its
+// framebuffer-size query: otherwise the topology tells the sandbox what the
+// rest of the GPU has.
 func Collect(sysRoot string) (*Snapshot, error) {
 	topoPath := filepath.Join(sysRoot, TopologyPath)
 	fi, err := os.Stat(topoPath)
@@ -530,4 +530,217 @@ func propUint64(data, key string) uint64 {
 		}
 	}
 	return 0
+}
+
+// RenderMinorGPUIDs maps each GPU node's render node minor to its gpu_id.
+// Nodes without a render node, such as CPUs, are left out.
+func (s *Snapshot) RenderMinorGPUIDs() map[uint32]uint32 {
+	m := make(map[uint32]uint32)
+	if s == nil || s.Topology == nil || s.Topology.Dirs["nodes"] == nil {
+		return m
+	}
+	for _, node := range s.Topology.Dirs["nodes"].Dirs {
+		if node == nil {
+			continue
+		}
+		minor := propUint64(node.Files["properties"], "drm_render_minor")
+		id, err := strconv.ParseUint(strings.TrimSpace(node.Files["gpu_id"]), 10, 32)
+		if minor == 0 || err != nil || id == 0 {
+			continue
+		}
+		m[uint32(minor)] = uint32(id)
+	}
+	return m
+}
+
+// ForRenderNodes returns a copy of the snapshot restricted to the GPUs whose
+// render node minors are in allowed; see RestrictToRenderNodes. The receiver
+// is not modified, since one snapshot is shared by every container in a
+// sandbox and each container may have been given different GPUs.
+func (s *Snapshot) ForRenderNodes(allowed map[uint32]bool) (*Snapshot, error) {
+	if s == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+	var c Snapshot
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, err
+	}
+	if err := c.RestrictToRenderNodes(allowed); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// RestrictToRenderNodes reduces the snapshot to the GPUs whose render node
+// minors are in allowed, so that a sandbox sees only the GPUs assigned to it.
+//
+// This is needed for correctness, not only to avoid leaking what else the
+// machine has. ROCm's thunk acts on every GPU node in the topology while it
+// initializes: it binds the process to each one (SET_MEMORY_POLICY,
+// ACQUIRE_VM). KFD allows that only for a GPU whose render node the caller's
+// device cgroup permits, and the Sentry runs in the container's cgroup, so on
+// a host with more GPUs than the container was given the first unassigned one
+// fails and the thunk discards every GPU: HIP reports no device at all.
+//
+// CPU nodes are kept. The kept nodes are renumbered densely in their original
+// order, because the thunk reads nodes 0..N-1 and stops at the first gap. A
+// node's io_links and p2p_links name other nodes by number: links to a dropped
+// node are removed, the rest are renumbered densely too, their node_from and
+// node_to rewritten, and the node's io_links_count and p2p_links_count updated.
+// DRM nodes are kept for the allowed render nodes and the card nodes of the
+// same PCI functions, and the PCI closure is recomputed from them.
+func (s *Snapshot) RestrictToRenderNodes(allowed map[uint32]bool) error {
+	if s == nil || s.Topology == nil {
+		return nil
+	}
+	if nodes := s.Topology.Dirs["nodes"]; nodes != nil {
+		if err := restrictNodes(nodes, allowed); err != nil {
+			return err
+		}
+	}
+	s.restrictDRM(allowed)
+	return nil
+}
+
+func restrictNodes(nodes *Dir, allowed map[uint32]bool) error {
+	old, err := sortedIndices(nodes.Dirs)
+	if err != nil {
+		return fmt.Errorf("topology nodes: %w", err)
+	}
+	renum := make(map[int]int)
+	for _, i := range old {
+		props := nodes.Dirs[strconv.Itoa(i)].Files["properties"]
+		isCPU := propUint64(props, "simd_count") == 0
+		minor := propUint64(props, "drm_render_minor")
+		if isCPU || allowed[uint32(minor)] {
+			renum[i] = len(renum)
+		}
+	}
+	kept := make(map[string]*Dir, len(renum))
+	for _, i := range old {
+		n, ok := renum[i]
+		if !ok {
+			continue
+		}
+		node := nodes.Dirs[strconv.Itoa(i)]
+		for _, links := range []struct{ dir, count string }{
+			{"io_links", "io_links_count"},
+			{"p2p_links", "p2p_links_count"},
+		} {
+			count, err := restrictLinks(node.Dirs[links.dir], renum)
+			if err != nil {
+				return fmt.Errorf("topology node %d %s: %w", i, links.dir, err)
+			}
+			if props, ok := node.Files["properties"]; ok && hasProp(props, links.count) {
+				node.Files["properties"] = setProp(props, links.count, strconv.Itoa(count))
+			}
+		}
+		kept[strconv.Itoa(n)] = node
+	}
+	nodes.Dirs = kept
+	return nil
+}
+
+// restrictLinks drops the links in dir whose target node was dropped,
+// renumbers the rest, and returns how many remain.
+func restrictLinks(dir *Dir, renum map[int]int) (int, error) {
+	if dir == nil {
+		return 0, nil
+	}
+	old, err := sortedIndices(dir.Dirs)
+	if err != nil {
+		return 0, err
+	}
+	kept := make(map[string]*Dir, len(old))
+	for _, i := range old {
+		link := dir.Dirs[strconv.Itoa(i)]
+		props := link.Files["properties"]
+		if !hasProp(props, "node_from") || !hasProp(props, "node_to") {
+			return 0, fmt.Errorf("link %d has no node_from/node_to", i)
+		}
+		from, okFrom := renum[int(propUint64(props, "node_from"))]
+		to, okTo := renum[int(propUint64(props, "node_to"))]
+		if !okFrom || !okTo {
+			continue
+		}
+		props = setProp(props, "node_from", strconv.Itoa(from))
+		link.Files["properties"] = setProp(props, "node_to", strconv.Itoa(to))
+		kept[strconv.Itoa(len(kept))] = link
+	}
+	dir.Dirs = kept
+	return len(kept), nil
+}
+
+func (s *Snapshot) restrictDRM(allowed map[uint32]bool) {
+	gpuPCI := make(map[string]bool)
+	for _, n := range s.DRM {
+		if strings.HasPrefix(n.Name, "renderD") && allowed[n.Minor] {
+			gpuPCI[n.PCIPath] = true
+		}
+	}
+	var drm []DRMNode
+	for _, n := range s.DRM {
+		keep := allowed[n.Minor] && strings.HasPrefix(n.Name, "renderD")
+		// The card node is kept beside its GPU's render node for enumeration
+		// by the AMD SMI library (see drmNodeRE); its minor is not a render
+		// minor, so it is matched by PCI function instead.
+		keep = keep || (strings.HasPrefix(n.Name, "card") && gpuPCI[n.PCIPath])
+		if keep {
+			drm = append(drm, n)
+		}
+	}
+	s.DRM = drm
+	var pci []PCIDir
+	for _, d := range s.PCI {
+		for _, n := range s.DRM {
+			if n.PCIPath == d.Path || strings.HasPrefix(n.PCIPath, d.Path+"/") {
+				pci = append(pci, d)
+				break
+			}
+		}
+	}
+	s.PCI = pci
+}
+
+// sortedIndices returns the names of dirs, which must all be decimal
+// integers, as integers in ascending order.
+func sortedIndices(dirs map[string]*Dir) ([]int, error) {
+	idx := make([]int, 0, len(dirs))
+	for name, d := range dirs {
+		i, err := strconv.Atoi(name)
+		if err != nil || i < 0 || strconv.Itoa(i) != name {
+			return nil, fmt.Errorf("unexpected entry %q", name)
+		}
+		if d == nil {
+			return nil, fmt.Errorf("entry %q is empty", name)
+		}
+		idx = append(idx, i)
+	}
+	sort.Ints(idx)
+	return idx, nil
+}
+
+func hasProp(data, key string) bool {
+	for _, line := range strings.Split(data, "\n") {
+		if k, _, ok := strings.Cut(strings.TrimSpace(line), " "); ok && k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// setProp replaces the value of key in a sysfs properties string, keeping
+// every other line as it is.
+func setProp(data, key, value string) string {
+	lines := strings.Split(data, "\n")
+	for i, line := range lines {
+		if k, _, ok := strings.Cut(strings.TrimSpace(line), " "); ok && k == key {
+			lines[i] = key + " " + value
+		}
+	}
+	return strings.Join(lines, "\n")
 }
