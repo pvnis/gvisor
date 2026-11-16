@@ -23,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/amdgpu"
 	"gvisor.dev/gvisor/pkg/gpusched"
 	"gvisor.dev/gvisor/pkg/sentry/devices/amdproxy/amdconf"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 )
 
 // TestDbgTrapArgSizes tests that every DBG_TRAP parameter struct is the size
@@ -481,17 +480,7 @@ func TestSignalPageGoesToOneProcess(t *testing.T) {
 	}
 }
 
-// TestSignalPageUnsharedIsUnrestricted tests that without sharing every
-// process may propose a page, because each has its own kfd_process.
-func TestSignalPageUnsharedIsUnrestricted(t *testing.T) {
-	var es eventShare
-	es.init(false)
-	for _, tgid := range []int32{2, 6, 10} {
-		if !es.claimPage(kernel.ThreadID(tgid)) {
-			t.Errorf("thread group %d was refused a signal page with sharing off", tgid)
-		}
-	}
-	if es.mustPoll(6) {
-		t.Error("a process must not be made to poll when sharing is off")
-	}
-}
+// Without sharing, the signal page is still the KFD process's only one: a
+// sandbox has a single kfd_process whatever the mode, and a later process can
+// reach CREATE_EVENT after taking over the GPU from one that exited. See
+// TestSignalPageOwnedWithoutSharing in reclaim_test.go.

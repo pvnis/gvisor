@@ -17,6 +17,7 @@ go_library(
         "kfd_mmap.go",
         "kfd_unsafe.go",
         "memquota.go",
+        "reclaim.go",
         "seccomp_filters.go",
         "sharedvm.go",
         "timeslice.go",
@@ -57,10 +58,13 @@ go_test(
     size = "small",
     srcs = [
         "gpus_test.go",
+        "reclaim_test.go",
         "timeslice_test.go",
     ],
     library = ":amdproxy",
     deps = [
+        "//pkg/context",
+        "//pkg/sentry/kernel",
         "//pkg/abi/amdgpu",
         "//pkg/gpusched",
         "//pkg/sentry/devices/amdproxy/amdconf",

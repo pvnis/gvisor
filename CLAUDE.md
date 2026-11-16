@@ -224,6 +224,21 @@ each sandbox has its own Sentry and so its own `kfd_process` — so this is not
 an isolation regression; it is a correctness trade confined to the container
 that opts in, which is why it is off by default.
 
+**Processes in turn no longer need the opt-in** (`reclaim.go`). Two things were
+wrong for a pod that just runs one GPU program after another. Without sharing,
+the second got `EBUSY` on ACQUIRE_VM. With it, the second got past
+initialisation and then ran out of memory: measured on MI355X, 1024 of a
+4096 MiB quota free, because the first had allocated 3 GiB and exited without
+freeing it, as HIP programs do -- and the driver frees nothing until the
+kfd_process goes, which is when the sandbox does. Now each /dev/kfd description
+records the queues, events and buffers created through it and gives them back
+when released, and once an address space's holder has no /dev/kfd open, the
+next process takes it over (with a dup of the same render file) without the
+opt-in. The signal page cannot move -- the driver refuses to free it (EPERM)
+or replace it (EINVAL) -- so later processes' page proposals are dropped in
+every mode, not only with sharing on, and their waits poll at 20 ms. Measured:
+three vecadd runs in one pod, 5.54 / 5.42 / 5.43 s, each with the full quota.
+
 This is the same root as the KFD-mmap process binding and SVM's EFAULT: the
 driver seeing the Sentry where it expects the application.
 

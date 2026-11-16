@@ -1156,15 +1156,26 @@ the whole card and weight 100: it received a 1 GiB limit and a weight of 9.
 #### 6. Multi-process workloads
 
 A sandbox gets **one** KFD process context, because KFD keys it on the calling
-`mm` and the Sentry is one host process. Without help only the first process to
-touch the GPU succeeds and the rest get `EBUSY`, which rules out vLLM, PyTorch
-distributed, and anything else that forks.
+`mm` and the Sentry is one host process. That context, and everything created in
+it, lives as long as the sandbox, not as long as the process that created it.
 
-`--amdproxy-share-kfd-vm` (or the annotation above) shares the one context. The
-cost is that those processes allocate from one address space while each believes
-it has its own, so an allocation that would overlap another's is refused rather
-than aliased. Nothing crosses a sandbox boundary, so this is a correctness trade
-confined to the container that opts in -- which is why it is off by default.
+**Processes one after another need nothing.** When a process releases
+`/dev/kfd` (normally, when it exits), amdproxy gives back what it created --
+queues, events, buffers, the debug runtime -- since the driver will not, and the
+next process to use the GPU takes over the address space the first acquired. A
+script that runs several GPU programs in turn works, each with the full quota.
+The one thing not handed over is the event signal page, which the driver never
+lets a KFD process replace, so from the second process on, waits poll every
+20 ms instead of being woken; measured on MI355X, a vecadd run took the same
+time either way.
+
+**Processes at the same time** -- vLLM, PyTorch distributed, anything that
+forks -- still need `--amdproxy-share-kfd-vm` (or the annotation above), or all
+but the first get `EBUSY`. The cost is that those processes allocate from one
+address space while each believes it has its own, so an allocation that would
+overlap another's is refused rather than aliased. Nothing crosses a sandbox
+boundary, so this is a correctness trade confined to the container that opts
+in -- which is why it is off by default.
 
 #### 7. Check that it took
 

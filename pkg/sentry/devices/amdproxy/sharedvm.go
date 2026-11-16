@@ -129,17 +129,22 @@ func (rs *renderShare) init(enabled bool) {
 }
 
 // open returns a host descriptor for the render node with the given minor
-// number, calling openHost at most once per minor for the sandbox's lifetime.
+// number.
 //
-// With sharing off it is exactly openHost, so the ordinary path keeps one open
-// file per descriptor as before.
-func (rs *renderShare) open(minor uint32, openHost func() (int32, string, error)) (int32, string, error) {
-	if !rs.enabled {
-		return openHost()
-	}
+// The first open of each minor is kept for the sandbox's lifetime whether or
+// not sharing is on, because ACQUIRE_VM may bind that file's address space to
+// the sandbox's KFD process, and a later process that takes the address space
+// over (vmShare.shareFor) needs that same file again after the process that
+// opened it has exited. Later opens are dups of it when sharing is on, or when
+// handoff reports that the address space this node belongs to was acquired by
+// a process that has since gone; otherwise they are fresh opens, as before.
+func (rs *renderShare) open(minor uint32, handoff func() bool, openHost func() (int32, string, error)) (int32, string, error) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	if hostFD, ok := rs.canonical[minor]; ok {
+		if !rs.enabled && !handoff() {
+			return openHost()
+		}
 		dup, err := unix.Dup(int(hostFD))
 		if err != nil {
 			return -1, "", err
@@ -175,8 +180,9 @@ type vmShare struct {
 
 	mu sync.Mutex `state:"nosave"`
 
-	// owners maps a GPU ID to the thread group that acquired its address
-	// space. Only the first acquisition reaches the driver.
+	// owners maps a GPU ID to the thread group that holds its address space:
+	// the one that acquired it, or the last to take it over. Only the first
+	// acquisition reaches the driver. Kept whether or not sharing is on.
 	// +checklocks:mu
 	owners map[uint32]kernel.ThreadID
 
@@ -196,15 +202,29 @@ func (vs *vmShare) init(enabled bool) {
 
 // shareFor reports whether an acquisition of gpuID by tgid should be answered
 // with success without reaching the driver, which is the case when a different
-// process in this sandbox already holds that GPU's address space.
-func (vs *vmShare) shareFor(ctx context.Context, gpuID uint32, tgid kernel.ThreadID) bool {
-	if !vs.enabled {
-		return false
-	}
+// process in this sandbox already holds that GPU's address space and either
+// sharing is on or that process has gone (alive reports whether it still has
+// /dev/kfd open).
+//
+// The second case is a handover, and needs no opt-in: the owner can no longer
+// allocate, and what it held was given back when it released /dev/kfd (see
+// reclaim.go), so there is nobody left to collide with. Without it a sandbox
+// could use the GPU from exactly one process in its lifetime: a pod running
+// two GPU programs one after the other got EBUSY on ACQUIRE_VM for the second.
+// The new process becomes the owner, so a third can take over from it in turn.
+func (vs *vmShare) shareFor(ctx context.Context, gpuID uint32, tgid kernel.ThreadID, alive func(kernel.ThreadID) bool) bool {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 	owner, ok := vs.owners[gpuID]
 	if !ok || owner == tgid {
+		return false
+	}
+	if !alive(owner) {
+		vs.owners[gpuID] = tgid
+		ctx.Infof("amdproxy: thread group %d takes over the GPU %d address space from thread group %d, which has exited", tgid, gpuID, owner)
+		return true
+	}
+	if !vs.enabled {
 		return false
 	}
 	if !vs.warned[gpuID] {
@@ -220,14 +240,21 @@ func (vs *vmShare) shareFor(ctx context.Context, gpuID uint32, tgid kernel.Threa
 // claim records that tgid has acquired gpuID's address space. It is called
 // only after the driver has accepted the acquisition.
 func (vs *vmShare) claim(gpuID uint32, tgid kernel.ThreadID) {
-	if !vs.enabled {
-		return
-	}
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 	if _, ok := vs.owners[gpuID]; !ok {
 		vs.owners[gpuID] = tgid
 	}
+}
+
+// heldByGone reports whether gpuID's address space has been acquired and its
+// holder has gone, so that a render node of that GPU should be opened onto
+// the file the address space is bound to.
+func (vs *vmShare) heldByGone(gpuID uint32, alive func(kernel.ThreadID) bool) bool {
+	vs.mu.Lock()
+	owner, ok := vs.owners[gpuID]
+	vs.mu.Unlock()
+	return ok && !alive(owner)
 }
 
 // runtimeShare makes AMDKFD_IOC_RUNTIME_ENABLE idempotent across the
@@ -374,7 +401,11 @@ func (es *eventShare) init(enabled bool) {
 }
 
 // claimPage reports whether tgid may propose a signal page: true for the first
-// process to ask and for that process thereafter, false for every other.
+// process to ask and for that process thereafter, false for every other. This
+// holds whether or not sharing is on: the driver keeps one signal page per KFD
+// process and never lets it be replaced, so after a process hands the GPU over
+// (vmShare.shareFor), its successor's proposal would be refused too, and with
+// it the event, which ROCr does not check before using.
 //
 // A false answer must not become an error to the caller. The driver's
 // CREATE_EVENT returns before it creates anything if the page proposal fails
@@ -384,9 +415,6 @@ func (es *eventShare) init(enabled bool) {
 // to allocate a slot on the page the owner already registered, which is what
 // the caller needed; it just cannot be woken through it. See mustPoll.
 func (es *eventShare) claimPage(tgid kernel.ThreadID) bool {
-	if !es.enabled {
-		return true
-	}
 	es.mu.Lock()
 	defer es.mu.Unlock()
 	if es.pageOwner == 0 {
@@ -427,14 +455,11 @@ func (es *eventShare) owner() kernel.ThreadID {
 	return es.pageOwner
 }
 
-// releasePage drops tgid's claim on the signal page if it held it, so that a
-// later process can register one after the owner exits. The driver frees the
-// page with the KFD process, which outlives any one of these processes, so
-// this only keeps the Sentry's view from naming a thread group that is gone.
+// releasePage drops tgid's claim on the signal page if it held it. It is only
+// for a proposal the driver refused, when no page was registered and the
+// next process may try. Once a page is registered it stays the KFD process's
+// until the sandbox ends, so the claim is kept even after its owner exits.
 func (es *eventShare) releasePage(tgid kernel.ThreadID) {
-	if !es.enabled {
-		return
-	}
 	es.mu.Lock()
 	defer es.mu.Unlock()
 	if es.pageOwner == tgid {
@@ -467,9 +492,6 @@ func (es *eventShare) logCap(ctx context.Context, tgid kernel.ThreadID, timeout 
 // mustPoll reports whether tgid can only learn of completion by reading its
 // own memory, and so must not be left waiting indefinitely.
 func (es *eventShare) mustPoll(tgid kernel.ThreadID) bool {
-	if !es.enabled {
-		return false
-	}
 	es.mu.Lock()
 	defer es.mu.Unlock()
 	_, ok := es.denied[tgid]

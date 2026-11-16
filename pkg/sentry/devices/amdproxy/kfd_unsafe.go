@@ -142,6 +142,11 @@ func kfdMapMemoryToGPU(ki *kfdIoctlState) (uintptr, error) {
 	params.DeviceIDsArrayPtr = uint64(uintptr(unsafe.Pointer(&deviceIDs[0])))
 	n, err := kfdIoctlInvoke(ki, &params)
 	params.DeviceIDsArrayPtr = origPtr
+	// NSuccess counts the devices done, from the front of the array, and is
+	// meaningful even when the call failed part way.
+	if done := params.NSuccess; done > 0 && done <= params.NDevices {
+		ki.fd.res.mapped(params.Handle, deviceIDs[:done], ki.cmd == uint32(amdgpu.AMDKFD_IOC_MAP_MEMORY_TO_GPU))
+	}
 	if err != nil {
 		return n, err
 	}
@@ -457,6 +462,7 @@ func kfdCreateQueue(ki *kfdIoctlState) (uintptr, error) {
 		}
 	}
 	ki.fd.dev.amdp.timeSlicer.trackQueue(ki.fd.hostFD, params.QueueID, params.QueueType, params.CtlStackSize)
+	ki.fd.res.addQueue(params.QueueID)
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err
 	}
@@ -479,6 +485,7 @@ func kfdDestroyQueue(ki *kfdIoctlState) (uintptr, error) {
 	if err != nil {
 		return n, err
 	}
+	ki.fd.res.removeQueue(params.QueueID)
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err
 	}
@@ -509,6 +516,47 @@ func (fd *kfdFD) destroyQueue(queueID uint32) error {
 		return errno
 	}
 	return nil
+}
+
+// hostIoctl issues a KFD ioctl on the host with parameters held in Sentry
+// memory, for the requests this package makes on its own behalf.
+func (fd *kfdFD) hostIoctl(cmd uintptr, params unsafe.Pointer) error {
+	_, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fd.hostFD), cmd, uintptr(params))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// destroyEvent issues AMDKFD_IOC_DESTROY_EVENT on the host.
+func (fd *kfdFD) destroyEvent(eventID uint32) error {
+	params := amdgpu.KFDIoctlDestroyEventArgs{EventID: eventID}
+	return fd.hostIoctl(uintptr(amdgpu.AMDKFD_IOC_DESTROY_EVENT), unsafe.Pointer(&params))
+}
+
+// unmapMemory issues AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU on the host for the
+// given GPUs.
+func (fd *kfdFD) unmapMemory(handle uint64, gpuIDs []uint32) error {
+	defer runtime.KeepAlive(gpuIDs)
+	params := amdgpu.KFDIoctlUnmapMemoryFromGPUArgs{
+		Handle:            handle,
+		DeviceIDsArrayPtr: uint64(uintptr(unsafe.Pointer(&gpuIDs[0]))),
+		NDevices:          uint32(len(gpuIDs)),
+	}
+	return fd.hostIoctl(uintptr(amdgpu.AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU), unsafe.Pointer(&params))
+}
+
+// freeMemory issues AMDKFD_IOC_FREE_MEMORY_OF_GPU on the host.
+func (fd *kfdFD) freeMemory(handle uint64) error {
+	params := amdgpu.KFDIoctlFreeMemoryOfGPUArgs{Handle: handle}
+	return fd.hostIoctl(uintptr(amdgpu.AMDKFD_IOC_FREE_MEMORY_OF_GPU), unsafe.Pointer(&params))
+}
+
+// disableRuntime issues AMDKFD_IOC_RUNTIME_ENABLE on the host with the enable
+// bit clear, taking the debug runtime down.
+func (fd *kfdFD) disableRuntime() error {
+	params := amdgpu.KFDIoctlRuntimeEnableArgs{}
+	return fd.hostIoctl(uintptr(amdgpu.AMDKFD_IOC_RUNTIME_ENABLE), unsafe.Pointer(&params))
 }
 
 // kfdAllocMemoryOfGPU handles AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, charging the
@@ -557,6 +605,7 @@ func kfdAllocMemoryOfGPU(ki *kfdIoctlState) (uintptr, error) {
 		return n, err
 	}
 	acct.record(params.Handle, kind, params.Size)
+	ki.fd.res.addMem(params.Handle)
 	if kind != memKindNone {
 		guard.record(params.Handle, params.VAAddr, params.Size, tgid)
 	}
@@ -580,6 +629,7 @@ func kfdFreeMemoryOfGPU(ki *kfdIoctlState) (uintptr, error) {
 	}
 	ki.fd.dev.amdp.memAcct.forget(params.Handle)
 	ki.fd.dev.amdp.vaGuard.forget(params.Handle)
+	ki.fd.res.removeMem(params.Handle)
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err
 	}

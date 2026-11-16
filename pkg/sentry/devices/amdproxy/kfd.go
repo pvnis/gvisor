@@ -50,6 +50,10 @@ func (dev *kfdDevice) Open(ctx context.Context, mnt *vfs.Mount, d *vfs.Dentry, o
 		containerName: containerName,
 		dev:           dev,
 	}
+	if t := kernel.TaskFromContext(ctx); t != nil {
+		fd.tgid = t.ThreadGroup().ID()
+	}
+	fd.res.init()
 	if err := fd.vfsfd.Init(fd, opts.Flags, auth.CredentialsFromContext(ctx), mnt, d, &vfs.FileDescriptionOptions{
 		UseDentryMetadata: true,
 		SpecialFile:       true,
@@ -86,6 +90,13 @@ type kfdFD struct {
 	dev        *kfdDevice
 	queue      waiter.Queue
 	memmapFile kfdMemmapFile
+
+	// tgid is the thread group that opened this description. Immutable.
+	tgid kernel.ThreadID
+
+	// res is what was created in the driver through this description, given
+	// back when it is released; see reclaim.go.
+	res fdResources
 }
 
 func (fd *kfdFD) isRestored() bool {
@@ -98,6 +109,10 @@ func (fd *kfdFD) Release(context.Context) {
 	if fd.isRestored() {
 		return
 	}
+	// Before anything else: the host descriptor is still open and the
+	// sandbox's other descriptors are still tracked, and the driver will not
+	// give any of this back by itself; see reclaim.go.
+	fd.reclaim()
 	fdnotifier.RemoveFD(fd.hostFD)
 	fd.queue.Notify(waiter.EventHUp)
 	fd.memmapFile.MappableRelease() // eventually closes fd.hostFD
@@ -196,7 +211,7 @@ func (fd *kfdFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 	case amdgpu.AMDKFD_IOC_CREATE_EVENT:
 		return kfdCreateEvent(ki)
 	case amdgpu.AMDKFD_IOC_DESTROY_EVENT:
-		return kfdIoctlSimple[amdgpu.KFDIoctlDestroyEventArgs](ki)
+		return kfdDestroyEvent(ki)
 	case amdgpu.AMDKFD_IOC_SET_EVENT:
 		return kfdIoctlSimple[amdgpu.KFDIoctlSetEventArgs](ki)
 	case amdgpu.AMDKFD_IOC_RESET_EVENT:

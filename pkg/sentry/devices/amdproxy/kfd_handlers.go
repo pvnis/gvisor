@@ -97,9 +97,25 @@ func kfdCreateEvent(ki *kfdIoctlState) (uintptr, error) {
 	if err != nil {
 		return n, err
 	}
+	ki.fd.res.addEvent(params.EventID)
 	if _, err := params.CopyOut(ki.t, ki.argAddr); err != nil {
 		return n, err
 	}
+	return n, nil
+}
+
+// kfdDestroyEvent handles AMDKFD_IOC_DESTROY_EVENT, forgetting the event so
+// that it is not destroyed a second time when the description is released.
+func kfdDestroyEvent(ki *kfdIoctlState) (uintptr, error) {
+	var params amdgpu.KFDIoctlDestroyEventArgs
+	if _, err := params.CopyIn(ki.t, ki.argAddr); err != nil {
+		return 0, err
+	}
+	n, err := kfdIoctlInvoke(ki, &params)
+	if err != nil {
+		return n, err
+	}
+	ki.fd.res.removeEvent(params.EventID)
 	return n, nil
 }
 
@@ -122,10 +138,12 @@ func kfdRuntimeEnable(ki *kfdIoctlState) (uintptr, error) {
 		if share.enter(tgid) {
 			// Another process has already brought the runtime up, which is the
 			// state this caller is asking for.
+			ki.fd.res.setRuntime(true)
 			return 0, nil
 		}
 	} else if share.leave(tgid) {
 		// Someone else is still using it.
+		ki.fd.res.setRuntime(false)
 		return 0, nil
 	} else {
 		// The last user is taking the debug runtime down, and the driver will
@@ -149,6 +167,7 @@ func kfdRuntimeEnable(ki *kfdIoctlState) (uintptr, error) {
 		}
 		return n, err
 	}
+	ki.fd.res.setRuntime(enabling)
 	if enabling {
 		// The one moment at which a debug session may be opened: the debug
 		// runtime is up, and has not yet become busy. See openSession.
@@ -187,7 +206,7 @@ func kfdAcquireVM(ki *kfdIoctlState) (uintptr, error) {
 	// process unable to use the GPU at all; sharedvm.go explains what is being
 	// traded away by reporting success instead.
 	tgid := ki.t.ThreadGroup().ID()
-	if ki.fd.dev.amdp.vmShare.shareFor(ki.ctx, params.GPUID, tgid) {
+	if ki.fd.dev.amdp.vmShare.shareFor(ki.ctx, params.GPUID, tgid, ki.fd.dev.amdp.tgAlive) {
 		return 0, nil
 	}
 	params.DRMFD = uint32(renderFile.hostFD)

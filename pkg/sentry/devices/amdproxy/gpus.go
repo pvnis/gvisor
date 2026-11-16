@@ -87,6 +87,13 @@ func (g *gpuAllowlist) filterApertures(aps []amdgpu.KFDProcessDeviceApertures) [
 	return out
 }
 
+// gpuOfMinor returns the gpu_id of the GPU whose render node has the given
+// minor number.
+func (g *gpuAllowlist) gpuOfMinor(minor uint32) (uint32, bool) {
+	id, ok := g.byMinor[minor]
+	return id, ok
+}
+
 // AllowRenderNodes permits the sandbox to use the GPUs owning the given
 // render node minors. It is called for each container as its devices are
 // created. It changes the sandbox's amdproxy state, not the DeviceInfo.
